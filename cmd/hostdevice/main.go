@@ -12,8 +12,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
 	"github.com/shabunin/tiny-matter-go/exchange"
+	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/securechannel"
 	"github.com/shabunin/tiny-matter-go/securechannel/pase"
 )
@@ -62,11 +64,36 @@ func main() {
 		log.Fatal(err)
 	}
 	r.OpenWindow()
+
+	node := im.NewNode(uint32(time.Now().UnixNano()))
+	failSafe := &clusters.FailSafe{}
+	failSafe.OnExpire = append(failSafe.OnExpire, func(time.Time) { log.Printf("fail-safe expired") })
+	root := node.AddEndpoint(0, clusters.DeviceTypeRootNode)
+	node.AddCluster(root,
+		clusters.Descriptor{},
+		&clusters.BasicInformation{
+			VendorName: "tiny-matter-go", VendorID: 0xFFF1,
+			ProductName: "Host Light", ProductID: 0x8000,
+			HardwareVersion: 1, HardwareVersionString: "1",
+			SoftwareVersion: 1, SoftwareVersionString: "0.1",
+			SerialNumber: "TMG-0001", UniqueID: "tmg-host-0001",
+		},
+		clusters.NewGeneralCommissioning(failSafe),
+	)
+	light := node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
+	node.AddCluster(light, clusters.Descriptor{}, &clusters.OnOff{
+		OnChange: func(on bool) { log.Printf("light on=%v", on) },
+	})
+	im.NewServer(m, node)
 	log.Printf("listening on %v, passcode %d", conn.LocalAddr(), *passcode)
 
 	buf := make([]byte, 1280)
 	for {
-		deadline := m.Poll(time.Now())
+		now := time.Now()
+		deadline := m.Poll(now)
+		if fs := failSafe.Poll(now); !fs.IsZero() && (deadline.IsZero() || fs.Before(deadline)) {
+			deadline = fs
+		}
 		if deadline.IsZero() {
 			deadline = time.Now().Add(time.Hour)
 		}

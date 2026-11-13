@@ -319,6 +319,9 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 		}
 		return message.ErrDuplicate
 	}
+	if ex == nil && isAck {
+		return nil // consumed by handleAck (which may have closed the exchange)
+	}
 	if ex == nil {
 		var d Delegate
 		if !isAck && ph.Initiator {

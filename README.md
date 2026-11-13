@@ -15,6 +15,8 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `crypto/spake2p/` | SPAKE2+ (P-256, RFC 9383 as used by Matter) and the passcode verifier (W0, L) |
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
+| `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Write, Invoke, Timed; data model of endpoints and clusters with global attributes |
+| `clusters/` | Server clusters: Descriptor, Basic Information, General Commissioning (fail-safe), On/Off |
 | `cmd/hostdevice/` | Runs the stack over UDP on a host for interop testing with chip-tool |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |

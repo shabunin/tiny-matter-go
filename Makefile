@@ -14,12 +14,13 @@ test32:
 	GOARCH=386 go test $(PKGS)
 
 tinygo-test:
-	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase
+	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./im
 
 fuzz:
 	go test ./tlv -run XXX -fuzz FuzzRoundTrip -fuzztime 60s
 	go test ./message -run XXX -fuzz FuzzDecode -fuzztime 60s
 	go test ./securechannel/pase -run XXX -fuzz FuzzDecode -fuzztime 60s
+	go test ./im -run XXX -fuzz FuzzServer -fuzztime 60s -fuzzminimizetime 0s
 
 # Cross-compile the P-256 benchmark for real boards and print flash/RAM use.
 cross:

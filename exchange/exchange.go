@@ -95,3 +95,15 @@ func (ex *Exchange) fail(now time.Time, err error) {
 		ex.d.OnError(now, ex, err)
 	}
 }
+
+// MaxPayload returns the largest application payload Send accepts on this
+// exchange.
+func (ex *Exchange) MaxPayload() int {
+	h := ex.s.header(0)
+	ph := message.ProtocolHeader{HasAck: true, NeedsAck: true}
+	n := message.MaxPacketSize - h.Size() - ph.Size()
+	if ex.s.secure {
+		n -= message.MICSize
+	}
+	return n
+}

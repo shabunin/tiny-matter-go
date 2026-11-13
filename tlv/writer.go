@@ -198,3 +198,12 @@ func (w *Writer) EndContainer() {
 // PutRaw appends an already encoded element verbatim, such as one returned by
 // Reader.RawElement. The element's own tag is kept.
 func (w *Writer) PutRaw(elem []byte) { w.buf = append(w.buf, elem...) }
+
+// Checkpoint is a writer position to roll back to.
+type Checkpoint struct{ n, depth int }
+
+// Checkpoint returns the current position.
+func (w *Writer) Checkpoint() Checkpoint { return Checkpoint{len(w.buf), w.depth} }
+
+// Rollback discards everything written since c.
+func (w *Writer) Rollback(c Checkpoint) { w.buf, w.depth = w.buf[:c.n], c.depth }
