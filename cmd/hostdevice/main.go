@@ -1,6 +1,7 @@
 // Command hostdevice runs the stack on a host over UDP for interoperability
-// testing against a Matter controller such as chip-tool. It uses the SDK
-// test passcode (20202021) and salt.
+// testing against a Matter controller such as chip-tool. It is an on/off
+// light using the SDK development attestation credentials (vendor 0xFFF1,
+// product 0x8000), test passcode 20202021 and discriminator 3840.
 package main
 
 import (
@@ -13,11 +14,11 @@ import (
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
+	"github.com/shabunin/tiny-matter-go/credentials/devcreds"
+	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
+	"github.com/shabunin/tiny-matter-go/device"
 	"github.com/shabunin/tiny-matter-go/exchange"
-	"github.com/shabunin/tiny-matter-go/im"
-	"github.com/shabunin/tiny-matter-go/securechannel"
-	"github.com/shabunin/tiny-matter-go/securechannel/pase"
 )
 
 type udpTransport struct{ c *net.UDPConn }
@@ -30,12 +31,18 @@ func (t udpTransport) Send(to exchange.Addr, pkt []byte) error {
 func main() {
 	addr := flag.String("listen", "[::]:5540", "UDP listen address")
 	passcode := flag.Uint("passcode", 20202021, "setup passcode")
+	discriminator := flag.Uint("discriminator", 3840, "discriminator")
+	mdns := flag.Bool("mdns", true, "advertise with avahi-publish")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	salt := []byte("SPAKE2P Key Salt")
 	const iterations = 1000
 	v, err := spake2p.NewVerifier(uint32(*passcode), salt, iterations)
+	if err != nil {
+		log.Fatal(err)
+	}
+	dacKey, err := p256.NewPrivateKey(devcreds.DACPrivateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,52 +55,41 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	m, err := exchange.NewManager(exchange.Config{Transport: udpTransport{conn}, Rand: rand.Reader})
-	if err != nil {
-		log.Fatal(err)
-	}
-	d := securechannel.NewDispatcher(m)
-	r, err := pase.NewResponder(m, d, pase.ResponderConfig{
-		Verifier: v, Salt: salt, Iterations: iterations, Rand: rand.Reader,
-		OnEstablished: func(now time.Time, s *exchange.Session) {
-			log.Printf("PASE session established with %v (local session %d)", s.Peer, s.LocalSessionID())
-		},
-		OnFailed: func(now time.Time, err error) { log.Printf("PASE failed: %v", err) },
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	r.OpenWindow()
 
-	node := im.NewNode(uint32(time.Now().UnixNano()))
-	failSafe := &clusters.FailSafe{}
-	failSafe.OnExpire = append(failSafe.OnExpire, func(time.Time) { log.Printf("fail-safe expired") })
-	root := node.AddEndpoint(0, clusters.DeviceTypeRootNode)
-	node.AddCluster(root,
-		clusters.Descriptor{},
-		&clusters.BasicInformation{
-			VendorName: "tiny-matter-go", VendorID: 0xFFF1,
-			ProductName: "Host Light", ProductID: 0x8000,
+	cfg := device.Config{
+		Transport: udpTransport{conn}, Rand: rand.Reader, Port: uint16(ua.Port),
+		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: uint16(*discriminator),
+		Attestation: &clusters.Attestation{
+			DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
+			CertificationDeclaration: devcreds.CertificationDeclaration,
+		},
+		Basic: &clusters.BasicInformation{
+			VendorName: "tiny-matter-go", VendorID: devcreds.VendorID,
+			ProductName: "Host Light", ProductID: devcreds.ProductID,
 			HardwareVersion: 1, HardwareVersionString: "1",
 			SoftwareVersion: 1, SoftwareVersionString: "0.1",
 			SerialNumber: "TMG-0001", UniqueID: "tmg-host-0001",
 		},
-		clusters.NewGeneralCommissioning(failSafe),
-	)
-	light := node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
-	node.AddCluster(light, clusters.Descriptor{}, &clusters.OnOff{
+		DeviceType: clusters.DeviceTypeOnOffLight.ID,
+		Log:        func(msg string) { log.Print(msg) },
+	}
+	if *mdns {
+		cfg.Advertiser = &avahiAdvertiser{}
+	}
+	d, err := device.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	light := d.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
+	d.Node.AddCluster(light, clusters.Descriptor{}, &clusters.OnOff{
 		OnChange: func(on bool) { log.Printf("light on=%v", on) },
 	})
-	im.NewServer(m, node)
-	log.Printf("listening on %v, passcode %d", conn.LocalAddr(), *passcode)
+	d.OpenCommissioningWindow()
+	log.Printf("listening on %v, passcode %d, discriminator %d", conn.LocalAddr(), *passcode, *discriminator)
 
 	buf := make([]byte, 1280)
 	for {
-		now := time.Now()
-		deadline := m.Poll(now)
-		if fs := failSafe.Poll(now); !fs.IsZero() && (deadline.IsZero() || fs.Before(deadline)) {
-			deadline = fs
-		}
+		deadline := d.Poll(time.Now())
 		if deadline.IsZero() {
 			deadline = time.Now().Add(time.Hour)
 		}
@@ -105,7 +101,7 @@ func main() {
 			}
 			log.Fatal(err)
 		}
-		if err := m.HandlePacket(time.Now(), from, buf[:n]); err != nil {
+		if err := d.HandlePacket(time.Now(), from, buf[:n]); err != nil {
 			log.Printf("drop packet from %v: %v", from, err)
 		}
 	}

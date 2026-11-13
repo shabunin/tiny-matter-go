@@ -30,8 +30,11 @@ type World struct {
 
 // Node is one endpoint.
 type Node struct {
-	M    *exchange.Manager
-	Addr exchange.Addr
+	M      *exchange.Manager
+	Addr   exchange.Addr
+	w      *World
+	handle func(now time.Time, from exchange.Addr, pkt []byte) error
+	poll   func(now time.Time) time.Time
 }
 
 type port struct {
@@ -57,7 +60,7 @@ func (w *World) Node(p uint16) *Node {
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	n := &Node{M: m, Addr: addr}
+	n := &Node{M: m, Addr: addr, w: w, handle: m.HandlePacket, poll: m.Poll}
 	w.nodes = append(w.nodes, n)
 	return n
 }
@@ -69,7 +72,7 @@ func (w *World) Deliver() {
 		w.Queue = w.Queue[1:]
 		for _, n := range w.nodes {
 			if n.Addr == p.To {
-				n.M.HandlePacket(w.Now, p.From, p.Data)
+				n.handle(w.Now, p.From, p.Data)
 			}
 		}
 	}
@@ -82,7 +85,7 @@ func (w *World) Advance(d time.Duration) {
 	for {
 		var next time.Time
 		for _, n := range w.nodes {
-			if t := n.M.Poll(w.Now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+			if t := n.poll(w.Now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 				next = t
 			}
 		}
@@ -95,4 +98,21 @@ func (w *World) Advance(d time.Duration) {
 		}
 	}
 	w.Now = end
+}
+
+// ExternalNode adds a node whose packet handling is supplied with Attach,
+// for components that own their exchange.Manager (such as a whole device).
+func (w *World) ExternalNode(p uint16) *Node {
+	addr := netip.AddrPortFrom(netip.MustParseAddr("fe80::1"), p)
+	n := &Node{Addr: addr, w: w}
+	w.nodes = append(w.nodes, n)
+	return n
+}
+
+// Transport returns the node's transport.
+func (n *Node) Transport() exchange.Transport { return port{n.w, n.Addr} }
+
+// Attach sets the packet handler and poll function of an external node.
+func (n *Node) Attach(handle func(now time.Time, from exchange.Addr, pkt []byte) error, poll func(now time.Time) time.Time) {
+	n.handle, n.poll = handle, poll
 }

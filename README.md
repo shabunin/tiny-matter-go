@@ -16,8 +16,13 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
 | `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Write, Invoke, Timed; data model of endpoints and clusters with global attributes |
-| `clusters/` | Server clusters: Descriptor, Basic Information, General Commissioning (fail-safe), On/Off |
-| `cmd/hostdevice/` | Runs the stack over UDP on a host for interop testing with chip-tool |
+| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker), Basic Information, General Commissioning (fail-safe), Operational Credentials, On/Off |
+| `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
+| `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
+| `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
+| `dnssd/` | DNS-SD service descriptions (commissionable `_matterc._udp`, operational `_matter._tcp`) for an mDNS advertiser |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising |
+| `cmd/hostdevice/` | An on/off light over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool commissions and controls it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |

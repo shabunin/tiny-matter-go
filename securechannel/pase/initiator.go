@@ -188,9 +188,11 @@ func (in *initiator) onStatus(now time.Time, ex *exchange.Exchange, payload []by
 		PeerSessionID:  in.peerSessionID,
 		EncryptKey:     keys.I2R[:],
 		DecryptKey:     keys.R2I[:],
+		AuthMode:       exchange.AuthPASE,
+
+		AttestationChallenge: keys.AttestationChallenge,
 	})
 	if err == nil {
-		s.Attachment = &Info{AttestationChallenge: keys.AttestationChallenge}
 	}
 	in.finish(now, ex, s, err)
 }

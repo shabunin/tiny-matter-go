@@ -1,0 +1,223 @@
+// Package device assembles a Matter node: the session layer, PASE and CASE
+// session establishment, the Interaction Model server with the root-node
+// clusters, fabrics, access control, the commissioning fail-safe and DNS-SD
+// advertising. Applications add their own endpoints to Node and drive the
+// device with HandlePacket and Poll (sans-IO).
+package device
+
+import (
+	"encoding/binary"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/shabunin/tiny-matter-go/clusters"
+	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
+	"github.com/shabunin/tiny-matter-go/dnssd"
+	"github.com/shabunin/tiny-matter-go/exchange"
+	"github.com/shabunin/tiny-matter-go/fabric"
+	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/securechannel"
+	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
+	"github.com/shabunin/tiny-matter-go/securechannel/pase"
+)
+
+// Config configures a device.
+type Config struct {
+	Transport exchange.Transport
+	Rand      io.Reader
+	Port      uint16 // UDP port, for DNS-SD (default 5540)
+
+	// Commissioning: the passcode verifier with its PBKDF parameters.
+	Verifier      *spake2p.Verifier
+	Salt          []byte
+	Iterations    uint32
+	Discriminator uint16
+
+	Attestation *clusters.Attestation
+	// Basic is the Basic Information cluster; VendorID and ProductID must
+	// match the attestation credentials.
+	Basic *clusters.BasicInformation
+	// DeviceType is advertised while commissionable.
+	DeviceType uint32
+
+	Advertiser dnssd.Advertiser // optional
+	Log        func(msg string) // optional
+}
+
+// Device is a Matter node.
+type Device struct {
+	cfg      Config
+	M        *exchange.Manager
+	Node     *im.Node
+	Root     *im.Endpoint
+	Server   *im.Server
+	Fabrics  *fabric.Table
+	ACL      *clusters.AccessControl
+	FailSafe *clusters.FailSafe
+	PASE     *pase.Responder
+	General  *clusters.GeneralCommissioning
+	OpCreds  *clusters.OperationalCredentials
+
+	deferred []func(now time.Time)
+	instance uint64 // commissionable instance name
+}
+
+// New creates a device. Its commissioning window starts closed; call
+// OpenCommissioningWindow (typically when no fabric is configured).
+func New(cfg Config) (*Device, error) {
+	if cfg.Transport == nil || cfg.Rand == nil || cfg.Attestation == nil || cfg.Basic == nil {
+		return nil, errors.New("device: Transport, Rand, Attestation and Basic are required")
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 5540
+	}
+	m, err := exchange.NewManager(exchange.Config{Transport: cfg.Transport, Rand: cfg.Rand})
+	if err != nil {
+		return nil, err
+	}
+	var seed [4]byte
+	io.ReadFull(cfg.Rand, seed[:])
+	d := &Device{
+		cfg: cfg, M: m,
+		Node:     im.NewNode(binary.LittleEndian.Uint32(seed[:])),
+		Fabrics:  &fabric.Table{},
+		ACL:      &clusters.AccessControl{},
+		FailSafe: &clusters.FailSafe{},
+	}
+	disp := securechannel.NewDispatcher(m)
+	d.PASE, err = pase.NewResponder(m, disp, pase.ResponderConfig{
+		Verifier: cfg.Verifier, Salt: cfg.Salt, Iterations: cfg.Iterations, Rand: cfg.Rand,
+		OnEstablished: func(now time.Time, s *exchange.Session) { d.log("PASE session established") },
+		OnFailed:      func(now time.Time, err error) { d.log("PASE failed: " + err.Error()) },
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	casesession.NewResponder(m, disp, casesession.ResponderConfig{
+		Fabrics: d.Fabrics, Rand: cfg.Rand,
+		OnEstablished: func(now time.Time, s *exchange.Session, f *fabric.Fabric) {
+			d.log("CASE session established")
+		},
+		OnFailed: func(now time.Time, err error) { d.log("CASE failed: " + err.Error()) },
+	})
+
+	d.General = clusters.NewGeneralCommissioning(d.FailSafe)
+	d.General.FabricIndex = func(ctx *im.Context) uint8 { return ctx.Session.FabricIndex }
+	d.General.Complete = d.commissioningComplete
+	d.OpCreds = clusters.NewOperationalCredentials(cfg.Attestation, d.Fabrics, d.FailSafe, d.ACL, cfg.Rand)
+	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
+		d.later(func(now time.Time) { d.closeFabricSessions(now, index) })
+		d.advertise()
+	}
+	d.OpCreds.OnFabricAdded = func(now time.Time, f *fabric.Fabric) {
+		d.log("fabric added (pending commissioning complete)")
+		d.advertise()
+	}
+	d.FailSafe.OnExpire = append(d.FailSafe.OnExpire, func(now time.Time) {
+		d.log("fail-safe expired: commissioning rolled back")
+	})
+
+	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
+	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.OpCreds)
+	d.Server = im.NewServer(m, d.Node)
+	d.Server.Access = d.ACL
+	return d, nil
+}
+
+func (d *Device) log(msg string) {
+	if d.cfg.Log != nil {
+		d.cfg.Log(msg)
+	}
+}
+
+func (d *Device) later(f func(now time.Time)) { d.deferred = append(d.deferred, f) }
+
+// HandlePacket processes a received UDP datagram.
+func (d *Device) HandlePacket(now time.Time, from exchange.Addr, pkt []byte) error {
+	return d.M.HandlePacket(now, from, pkt)
+}
+
+// Poll runs timers and deferred work, returning when it next needs to run
+// (zero if idle).
+func (d *Device) Poll(now time.Time) time.Time {
+	for len(d.deferred) > 0 {
+		f := d.deferred[0]
+		d.deferred = d.deferred[1:]
+		f(now)
+	}
+	next := d.M.Poll(now)
+	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
+	return next
+}
+
+// OpenCommissioningWindow allows commissioning with the passcode and
+// advertises the commissionable service.
+func (d *Device) OpenCommissioningWindow() {
+	var b [8]byte
+	io.ReadFull(d.cfg.Rand, b[:])
+	d.instance = binary.LittleEndian.Uint64(b[:])
+	d.PASE.OpenWindow()
+	d.advertise()
+}
+
+// commissioningComplete commits the fabric added under the fail-safe. It
+// is called by GeneralCommissioning once the fail-safe is armed.
+func (d *Device) commissioningComplete(ctx *im.Context) clusters.CommissioningError {
+	s := ctx.Session
+	if s.AuthMode != exchange.AuthCASE || s.FabricIndex == 0 || s.FabricIndex != d.FailSafe.FabricIndex() {
+		return clusters.InvalidAuthentication
+	}
+	d.Fabrics.Commit()
+	d.OpCreds.Reset()
+	d.PASE.CloseWindow()
+	d.later(d.closePASESessions)
+	d.log("commissioning complete")
+	d.advertise()
+	return clusters.CommissioningOK
+}
+
+func (d *Device) closePASESessions(now time.Time) {
+	for _, s := range d.M.Sessions() {
+		if s.AuthMode == exchange.AuthPASE {
+			d.M.CloseSession(now, s)
+		}
+	}
+}
+
+func (d *Device) closeFabricSessions(now time.Time, index uint8) {
+	for _, s := range d.M.Sessions() {
+		if s.IsSecure() && s.FabricIndex == index {
+			d.M.CloseSession(now, s)
+		}
+	}
+}
+
+func (d *Device) mrp() dnssd.MRP {
+	p := securechannel.DefaultSessionParams.MRP
+	return dnssd.MRP{Idle: p.IdleInterval, Active: p.ActiveInterval, ActiveThreshold: p.ActiveThreshold}
+}
+
+// advertise publishes the current DNS-SD services.
+func (d *Device) advertise() {
+	if d.cfg.Advertiser == nil {
+		return
+	}
+	var svcs []dnssd.Service
+	if d.PASE.WindowOpen() {
+		c := dnssd.Commissionable{
+			Instance: d.instance, Port: d.cfg.Port, Discriminator: d.cfg.Discriminator,
+			VendorID: d.cfg.Basic.VendorID, ProductID: d.cfg.Basic.ProductID,
+			DeviceType: d.cfg.DeviceType, DeviceName: d.cfg.Basic.ProductName, MRP: d.mrp(), Mode: 1,
+		}
+		svcs = append(svcs, c.Service())
+	}
+	for _, f := range d.Fabrics.Fabrics() {
+		o := dnssd.Operational{CompressedFabricID: f.CompressedFabricID, NodeID: f.NodeID, Port: d.cfg.Port, MRP: d.mrp()}
+		svcs = append(svcs, o.Service())
+	}
+	d.cfg.Advertiser.Advertise(svcs)
+}

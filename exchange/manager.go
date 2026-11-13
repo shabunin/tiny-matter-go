@@ -156,6 +156,8 @@ func (m *Manager) NewSecureSession(now time.Time, p SecureSessionParams) (*Sessi
 		localSessionID: p.LocalSessionID, peerSessionID: p.PeerSessionID,
 		localNodeID: p.LocalNodeID, peerNodeID: p.PeerNodeID,
 		enc: enc, dec: dec, counter: ctr, lastUse: now,
+		AuthMode: p.AuthMode, FabricIndex: p.FabricIndex, PeerCATs: p.PeerCATs,
+		AttestationChallenge: p.AttestationChallenge,
 	}
 	if s.PeerMRP == (MRPConfig{}) {
 		s.PeerMRP = DefaultMRPConfig
@@ -509,3 +511,7 @@ func (m *Manager) compact() {
 	clear(m.sessions[j:])
 	m.sessions = m.sessions[:j]
 }
+
+// Sessions returns a snapshot of the live sessions; closing sessions while
+// iterating over it is safe.
+func (m *Manager) Sessions() []*Session { return append([]*Session(nil), m.sessions...) }

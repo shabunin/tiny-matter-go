@@ -40,10 +40,30 @@ type Session struct {
 	lastPeerActivity time.Time
 	lastUse          time.Time
 
-	// Attachment is free for the layer that established the session, e.g.
-	// to hold the fabric and subject of a CASE session.
+	// AuthMode and FabricIndex describe the session's subject for access
+	// control. FabricIndex is 0 while a PASE session has no fabric yet.
+	AuthMode    AuthMode
+	FabricIndex uint8
+	// PeerCATs are the CASE Authenticated Tags of a CASE peer.
+	PeerCATs []uint32
+	// AttestationChallenge is derived with the session keys and used to
+	// bind device attestation to the session.
+	AttestationChallenge [16]byte
+
+	// Attachment is free for the layer that established the session.
 	Attachment any
 }
+
+// AuthMode is how a session's peer was authenticated (the access control
+// auth modes of spec 9.10.5).
+type AuthMode uint8
+
+const (
+	AuthNone  AuthMode = 0
+	AuthPASE  AuthMode = 1
+	AuthCASE  AuthMode = 2
+	AuthGroup AuthMode = 3
+)
 
 // SecureSessionParams describes a secure session established by PASE or
 // CASE.
@@ -56,6 +76,11 @@ type SecureSessionParams struct {
 	PeerNodeID     uint64 // 0 for PASE
 	EncryptKey     []byte // I2RKey for the initiator, R2IKey for the responder
 	DecryptKey     []byte
+	AuthMode       AuthMode
+	FabricIndex    uint8
+	PeerCATs       []uint32
+	// AttestationChallenge, from the session key derivation.
+	AttestationChallenge [16]byte
 }
 
 // IsSecure reports whether the session is encrypted.

@@ -162,7 +162,7 @@ func TestPairing(t *testing.T) {
 	if !ds.IsSecure() || !cs.IsSecure() {
 		t.Fatal("sessions not secure")
 	}
-	if ds.Attachment.(*Info).AttestationChallenge != cs.Attachment.(*Info).AttestationChallenge {
+	if ds.AttestationChallenge != cs.AttestationChallenge || ds.AuthMode != exchange.AuthPASE {
 		t.Fatal("attestation challenges differ")
 	}
 

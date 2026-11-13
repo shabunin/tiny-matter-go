@@ -275,11 +275,13 @@ func (h *responderHandshake) onPake3(now time.Time, ex *exchange.Exchange, paylo
 		PeerSessionID:  h.peerSessionID,
 		EncryptKey:     keys.R2I[:],
 		DecryptKey:     keys.I2R[:],
+		AuthMode:       exchange.AuthPASE,
+
+		AttestationChallenge: keys.AttestationChallenge,
 	})
 	if err != nil {
 		return err
 	}
-	s.Attachment = &Info{AttestationChallenge: keys.AttestationChallenge}
 	securechannel.SendStatus(now, ex, securechannel.SecureChannelStatus(
 		securechannel.GeneralSuccess, securechannel.CodeSessionEstablishmentSuccess))
 	ex.Close(now)
@@ -289,11 +291,4 @@ func (h *responderHandshake) onPake3(now time.Time, ex *exchange.Exchange, paylo
 		h.r.cfg.OnEstablished(now, s)
 	}
 	return nil
-}
-
-// Info is attached to PASE sessions (Session.Attachment).
-type Info struct {
-	// AttestationChallenge is used in device attestation during
-	// commissioning.
-	AttestationChallenge [16]byte
 }

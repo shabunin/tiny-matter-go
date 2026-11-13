@@ -289,3 +289,11 @@ func (g *GeneralCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 	}
 	return im.UnsupportedCommand
 }
+
+func (*GeneralCommissioning) ReadPrivilege(uint32) im.Privilege   { return im.View }
+func (*GeneralCommissioning) WritePrivilege(uint32) im.Privilege  { return im.Administer }
+func (*GeneralCommissioning) InvokePrivilege(uint32) im.Privilege { return im.Administer }
+
+// SetFabricIndex records the fabric a NOC was added for under the
+// fail-safe; CommissioningComplete must come from that fabric.
+func (f *FailSafe) SetFabricIndex(index uint8) { f.fabricIndex = index }

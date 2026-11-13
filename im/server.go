@@ -24,6 +24,8 @@ const (
 type Server struct {
 	node *Node
 	buf  []byte // shared encode buffer; messages are sent synchronously
+	// Access, if set, enforces access control; nil allows everything.
+	Access AccessChecker
 }
 
 // NewServer returns a Server for n and registers it with m.
@@ -339,6 +341,13 @@ func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 			return true
 		}
 		cp := w.Checkpoint()
+		if c.status == Success && !h.s.allowed(ctx, c.path.Endpoint, c.path.Cluster, readPrivilege(c.cluster, c.path.Attribute)) {
+			if c.wildcard {
+				rs.next = i + 1
+				return true
+			}
+			c.status = UnsupportedAccess
+		}
 		wrote := encodeReport(ctx, w, c)
 		if w.Len() > limit {
 			w.Rollback(cp)
@@ -522,6 +531,8 @@ func (h *handler) invokeOne(ctx *Context, w *tlv.Writer, q *invokeRequest) {
 		st = UnsupportedCluster
 	} else if !hasID(c.AcceptedCommands(), q.path.Command) {
 		st = UnsupportedCommand
+	} else if !h.s.allowed(ctx, q.path.Endpoint, q.path.Cluster, invokePrivilege(c, q.path.Command)) {
+		st = UnsupportedAccess
 	}
 	cp := w.Checkpoint()
 	resp := Response{w: w, path: q.path}
@@ -647,6 +658,8 @@ func (h *handler) writeOne(ctx *Context, w *tlv.Writer, r *tlv.Reader) error {
 		st = UnsupportedAttribute
 	} else if isGlobalAttribute(path.Attribute) {
 		st = UnsupportedWrite
+	} else if !h.s.allowed(ctx, path.Endpoint, path.Cluster, writePrivilege(ce.c, path.Attribute)) {
+		st = UnsupportedAccess
 	} else if hasVer && version != ce.version {
 		st = DataVersionMismatch
 	}

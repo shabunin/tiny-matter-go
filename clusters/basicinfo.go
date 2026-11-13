@@ -147,3 +147,7 @@ func (b *BasicInformation) WriteAttribute(ctx *im.Context, attr uint32, appendIt
 	}
 	return im.Success
 }
+
+func (*BasicInformation) ReadPrivilege(uint32) im.Privilege   { return im.View }
+func (*BasicInformation) WritePrivilege(uint32) im.Privilege  { return im.Manage }
+func (*BasicInformation) InvokePrivilege(uint32) im.Privilege { return im.Operate }
