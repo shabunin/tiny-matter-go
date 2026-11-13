@@ -21,7 +21,9 @@ func sysTick() { mi.Set(mi.Get() + 1) }
 
 func t(name string, n int, f func()) {
 	s := mi.Get()
-	for i := 0; i < n; i++ { f() }
+	for i := 0; i < n; i++ {
+		f()
+	}
 	d := mi.Get() - s
 	println(name, "x", n, ":", d, "Minsn total,", d*1000/uint32(n), "Kinsn each")
 }

@@ -10,8 +10,8 @@ import (
 	"errors"
 	"io"
 
-	"tinymatter/crypto/internal/bigmod"
-	"tinymatter/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
 )
 
 // Sign signs digest (normally a SHA-256 hash) and returns a raw r||s

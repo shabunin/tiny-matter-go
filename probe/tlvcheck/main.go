@@ -1,6 +1,6 @@
 package main
 
-import "tinymatter/tlv"
+import "github.com/shabunin/tiny-matter-go/tlv"
 
 func main() {
 	w := tlv.NewWriter(make([]byte, 0, 64))

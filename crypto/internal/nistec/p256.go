@@ -11,7 +11,7 @@ import (
 	"math/bits"
 	"sync"
 
-	"tinymatter/crypto/internal/nistec/fiat"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec/fiat"
 )
 
 // P256Point is a P-256 point. The zero value is NOT valid.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"tinymatter/message"
+	"github.com/shabunin/tiny-matter-go/message"
 )
 
 // From connectedhomeip src/messaging/tests/TestReliableMessageProtocol.cpp

@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"tinymatter/crypto/ccm"
+	"github.com/shabunin/tiny-matter-go/crypto/ccm"
 )
 
 // ErrAuth is returned when an encrypted message fails authentication.

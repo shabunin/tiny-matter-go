@@ -14,7 +14,7 @@ import (
 	"io"
 	"time"
 
-	"tinymatter/message"
+	"github.com/shabunin/tiny-matter-go/message"
 )
 
 // Secure Channel opcode for MRP standalone acknowledgements.

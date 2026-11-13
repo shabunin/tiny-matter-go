@@ -131,7 +131,7 @@ func p256InvertEndianness(v []byte) {
 }
 
 // SetMontgomeryLimbs sets e to the element whose Montgomery-domain
-// representation is l. Added for tinymatter's flash-resident base table.
+// representation is l. Added for tiny-matter-go's flash-resident base table.
 func (e *P256Element) SetMontgomeryLimbs(l *[4]uint64) *P256Element {
 	e.x = p256MontgomeryDomainFieldElement(*l)
 	return e

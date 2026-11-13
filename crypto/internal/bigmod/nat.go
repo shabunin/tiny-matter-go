@@ -1228,7 +1228,7 @@ func (x *Nat) DivShortVarTime(y uint) uint {
 }
 
 // SetBytesWide sets x to the big-endian value b, of any length, without
-// reducing it. Its only valid use is as the input to Mod. Added for tinymatter.
+// reducing it. Its only valid use is as the input to Mod. Added for tiny-matter-go.
 func (x *Nat) SetBytesWide(b []byte) *Nat {
 	return x.resetToBytes(b)
 }

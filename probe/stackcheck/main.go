@@ -7,8 +7,8 @@ import (
 	"net/netip"
 	"time"
 
-	"tinymatter/exchange"
-	"tinymatter/message"
+	"github.com/shabunin/tiny-matter-go/exchange"
+	"github.com/shabunin/tiny-matter-go/message"
 )
 
 // NOT secure: deterministic stand-in for a hardware TRNG.
@@ -45,7 +45,9 @@ func (e *echo) OnMessage(now time.Time, ex *exchange.Exchange, m exchange.Messag
 		ex.Send(now, m.ProtocolID, m.Opcode+1, []byte("reply:"+e.got))
 	}
 }
-func (e *echo) OnError(now time.Time, ex *exchange.Exchange, err error) { println("error:", err.Error()) }
+func (e *echo) OnError(now time.Time, ex *exchange.Exchange, err error) {
+	println("error:", err.Error())
+}
 
 func main() {
 	rng := &xr{7}

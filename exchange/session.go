@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"time"
 
-	"tinymatter/message"
+	"github.com/shabunin/tiny-matter-go/message"
 )
 
 // Addr is a peer transport address.

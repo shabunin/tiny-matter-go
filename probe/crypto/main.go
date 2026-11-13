@@ -1,4 +1,5 @@
 // Probe: exercise every crypto primitive Matter needs, using only stdlib.
+//
 //go:debug cryptocustomrand=1
 package main
 
@@ -8,7 +9,7 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/pbkdf2"
-		"crypto/sha256"
+	"crypto/sha256"
 	"math/big"
 	"time"
 )
@@ -36,14 +37,28 @@ func main() {
 		x1, y1 := c.ScalarBaseMult(k)
 		x2, y2 := c.ScalarMult(x1, y1, k)
 		c.Add(x1, y1, x2, y2)
-		for i := 0; i < 9; i++ { c.ScalarMult(x1, y1, k) }
+		for i := 0; i < 9; i++ {
+			c.ScalarMult(x1, y1, k)
+		}
 	})
 	println("done")
 }
 
-func chk(err error) { if err != nil { panic(err.Error()) } }
+func chk(err error) {
+	if err != nil {
+		panic(err.Error())
+	}
+}
 
 // stub RNG for the emulator (NOT secure) — real targets need a HW TRNG driver
 type xr struct{ s uint32 }
-func (x *xr) Read(b []byte) (int, error) { for i := range b { x.s = x.s*1664525 + 1013904223; b[i] = byte(x.s >> 24) }; return len(b), nil }
+
+func (x *xr) Read(b []byte) (int, error) {
+	for i := range b {
+		x.s = x.s*1664525 + 1013904223
+		b[i] = byte(x.s >> 24)
+	}
+	return len(b), nil
+}
+
 var rand = struct{ Reader *xr }{&xr{1}}

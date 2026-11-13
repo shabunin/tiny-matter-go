@@ -1,4 +1,4 @@
-// Benchmark tinymatter/crypto/p256 on emulated Cortex-M (QEMU -icount shift=0):
+// Benchmark tiny-matter-go/crypto/p256 on emulated Cortex-M (QEMU -icount shift=0):
 // SysTick fires every 1M executed instructions.
 package main
 
@@ -7,7 +7,7 @@ import (
 	"device/arm"
 	"runtime/volatile"
 
-	"tinymatter/crypto/p256"
+	"github.com/shabunin/tiny-matter-go/crypto/p256"
 )
 
 var mi volatile.Register32

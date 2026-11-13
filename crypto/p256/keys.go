@@ -4,8 +4,8 @@ import (
 	"errors"
 	"io"
 
-	"tinymatter/crypto/internal/bigmod"
-	"tinymatter/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
 )
 
 // PrivateKey is a P-256 private key, usable for both ECDSA and ECDH.

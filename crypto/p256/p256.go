@@ -14,8 +14,8 @@ import (
 	"io"
 	"sync"
 
-	"tinymatter/crypto/internal/bigmod"
-	"tinymatter/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
 )
 
 const (

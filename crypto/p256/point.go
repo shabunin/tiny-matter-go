@@ -3,8 +3,8 @@ package p256
 import (
 	"io"
 
-	"tinymatter/crypto/internal/bigmod"
-	"tinymatter/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
 )
 
 // Point is a P-256 point, including the point at infinity. The zero value is

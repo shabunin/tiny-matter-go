@@ -3,7 +3,7 @@ package exchange
 import (
 	"time"
 
-	"tinymatter/message"
+	"github.com/shabunin/tiny-matter-go/message"
 )
 
 // Exchange is a request/response conversation with a peer (spec 4.10). Every
