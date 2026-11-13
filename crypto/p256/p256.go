@@ -1,0 +1,88 @@
+// Package p256 provides the NIST P-256 operations Matter needs (ECDSA with
+// SHA-256, ECDH, and raw point arithmetic for SPAKE2+), built on Go's
+// constant-time fiat-crypto implementation vendored under crypto/internal.
+//
+// Unlike the standard library, every operation that needs randomness takes an
+// explicit io.Reader, so it works on bare-metal TinyGo targets where the
+// standard library's crypto ignores the caller's reader and reads the OS.
+// Signatures are raw r||s (64 bytes), the encoding Matter uses on the wire and
+// in Matter TLV certificates.
+package p256
+
+import (
+	"errors"
+	"io"
+	"sync"
+
+	"tinymatter/crypto/internal/bigmod"
+	"tinymatter/crypto/internal/nistec"
+)
+
+const (
+	// ScalarSize is the size of a private key or scalar in bytes.
+	ScalarSize = 32
+	// PointSize is the size of an uncompressed SEC 1 point (0x04 || X || Y).
+	PointSize = 65
+	// SignatureSize is the size of a raw r||s ECDSA signature.
+	SignatureSize = 64
+	// SharedSecretSize is the size of an ECDH shared secret (the X coordinate).
+	SharedSecretSize = 32
+)
+
+var orderBytes = []byte{
+	0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+	0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+}
+
+var (
+	orderOnce sync.Once
+	order     *bigmod.Modulus
+	nMinus2   []byte
+)
+
+// n returns the group order as a bigmod.Modulus.
+func n() *bigmod.Modulus {
+	orderOnce.Do(func() {
+		var err error
+		order, err = bigmod.NewModulus(orderBytes)
+		if err != nil {
+			panic("p256: invalid order")
+		}
+		two, _ := bigmod.NewNat().SetBytes([]byte{2}, order)
+		nMinus2 = bigmod.NewNat().ExpandFor(order).Sub(two, order).Bytes(order)
+	})
+	return order
+}
+
+var (
+	errInvalidScalar = errors.New("p256: invalid scalar")
+	errInvalidKey    = errors.New("p256: invalid key")
+)
+
+// randomScalar returns a uniformly random non-zero scalar k and k*G, using
+// rejection sampling over bytes produced by generate.
+func randomScalar(generate func([]byte) error) (*bigmod.Nat, *nistec.P256Point, error) {
+	var b [ScalarSize]byte
+	for {
+		if err := generate(b[:]); err != nil {
+			return nil, nil, err
+		}
+		k, err := bigmod.NewNat().SetBytes(b[:], n())
+		if err == nil && k.IsZero() == 0 {
+			p, err := nistec.NewP256Point().ScalarBaseMult(k.Bytes(n()))
+			return k, p, err
+		}
+	}
+}
+
+func readFull(r io.Reader) func([]byte) error {
+	return func(b []byte) error {
+		if r == nil {
+			return errors.New("p256: nil random source")
+		}
+		_, err := io.ReadFull(r, b)
+		return err
+	}
+}
