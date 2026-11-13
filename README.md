@@ -12,6 +12,11 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `crypto/ccm/` | AES-CCM as a `cipher.AEAD`, allocation-free |
 | `message/` | Message and protocol headers, message encryption (`Cipher`), counters and replay windows |
 | `exchange/` | Sessions, exchanges and MRP (acks, retransmission, backoff); sans-IO, driven by `HandlePacket` and `Poll(now)` |
+| `crypto/spake2p/` | SPAKE2+ (P-256, RFC 9383 as used by Matter) and the passcode verifier (W0, L) |
+| `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
+| `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
+| `cmd/hostdevice/` | Runs the stack over UDP on a host for interop testing with chip-tool |
+| `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |
 | `probe/` | Feasibility probes, TinyGo benchmarks and a large-memory QEMU Cortex-M target |
