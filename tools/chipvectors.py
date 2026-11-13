@@ -21,7 +21,10 @@ for typ, name, body in re.findall(r'static\s+const\s+struct\s+(\w+)\s+(\w+)\s*=\
     obj = {'_name': name}
     for field, value in re.findall(r'\.(\w+)\s*=\s*([^,]+)', body):
         value = value.strip()
-        if value in ('nullptr', 'NULL'):
+        lit = re.fullmatch(r'(?:reinterpret_cast<const uint8_t \*>\()?"((?:[^"\\]|\\.)*)"\)?', value)
+        if lit:
+            obj[field] = lit.group(1).encode().decode('unicode_escape').encode('latin-1').hex()
+        elif value in ('nullptr', 'NULL'):
             obj[field] = ''
         elif value in arrays:
             obj[field] = arrays[value]
