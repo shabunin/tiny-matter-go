@@ -21,6 +21,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/message"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
 	"github.com/shabunin/tiny-matter-go/securechannel/pase"
+	"github.com/shabunin/tiny-matter-go/storage"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
@@ -37,7 +38,9 @@ type harness struct {
 	light *clusters.OnOff
 }
 
-func newHarness(t *testing.T) *harness {
+func newHarness(t *testing.T) *harness { return newHarnessStore(t, nil) }
+
+func newHarnessStore(t *testing.T, store storage.Store) *harness {
 	h := &harness{t: t, w: simnet.New(t)}
 	h.ctl = h.w.Node(5550)
 	h.devN = h.w.ExternalNode(5540)
@@ -50,6 +53,7 @@ func newHarness(t *testing.T) *harness {
 		Attestation: &clusters.Attestation{DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
 			CertificationDeclaration: devcreds.CertificationDeclaration},
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: 0xFFF1, ProductName: "P", ProductID: 0x8000},
+		Store: store,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +62,9 @@ func newHarness(t *testing.T) *harness {
 	h.light = &clusters.OnOff{}
 	ep := h.dev.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
 	h.dev.Node.AddCluster(ep, clusters.Descriptor{}, h.light)
-	h.dev.OpenCommissioningWindow()
+	if !h.dev.Commissioned() {
+		h.dev.OpenCommissioningWindow()
+	}
 	return h
 }
 
@@ -104,8 +110,12 @@ func field(t *testing.T, raw []byte, tag uint8) *tlv.Reader {
 	return nil
 }
 
-func TestCommissioning(t *testing.T) {
-	h := newHarness(t)
+func TestCommissioning(t *testing.T) { newHarness(t).commission() }
+
+// commission runs a full commissioning and returns the controller's fabric
+// and its CASE session.
+func (h *harness) commission() (*fabric.Fabric, *exchange.Session) {
+	t := h.t
 
 	// PASE.
 	var paseS *exchange.Session
@@ -233,6 +243,73 @@ func TestCommissioning(t *testing.T) {
 	h.w.Advance(2 * time.Minute)
 	if h.dev.Fabrics.Committed() != 1 {
 		t.Fatal("fabric lost after the fail-safe period")
+	}
+	return ctlF, caseS
+}
+
+// connect opens a CASE session to the device with the controller fabric.
+func (h *harness) connect(ctlF *fabric.Fabric) *exchange.Session {
+	var caseS *exchange.Session
+	err := casesession.Connect(h.w.Now, h.ctl.M, h.devN.Addr, casesession.InitiatorConfig{
+		Fabric: ctlF, PeerNodeID: 1, Rand: rand.Reader,
+		Done: func(now time.Time, s *exchange.Session, err error) {
+			if err != nil {
+				h.t.Fatal(err)
+			}
+			caseS = s
+		}})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.w.Advance(time.Second)
+	if caseS == nil {
+		h.t.Fatal("CASE did not complete")
+	}
+	return caseS
+}
+
+func TestRestartKeepsFabric(t *testing.T) {
+	store := &storage.Memory{}
+	h := newHarnessStore(t, store)
+	ctlF, caseS := h.commission()
+	// Label the fabric, then "reboot" into a new device on the same store.
+	h.invoke(caseS, im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: 9},
+		func(w *tlv.Writer) { w.PutString(tlv.ContextTag(0), "home") })
+	h.w.Advance(time.Second)
+
+	h2 := newHarnessStore(t, store)
+	if !h2.dev.Commissioned() || h2.dev.PASE.WindowOpen() {
+		t.Fatal("restarted device is not commissioned")
+	}
+	f := h2.dev.Fabrics.Fabrics()[0]
+	if f.Label != "home" || f.NodeID != 1 || len(h2.dev.ACL.Entries) != 1 {
+		t.Fatalf("restored fabric %+v, %d ACL entries", f, len(h2.dev.ACL.Entries))
+	}
+	s := h2.connect(ctlF)
+	res := h2.invoke(s, im.CommandPath{Endpoint: 1, Cluster: clusters.IDOnOff, Command: 1}, nil)
+	if res.Status != im.Success || !h2.light.On {
+		t.Fatalf("on after restart: %+v", res)
+	}
+
+	// Removing the last fabric is saved and reopens commissioning.
+	res = h2.invoke(s, im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: 0x0A},
+		func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), uint64(f.Index)) })
+	h2.w.Advance(time.Second)
+	if h2.dev.Commissioned() || !h2.dev.PASE.WindowOpen() {
+		t.Fatal("window not reopened after removing the last fabric")
+	}
+	h3 := newHarnessStore(t, store)
+	if h3.dev.Commissioned() {
+		t.Fatal("removed fabric came back after restart")
+	}
+}
+
+func TestCorruptStateIgnored(t *testing.T) {
+	store := &storage.Memory{}
+	store.Save([]byte{0x15, 0x24, 0x01, 0x07, 0x18}) // version 7
+	h := newHarnessStore(t, store)
+	if h.dev.Commissioned() || !h.dev.PASE.WindowOpen() {
+		t.Fatal("bad state not ignored")
 	}
 }
 

@@ -14,7 +14,7 @@ test32:
 	GOARCH=386 go test $(PKGS)
 
 tinygo-test:
-	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip6 ./mdns
+	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip6 ./mdns ./storage
 
 fuzz:
 	go test ./tlv -run XXX -fuzz FuzzRoundTrip -fuzztime 60s

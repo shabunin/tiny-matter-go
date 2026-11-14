@@ -23,7 +23,8 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `dnssd/` | DNS-SD service descriptions (commissionable `_matterc._udp`, operational `_matter._tcp`) for an mDNS advertiser |
 | `ip6/` | Minimal IPv6 host over raw Ethernet frames: EUI-64 link-local address, Neighbor Discovery, Echo, MLDv2 reports, UDP |
 | `mdns/` | Small mDNS/DNS-SD responder (PTR/SRV/TXT/AAAA, announcements, goodbyes, legacy and QU replies); a `dnssd.Advertiser` |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising |
+| `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, persistence of fabrics and ACL (reopens commissioning when the last fabric is removed) |
 | `cmd/hostdevice/` | An on/off light over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool commissions and controls it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |

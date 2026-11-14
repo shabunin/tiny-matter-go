@@ -33,6 +33,7 @@ func main() {
 	passcode := flag.Uint("passcode", 20202021, "setup passcode")
 	discriminator := flag.Uint("discriminator", 3840, "discriminator")
 	mdns := flag.Bool("mdns", true, "advertise with avahi-publish")
+	state := flag.String("state", "", "file keeping fabrics and the ACL across restarts")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -76,6 +77,9 @@ func main() {
 	if *mdns {
 		cfg.Advertiser = &avahiAdvertiser{}
 	}
+	if *state != "" {
+		cfg.Store = fileStore(*state)
+	}
 	d, err := device.New(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -84,7 +88,9 @@ func main() {
 	d.Node.AddCluster(light, clusters.Descriptor{}, &clusters.OnOff{
 		OnChange: func(on bool) { log.Printf("light on=%v", on) },
 	})
-	d.OpenCommissioningWindow()
+	if !d.Commissioned() {
+		d.OpenCommissioningWindow()
+	}
 	log.Printf("listening on %v, passcode %d, discriminator %d", conn.LocalAddr(), *passcode, *discriminator)
 
 	buf := make([]byte, 1280)

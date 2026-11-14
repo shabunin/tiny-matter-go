@@ -1,6 +1,8 @@
 package clusters
 
 import (
+	"errors"
+
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/tlv"
@@ -348,4 +350,40 @@ func (a *AccessControl) count(fabric uint8) int {
 		}
 	}
 	return n
+}
+
+// EncodeEntries writes the entries of the fabrics for which keep returns
+// true, as an array under tag, for persistent storage.
+func (a *AccessControl) EncodeEntries(w *tlv.Writer, tag tlv.Tag, keep func(fabric uint8) bool) {
+	w.StartArray(tag)
+	for i := range a.Entries {
+		if keep(a.Entries[i].FabricIndex) {
+			encodeACLEntry(w, &a.Entries[i], true)
+		}
+	}
+	w.EndContainer()
+}
+
+// DecodeEntries appends the entries written by EncodeEntries; r is
+// positioned on the array.
+func (a *AccessControl) DecodeEntries(r *tlv.Reader) error {
+	if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+		return errors.New("acl: malformed stored entries")
+	}
+	for r.Next() == nil {
+		var fabric uint8
+		sub := *r // a copy to find the fabric index first
+		im.ForEachField(&sub, func(r *tlv.Reader, tag uint8) error {
+			if tag == 0xFE {
+				fabric, _ = r.Uint8()
+			}
+			return nil
+		})
+		e, ok := decodeACLEntry(r, fabric)
+		if !ok || fabric == 0 {
+			return errors.New("acl: invalid stored entry")
+		}
+		a.Entries = append(a.Entries, e)
+	}
+	return r.ExitContainer()
 }

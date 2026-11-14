@@ -183,3 +183,26 @@ func (t *Table) Remove(index uint8) error {
 	}
 	return ErrNotFound
 }
+
+// Restore adds a committed fabric loaded from storage, keeping its index.
+// The certificate chain is validated again.
+func (t *Table) Restore(index uint8, rcac, icac, noc []byte, key *p256.PrivateKey, ipk []byte, vendorID uint16, label string) (*Fabric, error) {
+	if index == 0 || index == 255 || t.Get(index) != nil {
+		return nil, errors.New("fabric: bad or duplicate index")
+	}
+	saved := t.lastIndex
+	f, err := t.Add(rcac, icac, noc, key, ipk, vendorID)
+	t.lastIndex = saved
+	if err != nil {
+		return nil, err
+	}
+	f.Index, f.Label, f.Pending = index, label, false
+	return f, nil
+}
+
+// LastIndex returns the most recently assigned fabric index, which is
+// persisted so indexes are not reused soon after a removal.
+func (t *Table) LastIndex() uint8 { return t.lastIndex }
+
+// SetLastIndex restores LastIndex.
+func (t *Table) SetLastIndex(i uint8) { t.lastIndex = i }

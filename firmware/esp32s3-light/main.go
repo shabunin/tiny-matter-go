@@ -6,6 +6,10 @@
 //
 //	chip-tool pairing onnetwork-long 1 20202021 3840
 //
+// It keeps its fabrics in flash and restarts already commissioned. Hold
+// the G0 button for 5 s to erase them (factory reset). The RGB LED shows the
+// light state; dim purple means it is waiting to be commissioned.
+//
 // The console is USB-Serial-JTAG: when no host reads it, prints block,
 // which stalls the firmware. Keep a serial reader attached while it is
 // plugged into a computer.
@@ -17,6 +21,7 @@ package main
 
 import (
 	"crypto/rand"
+	"machine"
 	"net/netip"
 	"time"
 
@@ -28,6 +33,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/ip6"
 	"github.com/shabunin/tiny-matter-go/mdns"
+	"github.com/shabunin/tiny-matter-go/storage"
 	"tinygo.org/x/espradio"
 )
 
@@ -66,8 +72,18 @@ func fatal(msg string, err error) {
 	}
 }
 
+// stateStore keeps fabrics and the ACL in the last 32 KB of the flash data
+// area, in two 16 KB slots.
+func stateStore() *storage.Flash {
+	const slot = 16 << 10
+	return &storage.Flash{Dev: machine.Flash, Offset: machine.Flash.Size() - 2*slot, SlotSize: slot}
+}
+
 func main() {
+	initBoard()
+	setLED(0, 0, 8) // dim blue: starting
 	time.Sleep(2 * time.Second)
+	store := stateStore()
 	println("tiny-matter-go light: connecting to Wi-Fi", ssid)
 
 	params := espradio.STAConfig{SSID: ssid, Password: password}
@@ -139,6 +155,7 @@ func main() {
 		},
 		DeviceType: clusters.DeviceTypeOnOffLight.ID,
 		Advertiser: resp,
+		Store:      store,
 		Log:        func(msg string) { println(msg) },
 	})
 	if err != nil {
@@ -146,7 +163,15 @@ func main() {
 	}
 	ep := d.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
 	d.Node.AddCluster(ep, clusters.Descriptor{}, &clusters.OnOff{
-		OnChange: func(on bool) { println("LIGHT", map[bool]string{true: "ON", false: "OFF"}[on]) },
+		OnChange: func(on bool) {
+			if on {
+				println("LIGHT ON")
+				setLED(60, 50, 30) // warm white
+			} else {
+				println("LIGHT OFF")
+				setLED(0, 0, 0)
+			}
+		},
 	})
 
 	stack.Listen(matterPort, func(src netip.AddrPort, dst netip.Addr, b []byte) {
@@ -158,8 +183,15 @@ func main() {
 		nMDNS++
 		resp.HandlePacket(time.Now(), src, b)
 	})
-	d.OpenCommissioningWindow()
-	println("commissionable: passcode", passcode, "discriminator", discriminator)
+	if d.Commissioned() {
+		println("commissioned; reachable over CASE")
+		setLED(0, 0, 0)
+	} else {
+		d.OpenCommissioningWindow()
+		println("commissionable: passcode", passcode, "discriminator", discriminator)
+		setLED(8, 0, 8) // dim purple: waiting to be commissioned
+	}
+	var pressedSince time.Time
 
 	var frame [espradio.MaxFrameSize]byte
 	lastReport := time.Now()
@@ -181,6 +213,20 @@ func main() {
 		}
 		d.Poll(now)
 		resp.Poll(now)
+		// Holding G0 for 5 s erases the stored fabrics and restarts.
+		if buttonPressed() {
+			if pressedSince.IsZero() {
+				pressedSince = now
+			} else if now.Sub(pressedSince) > 5*time.Second {
+				println("factory reset")
+				setLED(40, 0, 0)
+				store.Erase()
+				time.Sleep(500 * time.Millisecond)
+				restart()
+			}
+		} else {
+			pressedSince = time.Time{}
+		}
 		if now.Sub(lastReport) > 30*time.Second {
 			lastReport = now
 			rx, drops := espradio.NetifRxStats()

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
@@ -20,6 +21,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/securechannel"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
 	"github.com/shabunin/tiny-matter-go/securechannel/pase"
+	"github.com/shabunin/tiny-matter-go/storage"
 )
 
 // Config configures a device.
@@ -43,6 +45,10 @@ type Config struct {
 
 	Advertiser dnssd.Advertiser // optional
 	Log        func(msg string) // optional
+
+	// Store, if set, keeps fabrics and the ACL across restarts. New loads
+	// it; changes are saved from Poll.
+	Store storage.Store
 }
 
 // Device is a Matter node.
@@ -61,6 +67,8 @@ type Device struct {
 
 	deferred []func(now time.Time)
 	instance uint64 // commissionable instance name
+	dirty    bool   // persistent state changed since the last save
+	saved    []byte // last saved state
 }
 
 // New creates a device. Its commissioning window starts closed; call
@@ -108,7 +116,13 @@ func New(cfg Config) (*Device, error) {
 	d.General.Complete = d.commissioningComplete
 	d.OpCreds = clusters.NewOperationalCredentials(cfg.Attestation, d.Fabrics, d.FailSafe, d.ACL, cfg.Rand)
 	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
-		d.later(func(now time.Time) { d.closeFabricSessions(now, index) })
+		d.later(func(now time.Time) {
+			d.closeFabricSessions(now, index)
+			if d.Fabrics.Committed() == 0 && len(d.Fabrics.Fabrics()) == 0 && !d.PASE.WindowOpen() {
+				d.log("last fabric removed: opening the commissioning window")
+				d.OpenCommissioningWindow()
+			}
+		})
 		d.advertise()
 	}
 	d.OpCreds.OnFabricAdded = func(now time.Time, f *fabric.Fabric) {
@@ -123,8 +137,26 @@ func New(cfg Config) (*Device, error) {
 	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.OpCreds)
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
+	d.Node.OnChange = func(p im.ConcretePath) {
+		if persistent(p) {
+			d.dirty = true
+		}
+	}
+	if cfg.Store != nil {
+		if err := d.load(); err != nil {
+			d.log("stored state ignored: " + err.Error())
+		} else if n := d.Fabrics.Committed(); n > 0 {
+			d.log("restored " + strconv.Itoa(n) + " fabric(s)")
+		}
+		d.saved = d.encodeState()
+		d.advertise()
+	}
 	return d, nil
 }
+
+// Commissioned reports whether the node belongs to at least one fabric.
+// Applications typically open the commissioning window when it does not.
+func (d *Device) Commissioned() bool { return d.Fabrics.Committed() > 0 }
 
 func (d *Device) log(msg string) {
 	if d.cfg.Log != nil {
@@ -146,6 +178,10 @@ func (d *Device) Poll(now time.Time) time.Time {
 		f := d.deferred[0]
 		d.deferred = d.deferred[1:]
 		f(now)
+	}
+	if d.dirty {
+		d.dirty = false
+		d.save()
 	}
 	next := d.M.Poll(now)
 	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
@@ -172,6 +208,7 @@ func (d *Device) commissioningComplete(ctx *im.Context) clusters.CommissioningEr
 		return clusters.InvalidAuthentication
 	}
 	d.Fabrics.Commit()
+	d.dirty = true
 	d.OpCreds.Reset()
 	d.PASE.CloseWindow()
 	d.later(d.closePASESessions)
