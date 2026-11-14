@@ -48,9 +48,9 @@ var commands []command
 func init() {
 	commands = []command{
 		{"info", "", "show the controller's fabric", cmdInfo},
-		{"discover", "[seconds]", "list devices in commissioning mode", cmdDiscover},
-		{"commission", "<code> [address] [-id n] [-label text] [-skip-attestation]",
-			"commission a device by its QR or manual pairing code", cmdCommission},
+		{"discover", "[seconds] [-ble]", "list devices in commissioning mode (-ble: over Bluetooth LE too)", cmdDiscover},
+		{"commission", "<code> [address] [-id n] [-label text] [-skip-attestation] [-ble] [-ssid name [-password pw]]",
+			"commission a device by its QR or manual pairing code; with -ssid, over BLE, giving it that Wi-Fi network", cmdCommission},
 		{"nodes", "", "list commissioned nodes", cmdNodes},
 		{"label", "<node> <label>", "name a node", cmdLabel},
 		{"read", "<node> <endpoint|*> <cluster|*> [attribute|*]... [-all-fabrics]", "read attributes", cmdRead},

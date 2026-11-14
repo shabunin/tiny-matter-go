@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -38,17 +39,22 @@ func cmdInfo(args []string) error {
 }
 
 func cmdDiscover(args []string) error {
+	fs := flagSet("discover")
+	ble := fs.Bool("ble", false, "look over Bluetooth LE too")
+	pos, err := parseArgs(fs, args)
+	if err != nil || len(pos) > 1 {
+		return usageError{}
+	}
 	wait := 3 * time.Second
-	switch len(args) {
-	case 0:
-	case 1:
-		s, err := strconv.ParseFloat(args[0], 64)
+	if *ble {
+		wait = 10 * time.Second
+	}
+	if len(pos) == 1 {
+		s, err := strconv.ParseFloat(pos[0], 64)
 		if err != nil {
 			return usageError{}
 		}
 		wait = time.Duration(s * float64(time.Second))
-	default:
-		return usageError{}
 	}
 	c, err := open(false)
 	if err != nil {
@@ -57,12 +63,37 @@ func cmdDiscover(args []string) error {
 	defer c.Close()
 	ctx, cancel := withTimeout(wait)
 	defer cancel()
+	var bleFound []controller.BLECommissionable
+	bleErr := make(chan error, 1)
+	if *ble {
+		go func() {
+			bleErr <- c.DiscoverBLE(ctx, func(d controller.BLECommissionable) { bleFound = append(bleFound, d) })
+		}()
+	}
 	found, err := c.Discover(ctx)
 	if err != nil {
 		return err
 	}
+	if *ble {
+		if err := <-bleErr; err != nil {
+			return err
+		}
+		if len(bleFound) > 0 {
+			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "BLE ADDRESS\tDISCRIMINATOR\tVENDOR\tPRODUCT\tNAME")
+			for _, d := range bleFound {
+				fmt.Fprintf(tw, "%s\t%d\t0x%04X\t0x%04X\t%s\n", d.Address, d.Discriminator, d.VendorID, d.ProductID, d.Name)
+			}
+			tw.Flush()
+			if len(found) > 0 {
+				fmt.Println()
+			}
+		}
+	}
 	if len(found) == 0 {
-		fmt.Println("no devices in commissioning mode")
+		if len(bleFound) == 0 {
+			fmt.Println("no devices in commissioning mode")
+		}
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -83,6 +114,9 @@ func cmdCommission(args []string) error {
 	id := fs.Uint64("id", 0, "node ID to give the device")
 	label := fs.String("label", "", "label for the node")
 	skip := fs.Bool("skip-attestation", false, "commission even if device attestation fails")
+	ble := fs.Bool("ble", false, "commission over Bluetooth LE")
+	ssid := fs.String("ssid", "", "Wi-Fi network to give the device (implies -ble without an address)")
+	password := fs.String("password", "", "the Wi-Fi password (default $TMCTL_WIFI_PASSWORD)")
 	pos, err := parseArgs(fs, args)
 	if err != nil || len(pos) < 1 || len(pos) > 2 {
 		return usageError{}
@@ -91,11 +125,21 @@ func cmdCommission(args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := controller.CommissionOptions{NodeID: *id, Label: *label, SkipAttestation: *skip}
+	opts := controller.CommissionOptions{NodeID: *id, Label: *label, SkipAttestation: *skip, BLE: *ble}
 	if len(pos) == 2 {
 		if opts.Addr, err = addrArg(pos[1]); err != nil {
 			return err
 		}
+	}
+	if *ssid != "" {
+		pw := *password
+		if pw == "" {
+			pw = os.Getenv("TMCTL_WIFI_PASSWORD")
+		}
+		opts.WiFi = &controller.WiFiNetwork{SSID: []byte(*ssid), Password: []byte(pw)}
+		opts.BLE = opts.BLE || len(pos) == 1
+	} else if *password != "" {
+		return errors.New("-password without -ssid")
 	}
 	c, err := open(true)
 	if err != nil {
