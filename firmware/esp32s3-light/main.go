@@ -11,6 +11,9 @@
 // light state (red when on); dim purple means it is waiting to be
 // commissioned, yellow means a factory reset.
 //
+// It speaks IPv6 (link-local) and IPv4 (DHCP), and advertises itself with
+// mDNS on both, so controllers that look over either family find it.
+//
 // The console is USB-Serial-JTAG: when no host reads it, prints block,
 // which stalls the firmware. Keep a serial reader attached while it is
 // plugged into a computer.
@@ -32,6 +35,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
 	"github.com/shabunin/tiny-matter-go/device"
 	"github.com/shabunin/tiny-matter-go/exchange"
+	"github.com/shabunin/tiny-matter-go/ip4"
 	"github.com/shabunin/tiny-matter-go/ip6"
 	"github.com/shabunin/tiny-matter-go/mdns"
 	"github.com/shabunin/tiny-matter-go/storage"
@@ -47,15 +51,27 @@ const (
 	iterations    = 1000
 )
 
-type transport struct{ s *ip6.Stack }
+// network sends UDP over IPv6 or IPv4 by destination.
+type network struct {
+	s6 *ip6.Stack
+	s4 *ip4.Stack
+}
 
-func (t transport) Send(to exchange.Addr, pkt []byte) error {
-	err := t.s.SendUDP(matterPort, to, pkt)
-	if err == ip6.ErrNoNeighbor {
+func (n network) sendUDP(port uint16, to netip.AddrPort, b []byte) error {
+	var err error
+	if to.Addr().Unmap().Is4() {
+		err = n.s4.SendUDP(port, netip.AddrPortFrom(to.Addr().Unmap(), to.Port()), b)
+	} else {
+		err = n.s6.SendUDP(port, to, b)
+	}
+	if err == ip6.ErrNoNeighbor || err == ip4.ErrNoNeighbor {
 		return nil // sent once the neighbor answers
 	}
 	return err
 }
+
+// Send implements exchange.Transport for Matter messages.
+func (n network) Send(to exchange.Addr, pkt []byte) error { return n.sendUDP(matterPort, to, pkt) }
 
 func hexMAC(mac [6]byte) string {
 	const digits = "0123456789ABCDEF"
@@ -115,7 +131,7 @@ func main() {
 	if err != nil {
 		fatal("mac", err)
 	}
-	stack := ip6.New(mac, func(f []byte) error {
+	sendFrame := func(f []byte) error {
 		nTX++
 		err := nd.SendOffsetEthFrame(f)
 		if err != nil {
@@ -125,15 +141,29 @@ func main() {
 			}
 		}
 		return err
-	})
+	}
+	stack := ip6.New(mac, sendFrame)
+	stack4 := ip4.New(mac, sendFrame)
+	net := network{stack, stack4}
 	println("wifi up, mac", hexMAC(mac), "address", stack.Addr().String())
 
 	resp := mdns.New(hexMAC(mac), []netip.Addr{stack.Addr()}, func(dst netip.AddrPort, b []byte) error {
-		return stack.SendUDP(mdns.Port, dst, b)
+		return net.sendUDP(mdns.Port, dst, b)
 	})
 	if err := stack.Join(mdns.Group); err != nil {
 		fatal("join mdns", err)
 	}
+	stack4.Join(mdns.Group4)
+	stack4.StartDHCP(hexMAC(mac), func(p netip.Prefix, gw netip.Addr) {
+		addrs := []netip.Addr{stack.Addr()}
+		if p.IsValid() {
+			println("ipv4 address", p.String(), "gateway", gw.String())
+			addrs = append(addrs, p.Addr())
+		} else {
+			println("ipv4 address lost")
+		}
+		resp.SetAddrs(addrs)
+	})
 
 	salt := []byte("SPAKE2P Key Salt")
 	v, err := spake2p.NewVerifier(passcode, salt, iterations)
@@ -145,7 +175,7 @@ func main() {
 		fatal("dac key", err)
 	}
 	d, err := device.New(device.Config{
-		Transport: transport{stack}, Rand: rand.Reader, Port: matterPort,
+		Transport: net, Rand: rand.Reader, Port: matterPort,
 		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: discriminator,
 		Attestation: &clusters.Attestation{
 			DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
@@ -180,15 +210,19 @@ func main() {
 		},
 	})
 
-	stack.Listen(matterPort, func(src netip.AddrPort, dst netip.Addr, b []byte) {
+	onMatter := func(src netip.AddrPort, dst netip.Addr, b []byte) {
 		if err := d.HandlePacket(time.Now(), src, b); err != nil {
 			println("drop from", src.String(), err.Error())
 		}
-	})
-	stack.Listen(mdns.Port, func(src netip.AddrPort, dst netip.Addr, b []byte) {
+	}
+	onMDNS := func(src netip.AddrPort, dst netip.Addr, b []byte) {
 		nMDNS++
 		resp.HandlePacket(time.Now(), src, b)
-	})
+	}
+	stack.Listen(matterPort, onMatter)
+	stack.Listen(mdns.Port, onMDNS)
+	stack4.Listen(matterPort, onMatter)
+	stack4.Listen(mdns.Port, onMDNS)
 	if d.Commissioned() {
 		println("commissioned; reachable over CASE")
 		setLED(0, 0, 0)
@@ -210,15 +244,19 @@ func main() {
 			f := frame[off : off+n]
 			countFrame(f)
 			stack.HandleFrame(f)
+			stack4.HandleFrame(f)
 		}
 		now := time.Now()
 		if reconnected {
 			reconnected = false
 			stack.ReportGroups()
+			stack4.ReportGroups()
+			stack4.RenewDHCP()
 			resp.Reannounce()
 		}
 		d.Poll(now)
 		resp.Poll(now)
+		stack4.Poll(now)
 		// Holding G0 for 5 s erases the stored fabrics and restarts.
 		if buttonPressed() {
 			if pressedSince.IsZero() {

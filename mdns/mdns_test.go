@@ -58,6 +58,8 @@ func parse(t *testing.T, b []byte) (qd int, an, ar []rr) {
 			r.data = strings.Join(parts, ",")
 		case typeAAAA:
 			r.data = netip.AddrFrom16([16]byte(d)).String()
+		case typeA:
+			r.data = netip.AddrFrom4([4]byte(d)).String()
 		}
 		off = e + 10 + l
 		if i < n {
@@ -210,4 +212,65 @@ func FuzzHandlePacket(f *testing.F) {
 		r, _ := newResponder()
 		r.HandlePacket(time.Now(), netip.AddrPortFrom(addr, Port), b)
 	})
+}
+
+func TestDualStack(t *testing.T) {
+	r, out := newResponder()
+	v4 := netip.MustParseAddr("192.168.2.50")
+	r.SetAddrs([]netip.Addr{addr, v4})
+
+	// Announcements go to both groups with both address records.
+	r.Poll(time.Now())
+	if len(*out) != 2 || (*out)[0].dst != netip.AddrPortFrom(Group, Port) || (*out)[1].dst != netip.AddrPortFrom(Group4, Port) {
+		t.Fatalf("announced to %v", *out)
+	}
+	_, an, _ := parse(t, (*out)[1].msg)
+	var a, aaaa string
+	for _, x := range an {
+		switch x.typ {
+		case typeA:
+			a = x.data
+		case typeAAAA:
+			aaaa = x.data
+		}
+	}
+	if a != v4.String() || aaaa != addr.String() {
+		t.Fatalf("announcement A=%q AAAA=%q", a, aaaa)
+	}
+
+	// An IPv4 query is answered on the IPv4 group.
+	*out = nil
+	src := netip.AddrPortFrom(netip.MustParseAddr("192.168.2.14"), Port)
+	r.HandlePacket(time.Now(), src, query(0, "_matterc._udp.local", typePTR, classIN))
+	if len(*out) != 1 || (*out)[0].dst != netip.AddrPortFrom(Group4, Port) {
+		t.Fatalf("replied to %v", *out)
+	}
+	_, _, ar := parse(t, (*out)[0].msg)
+	n := 0
+	for _, x := range ar {
+		if x.typ == typeA || x.typ == typeAAAA {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("additional address records: %+v", ar)
+	}
+
+	// A host query for A gets only the IPv4 address.
+	*out = nil
+	r.HandlePacket(time.Now(), src, query(0, "30EDA0C88734.local", typeA, classIN))
+	_, an, _ = parse(t, (*out)[0].msg)
+	if len(an) != 1 || an[0].typ != typeA || an[0].data != v4.String() {
+		t.Fatalf("A answer %+v", an)
+	}
+
+	// An IPv6-only responder does not announce over IPv4.
+	*out = nil
+	r.SetAddrs([]netip.Addr{addr})
+	r.Poll(time.Now().Add(time.Hour))
+	for _, m := range *out {
+		if m.dst.Addr().Is4() {
+			t.Fatal("announced over IPv4 without an IPv4 address")
+		}
+	}
 }

@@ -1,7 +1,8 @@
 // Package mdns is a small multicast DNS responder (RFC 6762) with DNS-SD
 // (RFC 6763) records, enough to publish Matter services from a device
-// without a full mDNS implementation. It answers PTR, SRV, TXT and AAAA
-// questions for its own names, announces services when they change and
+// without a full mDNS implementation. It answers PTR, SRV, TXT, A and AAAA
+// questions for its own names over IPv6 and IPv4, announces services when
+// they change and
 // sends goodbyes for removed ones. It does not probe for conflicts or
 // cache other hosts' records.
 package mdns
@@ -21,6 +22,9 @@ const Port = 5353
 
 // Group is the IPv6 mDNS multicast group.
 var Group = netip.MustParseAddr("ff02::fb")
+
+// Group4 is the IPv4 mDNS multicast group.
+var Group4 = netip.MustParseAddr("224.0.0.251")
 
 const (
 	typeA    = 1
@@ -59,10 +63,38 @@ type Responder struct {
 }
 
 // New returns a responder for host (a label such as "30EDA0C88734",
-// published as host.local) reachable at addrs. send transmits one UDP
-// datagram from port 5353.
+// published as host.local) reachable at addrs (IPv6 and IPv4). send
+// transmits one UDP datagram from port 5353, over IPv4 or IPv6 by dst.
+// Announcements go to the group of each address family in addrs.
 func New(host string, addrs []netip.Addr, send func(dst netip.AddrPort, b []byte) error) *Responder {
 	return &Responder{host: host + ".local", addrs: addrs, send: send, buf: make([]byte, 0, maxPacket)}
+}
+
+// SetAddrs replaces the host addresses, for example when DHCP assigns an
+// IPv4 address, and announces them again.
+func (r *Responder) SetAddrs(addrs []netip.Addr) {
+	r.addrs = append(r.addrs[:0:0], addrs...)
+	r.Reannounce()
+}
+
+// groups returns the multicast destinations for announcements.
+func (r *Responder) groups() []netip.AddrPort {
+	var g []netip.AddrPort
+	has := func(v4 bool) bool {
+		for _, a := range r.addrs {
+			if a.Is4() == v4 {
+				return true
+			}
+		}
+		return false
+	}
+	if has(false) {
+		g = append(g, netip.AddrPortFrom(Group, Port))
+	}
+	if has(true) {
+		g = append(g, netip.AddrPortFrom(Group4, Port))
+	}
+	return g
 }
 
 // Advertise replaces the published services (dnssd.Advertiser). Changes
@@ -130,21 +162,34 @@ func (r *Responder) announce(s dnssd.Service, ttlScale uint32) {
 	n += w.srv(s, r.host, ttlHost*ttlScale)
 	n += w.txt(s, ttlOther*ttlScale)
 	if ttlScale != 0 {
-		n += r.aaaa(w, ttlHost)
+		n += r.addrRecords(w, ttlHost, typeANY)
 	}
-	r.flush(w, 0, n, 0, netip.AddrPortFrom(Group, Port))
+	for _, g := range r.groups() {
+		r.flush(w, 0, n, 0, g)
+	}
 }
 
 func serviceName(s dnssd.Service) string  { return s.Type + ".local" }
 func instanceName(s dnssd.Service) string { return s.Instance + "." + s.Type + ".local" }
 
-func (r *Responder) aaaa(w *writer, ttl uint32) int {
+// addrRecords writes the host's A and AAAA records (those of type want, or
+// both for typeANY).
+func (r *Responder) addrRecords(w *writer, ttl uint32, want uint16) int {
+	n := 0
 	for _, a := range r.addrs {
-		w.record(r.host, typeAAAA, classIN|cacheFlush, ttl)
-		b := a.As16()
-		w.rdata(b[:])
+		if a.Is4() && (want == typeA || want == typeANY) {
+			w.record(r.host, typeA, classIN|cacheFlush, ttl)
+			b := a.As4()
+			w.rdata(b[:])
+			n++
+		} else if a.Is6() && (want == typeAAAA || want == typeANY) {
+			w.record(r.host, typeAAAA, classIN|cacheFlush, ttl)
+			b := a.As16()
+			w.rdata(b[:])
+			n++
+		}
 	}
-	return len(r.addrs)
+	return n
 }
 
 // HandlePacket processes a datagram received on port 5353 (or a legacy
@@ -209,13 +254,16 @@ func (r *Responder) HandlePacket(now time.Time, src netip.AddrPort, payload []by
 		ar += w.txt(s, ttlOther)
 	}
 	if addHost || len(addSrv) > 0 {
-		ar += r.aaaa(w, ttlHost)
+		ar += r.addrRecords(w, ttlHost, typeANY)
 	}
 	qdOut := 0
 	if legacy {
 		qdOut = len(questions)
 	}
 	dst := netip.AddrPortFrom(Group, Port)
+	if src.Addr().Unmap().Is4() {
+		dst = netip.AddrPortFrom(Group4, Port) // answer on the query's family
+	}
 	if unicast {
 		dst = src
 	}
@@ -243,8 +291,11 @@ func (r *Responder) answer(w *writer, q question) (n int, additional []dnssd.Ser
 		return n, nil, false
 	}
 	if strings.EqualFold(q.name, r.host) {
-		if match(typeAAAA) {
-			return r.aaaa(w, ttlHost), nil, false
+		switch {
+		case q.typ == typeANY:
+			return r.addrRecords(w, ttlHost, typeANY), nil, false
+		case q.typ == typeA || q.typ == typeAAAA:
+			return r.addrRecords(w, ttlHost, q.typ), nil, false
 		}
 		return 0, nil, false
 	}
