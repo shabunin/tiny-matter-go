@@ -36,6 +36,8 @@ type fixture struct {
 	w        *simnet.World
 	dev, ctl *simnet.Node
 	cs       *exchange.Session // controller's session to the device
+	ds       *exchange.Session // device's session to the controller
+	server   *im.Server
 	node     *im.Node
 	onoff    *clusters.OnOff
 	basic    *clusters.BasicInformation
@@ -55,7 +57,14 @@ func newFixture(t *testing.T) *fixture {
 	f.node.AddCluster(ep1, clusters.Descriptor{}, f.onoff)
 	ep2 := f.node.AddEndpoint(2)
 	f.node.AddCluster(ep2, bigCluster{})
-	im.NewServer(f.dev.M, f.node)
+	f.server = im.NewServer(f.dev.M, f.node)
+	f.dev.Attach(f.dev.M.HandlePacket, func(now time.Time) time.Time {
+		a, b := f.dev.M.Poll(now), f.server.Poll(now)
+		if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+			return b
+		}
+		return a
+	})
 
 	k1, k2 := bytes.Repeat([]byte{1}, 16), bytes.Repeat([]byte{2}, 16)
 	ida, _ := f.ctl.M.AllocateSessionID()
@@ -66,8 +75,9 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.dev.M.NewSecureSession(f.w.Now, exchange.SecureSessionParams{Peer: f.ctl.Addr,
-		LocalSessionID: idb, PeerSessionID: ida, EncryptKey: k2, DecryptKey: k1}); err != nil {
+	if f.ds, err = f.dev.M.NewSecureSession(f.w.Now, exchange.SecureSessionParams{Peer: f.ctl.Addr,
+		LocalSessionID: idb, PeerSessionID: ida, EncryptKey: k2, DecryptKey: k1,
+		AuthMode: exchange.AuthCASE, FabricIndex: 1}); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -355,6 +365,7 @@ func FuzzServer(f *testing.F) {
 	f.Add(uint8(im.OpInvokeRequest), im.EncodeInvokeRequest(im.CommandPath{Endpoint: 1, Cluster: 6, Command: 2}, false, nil))
 	f.Add(uint8(im.OpWriteRequest), im.EncodeWriteRequest(path(0, 0x28, 5), false, func(w *tlv.Writer, tag tlv.Tag) { w.PutString(tag, "x") }))
 	f.Add(uint8(im.OpTimedRequest), im.EncodeTimedRequest(100))
+	f.Add(uint8(im.OpSubscribeRequest), im.EncodeSubscribeRequest([]im.AttributePath{{AnyEndpoint: true, AnyCluster: true, AnyAttribute: true}}, 0, 10, false, true))
 	f.Fuzz(func(t *testing.T, op uint8, payload []byte) {
 		fx := newFixture(&testing.T{})
 		c := &client{}
@@ -366,5 +377,7 @@ func FuzzServer(f *testing.F) {
 			return
 		}
 		fx.w.Advance(time.Second)
+		fx.onoff.Set(fx.node, 1, true) // exercise subscription reports
+		fx.w.Advance(time.Minute)
 	})
 }

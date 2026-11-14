@@ -23,15 +23,28 @@ const (
 // Server serves the Interaction Model for a node.
 type Server struct {
 	node *Node
+	m    *exchange.Manager
 	buf  []byte // shared encode buffer; messages are sent synchronously
 	// Access, if set, enforces access control; nil allows everything.
 	Access AccessChecker
+
+	subs      []*subscription
+	nextSubID uint32
 }
 
-// NewServer returns a Server for n and registers it with m.
+// NewServer returns a Server for n and registers it with m. It chains
+// itself into n.OnChange to drive subscriptions; call Poll to send their
+// reports.
 func NewServer(m *exchange.Manager, n *Node) *Server {
-	s := &Server{node: n, buf: make([]byte, 0, message.MaxPacketSize)}
+	s := &Server{node: n, m: m, buf: make([]byte, 0, message.MaxPacketSize), nextSubID: n.version * 0x9E3779B1}
 	m.Register(message.ProtocolInteractionModel, s.factory)
+	prev := n.OnChange
+	n.OnChange = func(p ConcretePath) {
+		s.changed(p)
+		if prev != nil {
+			prev(p)
+		}
+	}
 	return s
 }
 
@@ -53,6 +66,11 @@ type readState struct {
 	filters        []versionFilter
 	fabricFiltered bool
 	next           int // index of the first candidate path not yet reported
+
+	// Subscriptions only.
+	sub   *subscription
+	dirty []ConcretePath // changed paths to report; nil reports all paths
+	done  bool           // last chunk sent, awaiting its StatusResponse
 }
 
 // handler serves one exchange.
@@ -66,7 +84,16 @@ func (h *handler) ctx(now time.Time, ex *exchange.Exchange) *Context {
 	return &Context{Now: now, Node: h.s.node, Session: ex.Session()}
 }
 
-func (h *handler) OnError(now time.Time, ex *exchange.Exchange, err error) { h.read = nil }
+func (h *handler) OnError(now time.Time, ex *exchange.Exchange, err error) { h.abort() }
+
+// abort ends the read or report in progress; a failed subscription report
+// ends the subscription.
+func (h *handler) abort() {
+	if h.read != nil && h.read.sub != nil {
+		h.s.removeSub(h.read.sub)
+	}
+	h.read = nil
+}
 
 func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
 	if msg.ProtocolID != message.ProtocolInteractionModel {
@@ -81,14 +108,24 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 			break
 		}
 		st = h.onRead(now, ex, msg.Payload)
+	case OpSubscribeRequest:
+		if h.read != nil {
+			st = InvalidAction
+			break
+		}
+		st = h.onSubscribe(now, ex, msg.Payload)
 	case OpStatusResponse:
 		if h.read == nil {
 			ex.Close(now)
 			return
 		}
 		if s, err := decodeStatusResponse(msg.Payload); err != nil || s != Success {
-			h.read = nil
+			h.abort()
 			ex.Close(now)
+			return
+		}
+		if h.read.done {
+			h.finishSubReport(now, ex)
 			return
 		}
 		h.sendReport(now, ex)
@@ -107,7 +144,7 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 		st = InvalidAction
 	}
 	if st != Success {
-		h.read = nil
+		h.abort()
 		h.sendStatus(now, ex, st, true)
 	}
 }
@@ -256,6 +293,27 @@ type candidate struct {
 func (h *handler) candidates(rs *readState, f func(c *candidate) bool) {
 	node := h.s.node
 	var c candidate
+	if rs.dirty != nil {
+		// A subscription report: the changed attributes it covers.
+		for _, d := range rs.dirty {
+			if !matchesAny(rs.paths, d) {
+				continue
+			}
+			e := node.Endpoint(d.Endpoint)
+			if e == nil {
+				continue
+			}
+			ce := e.entry(d.Cluster)
+			if ce == nil {
+				continue
+			}
+			c = candidate{path: d, wildcard: true, cluster: ce.c, version: ce.version}
+			if !f(&c) {
+				return
+			}
+		}
+		return
+	}
 	for i := range rs.paths {
 		p := &rs.paths[i]
 		if !p.IsWildcard() {
@@ -332,6 +390,10 @@ func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 
 	w := tlv.NewWriter(h.s.buf[:0])
 	w.StartStruct(tlv.Anonymous)
+	if rs.sub != nil {
+		w.PutUint(tlv.ContextTag(0), uint64(rs.sub.id))
+	}
+	arrayStart := w.Checkpoint()
 	w.StartArray(tlv.ContextTag(1))
 	index, inChunk, more := 0, 0, false
 	h.candidates(rs, func(c *candidate) bool {
@@ -366,18 +428,26 @@ func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 		}
 		return true
 	})
-	w.EndContainer()
+	if inChunk == 0 {
+		w.Rollback(arrayStart) // nothing to report (a keep-alive)
+	} else {
+		w.EndContainer()
+	}
 	if more {
 		w.PutBool(tlv.ContextTag(3), true)
-	} else {
+	} else if rs.sub == nil {
 		w.PutBool(tlv.ContextTag(4), true) // SuppressResponse
 	}
 	w.PutUint(tlv.ContextTag(tagIMRevision), Revision)
 	w.EndContainer()
 	ex.Send(now, message.ProtocolInteractionModel, OpReportData, w.Bytes())
 	if !more {
-		h.read = nil
-		ex.Close(now)
+		if rs.sub == nil {
+			h.read = nil
+			ex.Close(now)
+		} else {
+			rs.done = true // subscriptions want a StatusResponse
+		}
 	}
 }
 

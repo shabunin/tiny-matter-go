@@ -137,10 +137,12 @@ func New(cfg Config) (*Device, error) {
 	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.OpCreds)
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
+	serverHook := d.Node.OnChange // subscriptions
 	d.Node.OnChange = func(p im.ConcretePath) {
 		if persistent(p) {
 			d.dirty = true
 		}
+		serverHook(p)
 	}
 	if cfg.Store != nil {
 		if err := d.load(); err != nil {
@@ -185,6 +187,9 @@ func (d *Device) Poll(now time.Time) time.Time {
 	}
 	next := d.M.Poll(now)
 	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
+	if t := d.Server.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
 	return next

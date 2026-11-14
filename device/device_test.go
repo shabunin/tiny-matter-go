@@ -348,3 +348,37 @@ func TestFailSafeRollback(t *testing.T) {
 		t.Fatal("fail-safe expiry did not roll back")
 	}
 }
+
+// subscriber acknowledges reports and counts them.
+type subscriber struct{ reports, subResp int }
+
+func (c *subscriber) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+	switch msg.Opcode {
+	case im.OpReportData:
+		c.reports++
+		ex.Send(now, message.ProtocolInteractionModel, im.OpStatusResponse, im.EncodeStatusResponse(im.Success))
+	case im.OpSubscribeResp:
+		c.subResp++
+		ex.Close(now)
+	}
+}
+func (c *subscriber) OnError(time.Time, *exchange.Exchange, error) {}
+
+func TestSubscriptionOverCASE(t *testing.T) {
+	h := newHarness(t)
+	_, caseS := h.commission()
+	c := &subscriber{}
+	h.ctl.M.Register(message.ProtocolInteractionModel, func(*exchange.Exchange) exchange.Delegate { return c })
+	ex, _ := h.ctl.M.NewExchange(caseS, c)
+	ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpSubscribeRequest, im.EncodeSubscribeRequest(
+		[]im.AttributePath{{Endpoint: 1, Cluster: clusters.IDOnOff, Attribute: 0}}, 0, 60, false, true))
+	h.w.Advance(time.Second)
+	if c.subResp != 1 || c.reports != 1 || h.dev.Server.Subscriptions() != 1 {
+		t.Fatalf("subscribe: %+v", c)
+	}
+	h.invoke(caseS, im.CommandPath{Endpoint: 1, Cluster: clusters.IDOnOff, Command: 2}, nil)
+	h.w.Advance(time.Second)
+	if c.reports != 2 {
+		t.Fatalf("toggle not reported: %+v", c)
+	}
+}

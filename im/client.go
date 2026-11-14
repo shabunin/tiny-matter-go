@@ -196,3 +196,37 @@ func DecodeWriteResponse(b []byte) ([]AttributeReport, error) {
 	})
 	return out, err
 }
+
+// EncodeSubscribeRequest encodes a SubscribeRequest for paths with the
+// given interval bounds in seconds.
+func EncodeSubscribeRequest(paths []AttributePath, minFloor, maxCeiling uint16, keep, fabricFiltered bool) []byte {
+	w := tlv.NewWriter(nil)
+	w.StartStruct(tlv.Anonymous)
+	w.PutBool(tlv.ContextTag(0), keep)
+	w.PutUint(tlv.ContextTag(1), uint64(minFloor))
+	w.PutUint(tlv.ContextTag(2), uint64(maxCeiling))
+	w.StartArray(tlv.ContextTag(3))
+	for _, p := range paths {
+		EncodeAttributePath(w, tlv.Anonymous, p)
+	}
+	w.EndContainer()
+	w.PutBool(tlv.ContextTag(7), fabricFiltered)
+	w.PutUint(tlv.ContextTag(tagIMRevision), Revision)
+	w.EndContainer()
+	return w.Bytes()
+}
+
+// DecodeSubscribeResponse returns the subscription ID and max interval
+// (seconds) of a SubscribeResponse.
+func DecodeSubscribeResponse(b []byte) (id uint32, maxInterval uint16, err error) {
+	err = structFields(tlv.NewReader(b), func(r *tlv.Reader, tag uint8) (err error) {
+		switch tag {
+		case 0:
+			id, err = r.Uint32()
+		case 2:
+			maxInterval, err = r.Uint16()
+		}
+		return err
+	})
+	return id, maxInterval, err
+}
