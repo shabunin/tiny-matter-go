@@ -55,6 +55,46 @@ func (*AccessControl) ReadPrivilege(attr uint32) im.Privilege {
 func (*AccessControl) WritePrivilege(uint32) im.Privilege  { return im.Administer }
 func (*AccessControl) InvokePrivilege(uint32) im.Privilege { return im.Administer }
 
+// EventACLEntryChanged is the AccessControlEntryChanged event.
+const EventACLEntryChanged = 0x00
+
+// ACL change types (ChangeTypeEnum).
+const (
+	ACLChanged = 0
+	ACLAdded   = 1
+	ACLRemoved = 2
+)
+
+var aclEvents = []uint32{EventACLEntryChanged}
+
+func (*AccessControl) Events() []uint32                   { return aclEvents }
+func (*AccessControl) EventPrivilege(uint32) im.Privilege { return im.Administer }
+
+// entryChanged records AccessControlEntryChanged for an entry the subject
+// of ctx changed: a fabric-sensitive event naming the administrator by
+// node ID (CASE) or passcode ID (PASE).
+func entryChanged(ctx *im.Context, change uint8, e *ACLEntry) {
+	if ctx.Node == nil {
+		return
+	}
+	ctx.Node.Emit(ctx.Now, im.Event{
+		Path:     im.ConcreteEventPath{Endpoint: 0, Cluster: IDAccessControl, Event: EventACLEntryChanged},
+		Priority: im.PriorityInfo,
+		Fabric:   e.FabricIndex,
+		Fields: func(w *tlv.Writer) {
+			if s := ctx.Session; s != nil && s.AuthMode == exchange.AuthCASE {
+				w.PutUint(tlv.ContextTag(1), s.PeerNodeID())
+				w.PutNull(tlv.ContextTag(2))
+			} else {
+				w.PutNull(tlv.ContextTag(1))
+				w.PutUint(tlv.ContextTag(2), 0) // the commissioning passcode
+			}
+			w.PutUint(tlv.ContextTag(3), uint64(change))
+			encodeACLEntry(w, tlv.ContextTag(4), e, true)
+		},
+	})
+}
+
 // RemoveFabric drops the entries of a fabric.
 func (a *AccessControl) RemoveFabric(index uint8) {
 	out := a.Entries[:0]
@@ -154,7 +194,7 @@ func (a *AccessControl) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.Write
 			if ctx.FabricFiltered && e.FabricIndex != accessingFabric(ctx) {
 				continue
 			}
-			encodeACLEntry(w, e, e.FabricIndex == accessingFabric(ctx))
+			encodeACLEntry(w, tlv.Anonymous, e, e.FabricIndex == accessingFabric(ctx))
 		}
 		w.EndContainer()
 	case 2:
@@ -178,8 +218,8 @@ func accessingFabric(ctx *im.Context) uint8 {
 
 // encodeACLEntry writes an AccessControlEntryStruct; fabric-sensitive
 // fields are only written for the accessing fabric.
-func encodeACLEntry(w *tlv.Writer, e *ACLEntry, sensitive bool) {
-	w.StartStruct(tlv.Anonymous)
+func encodeACLEntry(w *tlv.Writer, tag tlv.Tag, e *ACLEntry, sensitive bool) {
+	w.StartStruct(tag)
 	if sensitive {
 		w.PutUint(tlv.ContextTag(1), uint64(e.Privilege))
 		w.PutUint(tlv.ContextTag(2), uint64(e.AuthMode))
@@ -301,6 +341,8 @@ func decodeACLEntry(r *tlv.Reader, fabric uint8) (ACLEntry, bool) {
 }
 
 // WriteAttribute replaces (or appends to) the accessing fabric's entries.
+// Like the SDK, a replacement reports each index as changed, added or
+// removed.
 func (a *AccessControl) WriteAttribute(ctx *im.Context, attr uint32, appendItem bool, r *tlv.Reader) im.Status {
 	if attr != 0 {
 		return im.UnsupportedWrite
@@ -318,6 +360,7 @@ func (a *AccessControl) WriteAttribute(ctx *im.Context, attr uint32, appendItem 
 			return im.ResourceExhausted
 		}
 		a.Entries = append(a.Entries, e)
+		entryChanged(ctx, ACLAdded, &e)
 		return im.Success
 	}
 	if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
@@ -337,8 +380,24 @@ func (a *AccessControl) WriteAttribute(ctx *im.Context, attr uint32, appendItem 
 	if len(fresh) > EntriesPerFabric {
 		return im.ResourceExhausted
 	}
+	var old []ACLEntry
+	for _, e := range a.Entries {
+		if e.FabricIndex == fabric {
+			old = append(old, e)
+		}
+	}
 	a.RemoveFabric(fabric)
 	a.Entries = append(a.Entries, fresh...)
+	for i := range fresh {
+		change := uint8(ACLAdded)
+		if i < len(old) {
+			change = ACLChanged
+		}
+		entryChanged(ctx, change, &fresh[i])
+	}
+	for i := len(old) - 1; i >= len(fresh); i-- {
+		entryChanged(ctx, ACLRemoved, &old[i])
+	}
 	return im.Success
 }
 
@@ -358,7 +417,7 @@ func (a *AccessControl) EncodeEntries(w *tlv.Writer, tag tlv.Tag, keep func(fabr
 	w.StartArray(tag)
 	for i := range a.Entries {
 		if keep(a.Entries[i].FabricIndex) {
-			encodeACLEntry(w, &a.Entries[i], true)
+			encodeACLEntry(w, tlv.Anonymous, &a.Entries[i], true)
 		}
 	}
 	w.EndContainer()

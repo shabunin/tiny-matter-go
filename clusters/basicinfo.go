@@ -1,6 +1,8 @@
 package clusters
 
 import (
+	"time"
+
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
@@ -151,3 +153,32 @@ func (b *BasicInformation) WriteAttribute(ctx *im.Context, attr uint32, appendIt
 func (*BasicInformation) ReadPrivilege(uint32) im.Privilege   { return im.View }
 func (*BasicInformation) WritePrivilege(uint32) im.Privilege  { return im.Manage }
 func (*BasicInformation) InvokePrivilege(uint32) im.Privilege { return im.Operate }
+
+// Basic Information events.
+const (
+	EventStartUp = 0x00
+	EventLeave   = 0x02
+)
+
+var basicInfoEvents = []uint32{EventStartUp, EventLeave}
+
+func (*BasicInformation) Events() []uint32 { return basicInfoEvents }
+
+// StartUp records the StartUp event, which a node generates once it has
+// booted.
+func (b *BasicInformation) StartUp(n *im.Node, now time.Time) {
+	n.Emit(now, im.Event{
+		Path:     im.ConcreteEventPath{Endpoint: 0, Cluster: IDBasicInformation, Event: EventStartUp},
+		Priority: im.PriorityCritical,
+		Fields:   func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), uint64(b.SoftwareVersion)) },
+	})
+}
+
+// Leave records the Leave event for a fabric the node is about to leave.
+func (b *BasicInformation) Leave(n *im.Node, now time.Time, fabric uint8) {
+	n.Emit(now, im.Event{
+		Path:     im.ConcreteEventPath{Endpoint: 0, Cluster: IDBasicInformation, Event: EventLeave},
+		Priority: im.PriorityInfo,
+		Fields:   func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), uint64(fabric)) },
+	})
+}

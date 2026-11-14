@@ -48,6 +48,9 @@ type OperationalCredentials struct {
 	OnFabricRemoved func(now time.Time, index uint8)
 	// OnFabricAdded is called after AddNOC adds a (pending) fabric.
 	OnFabricAdded func(now time.Time, f *fabric.Fabric)
+	// OnFabricLeave is called before RemoveFabric removes a fabric (not
+	// when a fail-safe rolls one back).
+	OnFabricLeave func(now time.Time, index uint8)
 
 	// State of the commissioning in progress, reset when the fail-safe
 	// ends.
@@ -369,6 +372,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		o.ACL.Entries = append(o.ACL.Entries, ACLEntry{
 			FabricIndex: fb.Index, Privilege: im.Administer, AuthMode: exchange.AuthCASE, Subjects: []uint64{admin},
 		})
+		entryChanged(ctx, ACLAdded, &o.ACL.Entries[len(o.ACL.Entries)-1])
 		// The PASE session now accesses the new fabric.
 		if ctx.Session.AuthMode == exchange.AuthPASE {
 			ctx.Session.FabricIndex = fb.Index
@@ -400,7 +404,13 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 
 	case ocRemoveFabric:
 		idx := uint8(f.uints[0])
-		if !f.has(0) || o.Fabrics.Remove(idx) != nil {
+		if !f.has(0) || o.Fabrics.Get(idx) == nil {
+			return nocResponse(resp, NOCInvalidFabricIndex, 0)
+		}
+		if o.OnFabricLeave != nil {
+			o.OnFabricLeave(ctx.Now, idx)
+		}
+		if o.Fabrics.Remove(idx) != nil {
 			return nocResponse(resp, NOCInvalidFabricIndex, 0)
 		}
 		o.ACL.RemoveFabric(idx)

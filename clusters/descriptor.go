@@ -8,12 +8,15 @@ import (
 
 // Cluster IDs.
 const (
+	IDIdentify               = 0x0003
 	IDOnOff                  = 0x0006
 	IDDescriptor             = 0x001D
 	IDAccessControl          = 0x001F
 	IDBasicInformation       = 0x0028
 	IDGeneralCommissioning   = 0x0030
 	IDNetworkCommissioning   = 0x0031
+	IDGeneralDiagnostics     = 0x0033
+	IDSwitch                 = 0x003B
 	IDAdminCommissioning     = 0x003C
 	IDOperationalCredentials = 0x003E
 	IDGroupKeyManagement     = 0x003F
@@ -21,8 +24,9 @@ const (
 
 // Device types.
 var (
-	DeviceTypeRootNode   = im.DeviceType{ID: 0x0016, Revision: 3}
-	DeviceTypeOnOffLight = im.DeviceType{ID: 0x0100, Revision: 3}
+	DeviceTypeRootNode      = im.DeviceType{ID: 0x0016, Revision: 3}
+	DeviceTypeOnOffLight    = im.DeviceType{ID: 0x0100, Revision: 3}
+	DeviceTypeGenericSwitch = im.DeviceType{ID: 0x000F, Revision: 3}
 )
 
 // Descriptor is the Descriptor cluster. One value serves every endpoint: it
