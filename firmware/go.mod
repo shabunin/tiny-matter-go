@@ -1,9 +1,10 @@
 module firmware
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/shabunin/tiny-matter-go v0.0.0
+	tinygo.org/x/bluetooth v0.17.0
 	tinygo.org/x/espradio v0.5.0
 )
 

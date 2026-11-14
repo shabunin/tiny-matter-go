@@ -81,3 +81,11 @@ func restart() {
 	for {
 	}
 }
+
+// factoryMAC reads the base MAC (the Wi-Fi station address) from eFuse, so
+// it is known before the radio starts.
+func factoryMAC() [6]byte {
+	lo := esp.EFUSE.RD_MAC_SPI_SYS_0.Get()
+	hi := esp.EFUSE.RD_MAC_SPI_SYS_1.Get()
+	return [6]byte{byte(hi >> 8), byte(hi), byte(lo >> 24), byte(lo >> 16), byte(lo >> 8), byte(lo)}
+}
