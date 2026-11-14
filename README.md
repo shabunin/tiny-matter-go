@@ -58,6 +58,45 @@ The device also reports Basic Information StartUp and Leave, the General
 Diagnostics BootReason, and Access Control entry changes; `identify
 identify 10 1 1` blinks the LED.
 
+## Controller (tmctl)
+
+`cmd/tmctl` is a command-line Matter controller for Linux (and other hosts)
+built on the `controller` package. It keeps its own fabric, a root CA it
+generates with the keys in `~/.local/share/tiny-matter-go/controller/`
+(readable only by you), commissions devices onto it over the IP network,
+and works with them:
+
+    go install github.com/shabunin/tiny-matter-go/cmd/tmctl@latest
+    tmctl discover                          # devices in commissioning mode
+    tmctl commission 34970112332 -label lamp
+    tmctl invoke lamp 1 OnOff Toggle
+    tmctl read lamp 1 OnOff onOff
+    tmctl write lamp 0 BasicInformation NodeLabel "desk lamp"
+    tmctl invoke lamp 1 LevelControl MoveToLevel level=128 transitionTime=10 optionsMask=0 optionsOverride=0
+    tmctl events lamp '*' '*'
+    tmctl subscribe lamp 2 Switch -events -urgent   # until Ctrl-C
+    tmctl open-window lamp                  # codes for another controller
+    tmctl remove lamp                       # RemoveFabric, then forget it
+
+Clusters, attributes, commands, events and enum values go by their names
+in the Matter SDK's IDL, case aside (a unique prefix will do: `basic` is
+BasicInformation), or by number; `tmctl clusters [cluster]` lists them.
+Lists and structs are written as JSON. Subscriptions come back by
+themselves after the device restarts.
+
+Device attestation is verified. The SDK test PAAs and test certification
+declarations are trusted, for development devices such as the ones here,
+unless `-strict` is given. For production devices, put the PAA
+certificates (such as the SDK's `credentials/production/paa-root-certs`)
+in `~/.local/share/tiny-matter-go/controller/paa` or pass `-paa`. A device
+that already has a controller joins through a commissioning window opened
+there, for example `chip-tool pairing open-commissioning-window <node> 1
+600 1000 3840`, whose code goes to `tmctl commission`.
+
+Tested against the devices here, a [matter.js](https://github.com/matter-js/matter.js)
+device, and chip-tool, which commissions devices through windows `tmctl
+open-window` opens. Commissioning over BLE is not supported yet.
+
 ## Layout
 
 | Path | What |
@@ -79,7 +118,12 @@ identify 10 1 1` blinks the LED.
 | `dnssd/` | DNS-SD service descriptions (commissionable `_matterc._udp`, operational `_matter._tcp`) for an mDNS advertiser |
 | `ip6/` | Minimal IPv6 host over raw Ethernet frames: EUI-64 link-local address, Neighbor Discovery, Echo, MLDv2 reports, UDP |
 | `ip4/` | Minimal IPv4 host over the same frames: DHCP client (renew/rebind/expiry), ARP, default gateway, Echo, IGMPv2 reports, UDP |
-| `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies); a `dnssd.Advertiser` |
+| `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies; a `dnssd.Advertiser`) and querier (browse, resolve, cache) |
+| `onboarding/` | Onboarding payloads: QR codes (`MT:` base-38) and 11/21-digit manual pairing codes (Verhoeff check digit) |
+| `credentials/attestation/` | Device attestation for commissioners: DAC/PAI/PAA chain, certification declaration (CMS, CSA and SDK test signing keys), attestation and NOCSR signatures; PAA trust stores |
+| `controller/` | Matter controller for hosts: own fabric (persisted), mDNS discovery, commissioning (PASE, attestation, CSR, NOC, CASE), read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal |
+| `cmd/tmctl/` | Command-line controller over `controller` (see above) |
+| `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
 | `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, Wi-Fi networks, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
 | `cmd/hostdevice/` | An on/off light and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool and matter.js commission and control it |
@@ -99,11 +143,17 @@ identify 10 1 1` blinks the LED.
     make cross        # build for pico2-w, pico-w, xiao-ble, esp32c3, esp32s3
     make bench-qemu   # instruction counts on emulated Cortex-M3
 
-## Third-party test data
+## Third-party data
 
-Test vectors under `*/testdata/` and inlined in some tests come from
-[connectedhomeip](https://github.com/project-chip/connectedhomeip)
-(Apache-2.0), the Matter SDK, and are used only for testing.
+From [connectedhomeip](https://github.com/project-chip/connectedhomeip), the
+Matter SDK (Apache-2.0, Copyright Project CHIP Authors):
+
+- test vectors under `*/testdata/` and inlined in some tests, used only for
+  testing;
+- the test PAA certificates in `credentials/attestation/testpaa/`, which
+  `attestation.TestPAAs` trusts for development devices;
+- `internal/datamodel/controller-clusters.matter`, the IDL of the clusters
+  a controller knows, embedded in `tmctl` for names and types.
 
 ## License
 
