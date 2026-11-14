@@ -8,7 +8,8 @@
 //
 // It keeps its fabrics in flash and restarts already commissioned. Hold
 // the G0 button for 5 s to erase them (factory reset). The RGB LED shows the
-// light state; dim purple means it is waiting to be commissioned.
+// light state (red when on); dim purple means it is waiting to be
+// commissioned, yellow means a factory reset.
 //
 // The console is USB-Serial-JTAG: when no host reads it, prints block,
 // which stalls the firmware. Keep a serial reader attached while it is
@@ -81,6 +82,10 @@ func stateStore() *storage.Flash {
 
 func main() {
 	initBoard()
+	for _, c := range [][3]uint8{{40, 0, 0}, {0, 40, 0}, {0, 0, 40}} { // boot self-test
+		setLED(c[0], c[1], c[2])
+		time.Sleep(400 * time.Millisecond)
+	}
 	setLED(0, 0, 8) // dim blue: starting
 	time.Sleep(2 * time.Second)
 	store := stateStore()
@@ -166,7 +171,7 @@ func main() {
 		OnChange: func(on bool) {
 			if on {
 				println("LIGHT ON")
-				setLED(60, 50, 30) // warm white
+				setLED(80, 0, 0) // red
 			} else {
 				println("LIGHT OFF")
 				setLED(0, 0, 0)
@@ -219,7 +224,7 @@ func main() {
 				pressedSince = now
 			} else if now.Sub(pressedSince) > 5*time.Second {
 				println("factory reset")
-				setLED(40, 0, 0)
+				setLED(40, 30, 0) // yellow: erasing
 				store.Erase()
 				time.Sleep(500 * time.Millisecond)
 				restart()

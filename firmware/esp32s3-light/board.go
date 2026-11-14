@@ -11,7 +11,8 @@ import (
 
 // M5Stack Cardputer pins.
 const (
-	ledPin    = machine.GPIO21 // WS2812 RGB LED
+	ledPin    = machine.GPIO21 // WS2812 RGB LED data
+	ledPower  = machine.GPIO38 // v1.1: RGB LED power switch (v1.0: display backlight)
 	buttonPin = machine.GPIO0  // G0 button (active low)
 )
 
@@ -24,8 +25,23 @@ const (
 	tBit   = 300 // 1.25 us
 )
 
-// setLED writes one GRB pixel, timing bits with the cycle counter.
+// setLED shows a colour. The pixel is written twice: the first pass may
+// stall on instruction-cache misses (code runs from flash), which would
+// stretch pulses; the second runs from cache and overrides it.
 func setLED(r, g, b uint8) {
+	writePixel(r, g, b)
+	busyWait(300 * 240) // > 280 us latch
+	writePixel(r, g, b)
+}
+
+func busyWait(cycles uint32) {
+	start := ccount()
+	for ccount()-start < cycles {
+	}
+}
+
+// writePixel writes one GRB pixel, timing bits with the cycle counter.
+func writePixel(r, g, b uint8) {
 	set, setMask := ledPin.PortMaskSet()
 	clr, clrMask := ledPin.PortMaskClear()
 	setReg := (*volatile.Register32)(unsafe.Pointer(set))
@@ -49,8 +65,11 @@ func setLED(r, g, b uint8) {
 }
 
 func initBoard() {
+	ledPower.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	ledPower.High()
 	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	ledPin.Low()
+	busyWait(240 * 1000) // let the LED power up
 	buttonPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 }
 
