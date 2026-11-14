@@ -161,6 +161,7 @@ func main() {
 		DeviceType: clusters.DeviceTypeOnOffLight.ID,
 		Advertiser: resp,
 		Store:      store,
+		Clock:      time.Now,
 		Log:        func(msg string) { println(msg) },
 	})
 	if err != nil {

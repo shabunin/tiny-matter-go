@@ -68,6 +68,10 @@ type Config struct {
 	MaxSecureSessions    int
 	MaxUnsecuredSessions int
 	MaxExchanges         int
+	// Clock, if set, returns the current time. Sends use it to schedule
+	// retransmissions, so a reply computed slowly after the message it
+	// answers is not retransmitted at once. Nil uses the time passed in.
+	Clock func() time.Time
 }
 
 // Manager owns the sessions and exchanges of a node.

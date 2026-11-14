@@ -49,6 +49,10 @@ type Config struct {
 	// Store, if set, keeps fabrics and the ACL across restarts. New loads
 	// it; changes are saved from Poll.
 	Store storage.Store
+
+	// Clock, if set, returns the current time (time.Now on real
+	// hardware); see exchange.Config.Clock.
+	Clock func() time.Time
 }
 
 // Device is a Matter node.
@@ -80,7 +84,7 @@ func New(cfg Config) (*Device, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 5540
 	}
-	m, err := exchange.NewManager(exchange.Config{Transport: cfg.Transport, Rand: cfg.Rand})
+	m, err := exchange.NewManager(exchange.Config{Transport: cfg.Transport, Rand: cfg.Rand, Clock: cfg.Clock})
 	if err != nil {
 		return nil, err
 	}

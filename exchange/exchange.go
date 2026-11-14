@@ -51,6 +51,11 @@ func (ex *Exchange) Send(now time.Time, protocolID uint16, opcode uint8, payload
 	if ex.rtActive {
 		return ErrBusy
 	}
+	if ex.m.cfg.Clock != nil {
+		// Time the retransmission from the real send time: the caller's
+		// now may predate slow work such as a PASE or CASE computation.
+		now = ex.m.cfg.Clock()
+	}
 	ph := message.ProtocolHeader{
 		Initiator: ex.initiator, NeedsAck: true,
 		Opcode: opcode, ExchangeID: ex.id, ProtocolID: protocolID,

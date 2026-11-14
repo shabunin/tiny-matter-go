@@ -73,6 +73,7 @@ func main() {
 		},
 		DeviceType: clusters.DeviceTypeOnOffLight.ID,
 		Log:        func(msg string) { log.Print(msg) },
+		Clock:      time.Now,
 	}
 	if *mdns {
 		cfg.Advertiser = &avahiAdvertiser{}

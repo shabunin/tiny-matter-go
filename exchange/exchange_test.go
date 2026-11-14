@@ -440,3 +440,29 @@ func TestUnsecuredSessionEviction(t *testing.T) {
 		t.Fatalf("%d unsecured sessions, want %d", n, b.m.cfg.MaxUnsecuredSessions)
 	}
 }
+
+// TestClockTimesRetransmission: a reply computed slowly after the request
+// it answers must not be retransmitted at once.
+func TestClockTimesRetransmission(t *testing.T) {
+	w := newWorld(t)
+	a := w.node(1)
+	peer := netip.AddrPortFrom(netip.MustParseAddr("fe80::1"), 9)
+	compute := 700 * time.Millisecond // PASE on a microcontroller
+	a.m.cfg.Clock = func() time.Time { return w.now.Add(compute) }
+	s, _ := a.m.NewUnsecuredSession(w.now, peer, MRPConfig{})
+	ex, _ := a.m.NewExchange(s, &recorder{})
+	ex.Send(w.now, message.ProtocolSecureChannel, 0x23, []byte("pake2"))
+	sent := w.net.sent
+	// Just after the real send, nothing may be retransmitted yet.
+	a.m.Poll(w.now.Add(compute + 10*time.Millisecond))
+	if w.net.sent != sent {
+		t.Fatal("retransmitted immediately after a slow send")
+	}
+	a.m.cfg.Clock = nil
+	ex2, _ := a.m.NewExchange(s, &recorder{})
+	ex2.Send(w.now, message.ProtocolSecureChannel, 0x23, []byte("pake2"))
+	a.m.Poll(w.now.Add(compute + 10*time.Millisecond))
+	if w.net.sent == sent+1 {
+		t.Fatal("without a clock the stale time should have caused a retransmission (test premise)")
+	}
+}
