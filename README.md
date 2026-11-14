@@ -28,7 +28,7 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |
-| `firmware/esp32s3-light/` | Matter on/off light over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `mdns` + `device`. Separate module |
+| `firmware/esp32s3-light/` | Matter on/off light over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `mdns` + `device`. Separate module. chip-tool commissions it over Wi-Fi in about 4 s (real attestation) and controls it |
 | `probe/onchip/` | Device and controller commissioning each other on the microcontroller (no radio), with timings |
 | `probe/` | Feasibility probes, TinyGo benchmarks and a large-memory QEMU Cortex-M target |
 
