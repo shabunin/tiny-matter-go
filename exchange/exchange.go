@@ -79,6 +79,25 @@ func (ex *Exchange) Send(now time.Time, protocolID uint16, opcode uint8, payload
 	return nil
 }
 
+// SendUnacked sends a message that asks for no acknowledgement, such as
+// a CloseSession status report, after which the session is gone. Any
+// pending acknowledgement is piggybacked.
+func (ex *Exchange) SendUnacked(now time.Time, protocolID uint16, opcode uint8, payload []byte) error {
+	if ex.done || ex.closing {
+		return ErrExchangeClosed
+	}
+	ph := message.ProtocolHeader{Initiator: ex.initiator, Opcode: opcode, ExchangeID: ex.id, ProtocolID: protocolID}
+	if ex.ackPending {
+		ph.HasAck, ph.AckCounter = true, ex.ackCounter
+	}
+	if _, _, err := ex.m.send(ex.s, &ph, payload); err != nil {
+		return err
+	}
+	ex.ackPending = false
+	ex.s.lastUse = now
+	return nil
+}
+
 // Close ends the exchange. A pending acknowledgement is sent immediately; an
 // unacknowledged message keeps being retransmitted until it is acknowledged
 // or fails, without further callbacks.

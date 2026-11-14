@@ -19,6 +19,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/internal/simnet"
 	"github.com/shabunin/tiny-matter-go/message"
+	"github.com/shabunin/tiny-matter-go/securechannel"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
 	"github.com/shabunin/tiny-matter-go/securechannel/pase"
 	"github.com/shabunin/tiny-matter-go/storage"
@@ -401,4 +402,41 @@ func TestSubscriptionOverCASE(t *testing.T) {
 	if c.reports != 2 {
 		t.Fatalf("toggle not reported: %+v", c)
 	}
+}
+
+// A CloseSession from the controller closes the session on the device and
+// ends its subscriptions.
+func TestCloseSessionFromPeer(t *testing.T) {
+	h := newHarness(t)
+	_, caseS := h.commission()
+	c := &subscriber{}
+	h.ctl.M.Register(message.ProtocolInteractionModel, func(*exchange.Exchange) exchange.Delegate { return c })
+	ex, _ := h.ctl.M.NewExchange(caseS, c)
+	ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpSubscribeRequest, im.EncodeSubscribeRequest(
+		[]im.AttributePath{{Endpoint: 1, Cluster: clusters.IDOnOff, Attribute: 0}}, 0, 60, false, true))
+	h.w.Advance(time.Second)
+	if h.dev.Server.Subscriptions() != 1 {
+		t.Fatal("not subscribed")
+	}
+	before := liveSecure(h.dev.M)
+	if err := securechannel.CloseSession(h.w.Now, h.ctl.M, caseS); err != nil {
+		t.Fatal(err)
+	}
+	h.w.Advance(time.Second)
+	h.dev.Poll(h.w.Now) // device loops poll after each packet; simnet polls before
+	if got := liveSecure(h.dev.M); got != before-1 {
+		t.Errorf("device secure sessions: %d, want %d", got, before-1)
+	}
+	if h.dev.Server.Subscriptions() != 0 {
+		t.Errorf("subscription survived its session")
+	}
+}
+
+func liveSecure(m *exchange.Manager) (n int) {
+	for _, s := range m.Sessions() {
+		if s.IsSecure() && !s.Closed() {
+			n++
+		}
+	}
+	return n
 }
