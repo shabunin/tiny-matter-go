@@ -1,0 +1,21 @@
+tiny-matter-go
+Copyright 2026 Vladimir Shabunin
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+It includes software from other projects:
+
+* The Go Programming Language (https://go.dev), BSD 3-Clause license,
+  Copyright The Go Authors; the full text is in crypto/internal/LICENSE-GO.
+  Used in crypto/internal/ (nistec, fiat, bigmod) and in the files of
+  crypto/p256/ that carry The Go Authors' copyright header.
+
+* connectedhomeip, the Matter SDK (https://github.com/project-chip/connectedhomeip),
+  Apache License 2.0, Copyright Project CHIP Authors.
+  credentials/devcreds/ holds its public development attestation credentials
+  (test DAC, PAI and Certification Declaration for vendor 0xFFF1), and
+  several tests use its test vectors. They are for development and testing
+  only and must never be used in products.
+
+Matter is a trademark of the Connectivity Standards Alliance. This project
+is not affiliated with or certified by the Connectivity Standards Alliance.

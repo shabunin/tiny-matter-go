@@ -1,4 +1,4 @@
-PKGS := ./tlv/... ./crypto/... ./message/... ./exchange/...
+PKGS := ./...  # this module only; firmware/ and probe/ are separate modules
 QEMU_TARGET := probe/qemu-m3-big.json
 
 .PHONY: test test32 tinygo-test fuzz cross bench-qemu all
@@ -14,7 +14,7 @@ test32:
 	GOARCH=386 go test $(PKGS)
 
 tinygo-test:
-	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip6 ./mdns ./storage
+	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip4 ./ip6 ./mdns ./storage
 
 fuzz:
 	go test ./tlv -run XXX -fuzz FuzzRoundTrip -fuzztime 60s
@@ -23,6 +23,7 @@ fuzz:
 	go test ./im -run XXX -fuzz FuzzServer -fuzztime 60s -fuzzminimizetime 0s
 	go test ./securechannel/casesession -run XXX -fuzz FuzzDecode -fuzztime 60s
 	go test ./ip6 -run XXX -fuzz FuzzHandleFrame -fuzztime 60s
+	go test ./ip4 -run XXX -fuzz FuzzHandleFrame -fuzztime 60s
 	go test ./mdns -run XXX -fuzz FuzzHandlePacket -fuzztime 60s
 
 # Cross-compile the P-256 benchmark for real boards and print flash/RAM use.

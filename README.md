@@ -1,7 +1,39 @@
 # tiny-matter-go
 
-A Matter device stack in Go that targets TinyGo on microcontrollers
-(first target: Raspberry Pi Pico 2 W). See [FEASIBILITY.md](FEASIBILITY.md).
+A Matter device stack in Go that targets TinyGo on microcontrollers. It
+implements commissioning (PASE, attestation, operational credentials, CASE),
+the Interaction Model (read, write, invoke, subscribe), multi-admin, and its
+own small IPv6/IPv4/mDNS networking over raw Ethernet frames, so it runs on
+bare-metal Wi-Fi chips without an OS network stack. Everything is sans-IO,
+allocation-conscious and safe on 32-bit targets.
+
+**Status: early (v0.x).** It works end to end on real hardware: an ESP32-S3
+(M5Stack Cardputer) on/off light is commissioned and controlled over Wi-Fi by
+chip-tool, [matter.js](https://github.com/matter-js/matter.js) and
+[matterctl](https://github.com/cybergarage/go-matter), all at once. The
+device persists its fabrics in flash. APIs will change. The examples use the
+public SDK **test** attestation credentials, so only controllers in
+development mode accept them. Not certified; do not use in products.
+
+Background and measurements: [FEASIBILITY.md](FEASIBILITY.md).
+
+## Quick start (ESP32-S3)
+
+    cd firmware
+    tinygo flash -target esp32s3-generic -port /dev/ttyACM0 \
+        -ldflags "-X main.ssid=YOUR_SSID -X main.password=YOUR_PASSWORD" ./esp32s3-light
+
+Then commission it with manual code `34970112332` (passcode 20202021,
+discriminator 3840), for example with the matter.js shell:
+
+    npx @matter/nodejs-shell
+    matter> commission pair --pairing-code 34970112332
+    matter> commands onoff toggle 1 1
+
+or `chip-tool pairing code 1 34970112332`. Keep a serial reader attached
+while it is plugged into a computer (see the firmware's package comment).
+To add another controller, open a commissioning window from an existing one
+(Administrator Commissioning, cluster 0x003C).
 
 ## Layout
 
@@ -16,7 +48,7 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
 | `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; data model of endpoints and clusters with global attributes |
-| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker), Basic Information, General Commissioning (fail-safe), Operational Credentials, On/Off |
+| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker), Basic Information, General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, On/Off |
 | `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
 | `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
@@ -47,3 +79,11 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 Test vectors under `*/testdata/` and inlined in some tests come from
 [connectedhomeip](https://github.com/project-chip/connectedhomeip)
 (Apache-2.0), the Matter SDK, and are used only for testing.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). Parts derived from the Go
+standard library are under Go's BSD license; see [NOTICE](NOTICE).
+
+Matter is a trademark of the Connectivity Standards Alliance. This project
+is not affiliated with or certified by the Connectivity Standards Alliance.
