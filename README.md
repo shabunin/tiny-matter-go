@@ -2,7 +2,7 @@
 
 A Matter device stack in Go that targets TinyGo on microcontrollers. It
 implements commissioning (PASE, attestation, operational credentials, CASE),
-the Interaction Model (read, write, invoke, subscribe), multi-admin, BLE commissioning (BTP) with Network Commissioning for Wi-Fi,
+the Interaction Model (read, write, invoke, subscribe, events), multi-admin, BLE commissioning (BTP) with Network Commissioning for Wi-Fi,
 and its own small IPv6/IPv4/mDNS networking over raw Ethernet frames, so it runs on
 bare-metal Wi-Fi chips without an OS network stack. Everything is sans-IO,
 allocation-conscious and safe on 32-bit targets.
@@ -12,7 +12,8 @@ allocation-conscious and safe on 32-bit targets.
 chip-tool, [matter.js](https://github.com/matter-js/matter.js) and
 [matterctl](https://github.com/cybergarage/go-matter), all at once, and
 chip-tool commissions it over Bluetooth LE and hands it the Wi-Fi network.
-The device persists its fabrics and network in flash. APIs will change. The examples use the
+Its button is a Generic Switch whose presses reach subscribed controllers
+as events. The device persists its fabrics and network in flash. APIs will change. The examples use the
 public SDK **test** attestation credentials, so only controllers in
 development mode accept them. Not certified; do not use in products.
 
@@ -44,6 +45,19 @@ while it is plugged into a computer (see the firmware's package comment).
 To add another controller, open a commissioning window from an existing one
 (Administrator Commissioning, cluster 0x003C).
 
+Endpoint 1 is the light. Endpoint 2 is the G0 button as a Generic Switch:
+a press reports the InitialPress and ShortRelease events, a hold of 1 s
+or more InitialPress, LongPress and LongRelease. Watch them from a
+subscription (`subscribe 1` in the matter.js shell), or in chip-tool's
+interactive mode:
+
+    chip-tool interactive start
+    >>> any subscribe-event-by-id 0x003B 0xFFFFFFFF 0 60 1 2 --is-urgent true
+
+The device also reports Basic Information StartUp and Leave, the General
+Diagnostics BootReason, and Access Control entry changes; `identify
+identify 10 1 1` blinks the LED.
+
 ## Layout
 
 | Path | What |
@@ -57,8 +71,8 @@ To add another controller, open a commissioning window from an existing one
 | `crypto/spake2p/` | SPAKE2+ (P-256, RFC 9383 as used by Matter) and the passcode verifier (W0, L) |
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
-| `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; data model of endpoints and clusters with global attributes |
-| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker), Basic Information, General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi, with fail-safe rollback), On/Off |
+| `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; events (a compact log per priority, event reads with filters, urgent and batched event reports, fabric-sensitive events); data model of endpoints and clusters with global attributes |
+| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), On/Off, Identify, Switch (momentary, with long press) |
 | `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
 | `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
@@ -67,13 +81,13 @@ To add another controller, open a commissioning window from an existing one
 | `ip4/` | Minimal IPv4 host over the same frames: DHCP client (renew/rebind/expiry), ARP, default gateway, Echo, IGMPv2 reports, UDP |
 | `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies); a `dnssd.Advertiser` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, persistence of fabrics, ACL and Wi-Fi networks (reopens commissioning when the last fabric is removed) |
-| `cmd/hostdevice/` | An on/off light over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool commissions and controls it |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, Wi-Fi networks, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
+| `cmd/hostdevice/` | An on/off light and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool and matter.js commission and control it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |
 | `firmware/matterble/` | Matter BLE peripheral for TinyGo: the Matter GATT service over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp` |
-| `firmware/esp32s3-light/` | Matter on/off light over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `ip4` + `mdns` + `device`, BLE commissioning via `matterble`. Separate module. chip-tool, matter.js and matterctl commission it over Wi-Fi in about 3-4 s (real attestation) and control it, all at once (multi-admin) |
+| `firmware/esp32s3-light/` | Matter on/off light and push button (G0 as a Generic Switch) over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `ip4` + `mdns` + `device`, BLE commissioning via `matterble`. Separate module. chip-tool, matter.js and matterctl commission it over Wi-Fi in about 3-4 s (real attestation) and control it, all at once (multi-admin) |
 | `probe/onchip/` | Device and controller commissioning each other on the microcontroller (no radio), with timings |
 | `probe/` | Feasibility probes, TinyGo benchmarks and a large-memory QEMU Cortex-M target |
 
