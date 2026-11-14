@@ -14,7 +14,7 @@ test32:
 	GOARCH=386 go test $(PKGS)
 
 tinygo-test:
-	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device
+	tinygo test ./tlv ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip6 ./mdns
 
 fuzz:
 	go test ./tlv -run XXX -fuzz FuzzRoundTrip -fuzztime 60s
@@ -22,6 +22,8 @@ fuzz:
 	go test ./securechannel/pase -run XXX -fuzz FuzzDecode -fuzztime 60s
 	go test ./im -run XXX -fuzz FuzzServer -fuzztime 60s -fuzzminimizetime 0s
 	go test ./securechannel/casesession -run XXX -fuzz FuzzDecode -fuzztime 60s
+	go test ./ip6 -run XXX -fuzz FuzzHandleFrame -fuzztime 60s
+	go test ./mdns -run XXX -fuzz FuzzHandlePacket -fuzztime 60s
 
 # Cross-compile the P-256 benchmark for real boards and print flash/RAM use.
 cross:
@@ -30,6 +32,8 @@ cross:
 	@echo "full device (on/off light):"
 	@cd probe && for t in pico2-w pico-w esp32c3-generic; do \
 		printf "%-16s " $$t; tinygo build -target=$$t -opt=z -size=short -o /dev/null ./devicesize | tail -1; done
+	@echo "Wi-Fi light firmware:"
+	@cd firmware && printf "%-16s " esp32s3-generic; tinygo build -target=esp32s3-generic -size=short -o /dev/null ./esp32s3-light | tail -1
 
 # Instruction counts on an emulated Cortex-M3 (QEMU mps2-an385, -icount).
 bench-qemu: probe/qemu-m3-big.json

@@ -21,11 +21,15 @@ A Matter device stack in Go that targets TinyGo on microcontrollers
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
 | `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
 | `dnssd/` | DNS-SD service descriptions (commissionable `_matterc._udp`, operational `_matter._tcp`) for an mDNS advertiser |
+| `ip6/` | Minimal IPv6 host over raw Ethernet frames: EUI-64 link-local address, Neighbor Discovery, Echo, MLDv2 reports, UDP |
+| `mdns/` | Small mDNS/DNS-SD responder (PTR/SRV/TXT/AAAA, announcements, goodbyes, legacy and QU replies); a `dnssd.Advertiser` |
 | `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising |
 | `cmd/hostdevice/` | An on/off light over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool commissions and controls it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |
+| `firmware/esp32s3-light/` | Matter on/off light over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `mdns` + `device`. Separate module |
+| `probe/onchip/` | Device and controller commissioning each other on the microcontroller (no radio), with timings |
 | `probe/` | Feasibility probes, TinyGo benchmarks and a large-memory QEMU Cortex-M target |
 
 ## Checks
