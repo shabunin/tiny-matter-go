@@ -36,14 +36,31 @@ type testDevice struct {
 	done  chan struct{}
 }
 
-type udpTransport struct{ conn *net.UDPConn }
+// udpTransport sends over UDP and, to blePeer, over the device's BTP
+// peripheral if it has one.
+type udpTransport struct {
+	conn *net.UDPConn
+	ble  *blePeripheral
+}
 
 func (u udpTransport) Send(to exchange.Addr, pkt []byte) error {
+	if to == blePeer {
+		if u.ble == nil {
+			return nil
+		}
+		return u.ble.srv.Send(pkt)
+	}
 	_, err := u.conn.WriteToUDPAddrPort(pkt, to)
 	return err
 }
 
-func startDevice(t *testing.T) *testDevice {
+func (u udpTransport) Reliable(to exchange.Addr) bool { return to == blePeer }
+
+func startDevice(t *testing.T) *testDevice { return startDeviceWith(t, false, nil) }
+
+// startDeviceWith starts a device, with Network Commissioning (Wi-Fi) if
+// wifi, and reachable over BLE through ble if not nil.
+func startDeviceWith(t *testing.T, wifi bool, ble *blePeripheral) *testDevice {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -53,12 +70,13 @@ func startDevice(t *testing.T) *testDevice {
 	v, _ := spake2p.NewVerifier(passcode, salt, 1000)
 	dacKey, _ := p256.NewPrivateKey(devcreds.DACPrivateKey)
 	dev, err := device.New(device.Config{
-		Transport: udpTransport{conn}, Rand: rand.Reader,
+		Transport: udpTransport{conn, ble}, Rand: rand.Reader,
 		Verifier: v, Salt: salt, Iterations: 1000, Discriminator: 3840,
 		Attestation: &clusters.Attestation{DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
 			CertificationDeclaration: devcreds.CertificationDeclaration},
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: devcreds.VendorID,
 			ProductName: "Test Light", ProductID: devcreds.ProductID},
+		WiFi: wifi,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +106,13 @@ func startDevice(t *testing.T) *testDevice {
 		defer close(d.done)
 		for {
 			wait := time.Second
-			if deadline := dev.Poll(time.Now()); !deadline.IsZero() {
+			deadline := dev.Poll(time.Now())
+			if ble != nil {
+				if next := ble.poll(t, time.Now()); !next.IsZero() && (deadline.IsZero() || next.Before(deadline)) {
+					deadline = next
+				}
+			}
+			if !deadline.IsZero() {
 				wait = max(time.Until(deadline), time.Millisecond)
 			}
 			timer := time.NewTimer(wait)

@@ -23,6 +23,7 @@ import (
 const (
 	clBasicInformation     = 0x0028
 	clGeneralCommissioning = 0x0030
+	clNetworkCommissioning = 0x0031
 	clAdminCommissioning   = 0x003C
 	clOperationalCreds     = 0x003E
 
@@ -32,6 +33,9 @@ const (
 	attrRegulatory      = 0x02 // General Commissioning RegulatoryConfig
 	attrLocationCap     = 0x03 // General Commissioning LocationCapability
 	attrCurrentFabricIx = 0x05 // Operational Credentials CurrentFabricIndex
+	attrConcurrent      = 0x04 // General Commissioning SupportsConcurrentConnection
+	attrConnectMaxTime  = 0x03 // Network Commissioning ConnectMaxTimeSeconds
+	attrFeatureMap      = 0xFFFC
 
 	cmdArmFailSafe           = 0x00 // General Commissioning
 	cmdSetRegulatoryConfig   = 0x02
@@ -44,6 +48,10 @@ const (
 	cmdAddTrustedRoot        = 0x0B
 	cmdOpenWindow            = 0x00 // Administrator Commissioning
 	cmdRevokeCommissioning   = 0x02
+	cmdAddOrUpdateWiFi       = 0x02 // Network Commissioning
+	cmdConnectNetwork        = 0x06
+
+	featureWiFi = 0x01 // Network Commissioning WI
 
 	certTypeDAC, certTypePAI = 1, 2
 	locationIndoorOutdoor    = 2
@@ -52,14 +60,16 @@ const (
 	stepTimeout        = 30 * time.Second
 	paseAttemptTimeout = 15 * time.Second
 	commissionableWait = 10 * time.Second
+	operationalWait    = 90 * time.Second // for a device joining a network
 )
 
 // CommissionOptions adjust commissioning.
 type CommissionOptions struct {
 	// NodeID is the node ID to give the device (0: the next free one).
 	NodeID uint64
-	// Addr, if valid, is where the device is; otherwise it is found with
-	// mDNS by the payload's discriminator.
+	// Addr, if valid, is where the device is on the IP network. Otherwise
+	// it is found with mDNS: by the payload's discriminator or, after
+	// commissioning over BLE, as an operational node.
 	Addr netip.AddrPort
 	// Label names the node in the controller's records (default: the
 	// device's product name).
@@ -67,10 +77,24 @@ type CommissionOptions struct {
 	// SkipAttestation commissions a device whose attestation fails, after
 	// logging why. Only for devices trusted by other means.
 	SkipAttestation bool
+	// BLE commissions over Bluetooth LE: the device is found by the
+	// payload's discriminator in BLE advertisements and reached over BTP
+	// until it is on the IP network.
+	BLE bool
+	// WiFi, if set, is the network the device is told to join (Network
+	// Commissioning) before it is reached over CASE. A device commissioned
+	// over BLE without one must be on a network already.
+	WiFi *WiFiNetwork
+}
+
+// WiFiNetwork is a Wi-Fi network for a device to join.
+type WiFiNetwork struct {
+	SSID     []byte
+	Password []byte // empty for an open network
 }
 
 // Commission commissions the device with onboarding payload p onto the
-// controller's fabric. The device must be on the IP network already.
+// controller's fabric, over the IP network or, with opts.BLE, Bluetooth LE.
 func (c *Controller) Commission(ctx context.Context, p *onboarding.Payload, opts CommissionOptions) (*Node, error) {
 	id := opts.NodeID
 	c.mu.Lock()
@@ -83,6 +107,9 @@ func (c *Controller) Commission(ctx context.Context, p *onboarding.Payload, opts
 	}
 	c.mu.Unlock()
 
+	if opts.BLE {
+		return c.commissionBLE(ctx, p, id, opts)
+	}
 	addrs := []netip.AddrPort{opts.Addr}
 	if !opts.Addr.IsValid() {
 		if c.disc == nil {
@@ -124,9 +151,30 @@ func (c *Controller) Commission(ctx context.Context, p *onboarding.Payload, opts
 	if err != nil {
 		return nil, fmt.Errorf("controller: PASE: %w", err)
 	}
-	defer c.do(func(now time.Time) { securechannel.CloseSession(now, c.m, ps) })
+	return c.commissionWith(ctx, ps, nil, id, opts)
+}
 
-	n, err := c.commissionOver(ctx, ps, id, opts)
+// commissionBLE commissions over BLE.
+func (c *Controller) commissionBLE(ctx context.Context, p *onboarding.Payload, id uint64, opts CommissionOptions) (*Node, error) {
+	link, err := c.openBLE(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	defer link.close()
+	c.logf("PASE over BLE")
+	pctx, cancel := context.WithTimeout(ctx, blePASETimeout)
+	ps, err := c.pase(pctx, link.addr, p.Passcode)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("controller: PASE: %w", err)
+	}
+	return c.commissionWith(ctx, ps, link, id, opts)
+}
+
+// commissionWith commissions over a PASE session, which ends with it.
+func (c *Controller) commissionWith(ctx context.Context, ps *exchange.Session, link *bleLink, id uint64, opts CommissionOptions) (*Node, error) {
+	defer c.do(func(now time.Time) { securechannel.CloseSession(now, c.m, ps) })
+	n, err := c.commissionOver(ctx, ps, link, id, opts)
 	if err != nil {
 		// Let the device roll back now rather than when the fail-safe
 		// expires.
@@ -184,20 +232,28 @@ func ocCmd(cmd uint32) im.CommandPath {
 	return im.CommandPath{Endpoint: 0, Cluster: clOperationalCreds, Command: cmd}
 }
 
-// commissionOver runs the commissioning steps over a PASE session, then
-// completes commissioning over CASE.
-func (c *Controller) commissionOver(ctx context.Context, ps *exchange.Session, id uint64, opts CommissionOptions) (*Node, error) {
+// commissionOver runs the commissioning steps over a PASE session (over a
+// BLE link, or the IP network if link is nil), gives the device its
+// network if asked, then completes commissioning over CASE.
+func (c *Controller) commissionOver(ctx context.Context, ps *exchange.Session, link *bleLink, id uint64, opts CommissionOptions) (*Node, error) {
 	step := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, stepTimeout) }
 
 	// What the commissioner needs to know first.
-	sctx, cancel := step()
-	rep, err := c.readOn(sctx, ps, im.Request{Attributes: []im.AttributePath{
+	paths := []im.AttributePath{
 		{Cluster: clBasicInformation, Attribute: attrVendorID},
 		{Cluster: clBasicInformation, Attribute: attrProductID},
 		{Cluster: clBasicInformation, Attribute: attrProductName},
 		{Cluster: clGeneralCommissioning, Attribute: attrRegulatory},
 		{Cluster: clGeneralCommissioning, Attribute: attrLocationCap},
-	}})
+	}
+	if opts.WiFi != nil {
+		paths = append(paths,
+			im.AttributePath{Cluster: clGeneralCommissioning, Attribute: attrConcurrent},
+			im.AttributePath{AnyEndpoint: true, Cluster: clNetworkCommissioning, Attribute: attrFeatureMap},
+			im.AttributePath{AnyEndpoint: true, Cluster: clNetworkCommissioning, Attribute: attrConnectMaxTime})
+	}
+	sctx, cancel := step()
+	rep, err := c.readOn(sctx, ps, im.Request{Attributes: paths})
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("controller: reading device information: %w", err)
@@ -206,6 +262,9 @@ func (c *Controller) commissionOver(ctx context.Context, ps *exchange.Session, i
 	pid := uint16(rep.uint(clBasicInformation, attrProductID, 0))
 	name := rep.string(clBasicInformation, attrProductName)
 	c.logf("device: %q, vendor %#04x, product %#04x", name, vid, pid)
+	if _, _, ok := wifiEndpoint(rep); opts.WiFi != nil && !ok {
+		return nil, errNoWiFi
+	}
 
 	sctx, cancel = step()
 	res, err := c.invokeOn(sctx, ps, gcCmd(cmdArmFailSafe), 0, func(w *tlv.Writer) {
@@ -331,11 +390,30 @@ func (c *Controller) commissionOver(ctx context.Context, ps *exchange.Session, i
 	}
 	c.logf("device joined fabric %016X as node %d", c.fab.FabricID, id)
 
+	if opts.WiFi != nil {
+		if err := c.joinWiFi(ctx, ps, rep, opts.WiFi); err != nil {
+			return nil, err
+		}
+	}
 	// CommissioningComplete over CASE on the new fabric. The node is
 	// found with mDNS, or where PASE found it.
+	addr := ps.Peer.String()
+	if link != nil {
+		link.close() // the device is on its network now
+		addr = ""
+		if opts.Addr.IsValid() {
+			addr = opts.Addr.String()
+		} else {
+			a, err := c.waitOperational(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			addr = a.String()
+		}
+	}
 	c.mu.Lock()
 	c.st.Nodes = append(c.st.Nodes, &Node{ID: id, Label: label(opts.Label, name),
-		VendorID: vid, ProductID: pid, Addr: ps.Peer.String(), Added: time.Now().UTC().Truncate(time.Second)})
+		VendorID: vid, ProductID: pid, Addr: addr, Added: time.Now().UTC().Truncate(time.Second)})
 	c.mu.Unlock()
 	err = c.withSession(ctx, id, func(s *exchange.Session) error {
 		sctx, cancel := step()
@@ -356,6 +434,139 @@ func (c *Controller) commissionOver(ctx context.Context, ps *exchange.Session, i
 	c.logf("node %d commissioned", id)
 	out := *c.st.node(id)
 	return &out, nil
+}
+
+var errNoWiFi = errors.New("controller: the device has no Wi-Fi interface (Network Commissioning with the Wi-Fi feature)")
+
+var networkingStatuses = [...]string{"Success", "OutOfRange", "BoundsExceeded", "NetworkIDNotFound",
+	"DuplicateNetworkID", "NetworkNotFound", "RegulatoryError", "AuthFailure", "UnsupportedSecurity",
+	"OtherConnectionFailure", "IPV6Failed", "IPBindFailed", "UnknownError"}
+
+// networkError turns a Network Commissioning response (NetworkingStatus in
+// field 0, DebugText in field 1) into an error.
+func networkError(cmd string, res im.InvokeResult, err error) error {
+	if err != nil {
+		return fmt.Errorf("controller: %s: %w", cmd, err)
+	}
+	code, err := uintField(res.Fields, 0)
+	if err != nil {
+		return fmt.Errorf("controller: %s: malformed response", cmd)
+	}
+	if code == 0 {
+		return nil
+	}
+	name := fmt.Sprint(code)
+	if code < uint64(len(networkingStatuses)) {
+		name = networkingStatuses[code]
+	}
+	text, _ := stringField(res.Fields, 1)
+	return fmt.Errorf("controller: %s: %s %s", cmd, name, text)
+}
+
+// wifiEndpoint finds the device's Network Commissioning cluster with the
+// Wi-Fi feature in a report, and its ConnectMaxTimeSeconds.
+func wifiEndpoint(rep *Report) (ep uint16, connectMax uint64, ok bool) {
+	for _, a := range rep.Attributes {
+		if a.Status != im.Success || a.Path.Cluster != clNetworkCommissioning || a.Path.Attribute != attrFeatureMap {
+			continue
+		}
+		r := tlv.NewReader(a.Data)
+		if r.Next() != nil {
+			continue
+		}
+		if fm, err := r.Uint(); err == nil && fm&featureWiFi != 0 {
+			ep, ok = a.Path.Endpoint, true
+			break
+		}
+	}
+	connectMax = 30
+	for _, a := range rep.Attributes {
+		if ok && a.Status == im.Success && a.Path.Endpoint == ep && a.Path.Cluster == clNetworkCommissioning &&
+			a.Path.Attribute == attrConnectMaxTime {
+			r := tlv.NewReader(a.Data)
+			if r.Next() == nil {
+				if v, err := r.Uint(); err == nil && v > 0 {
+					connectMax = v
+				}
+			}
+		}
+	}
+	return ep, connectMax, ok
+}
+
+// joinWiFi gives the device a Wi-Fi network and has it connect.
+func (c *Controller) joinWiFi(ctx context.Context, ps *exchange.Session, rep *Report, wifi *WiFiNetwork) error {
+	ep, connectMax, ok := wifiEndpoint(rep)
+	if !ok {
+		return errNoWiFi
+	}
+	concurrent := rep.uint(clGeneralCommissioning, attrConcurrent, 1) != 0
+	nc := func(cmd uint32) im.CommandPath {
+		return im.CommandPath{Endpoint: ep, Cluster: clNetworkCommissioning, Command: cmd}
+	}
+	sctx, cancel := context.WithTimeout(ctx, stepTimeout)
+	res, err := c.invokeOn(sctx, ps, nc(cmdAddOrUpdateWiFi), 0, func(w *tlv.Writer) {
+		w.PutBytes(tlv.ContextTag(0), wifi.SSID)
+		w.PutBytes(tlv.ContextTag(1), wifi.Password)
+		w.PutUint(tlv.ContextTag(2), 2) // breadcrumb
+	})
+	cancel()
+	if err := networkError("AddOrUpdateWiFiNetwork", res, err); err != nil {
+		return err
+	}
+	// Time to join, then to be found and complete over CASE.
+	sctx, cancel = context.WithTimeout(ctx, stepTimeout)
+	res, err = c.invokeOn(sctx, ps, gcCmd(cmdArmFailSafe), 0, func(w *tlv.Writer) {
+		w.PutUint(tlv.ContextTag(0), max(failSafeSeconds, connectMax+uint64(operationalWait/time.Second)))
+		w.PutUint(tlv.ContextTag(1), 3)
+	})
+	cancel()
+	if err := commissioningError("ArmFailSafe", res, err); err != nil {
+		return err
+	}
+	c.logf("asking the device to join Wi-Fi network %q", wifi.SSID)
+	wait := time.Duration(connectMax)*time.Second + 15*time.Second
+	if !concurrent {
+		wait = 15 * time.Second // it may leave BLE before it answers
+	}
+	sctx, cancel = context.WithTimeout(ctx, wait)
+	res, err = c.invokeOn(sctx, ps, nc(cmdConnectNetwork), 0, func(w *tlv.Writer) {
+		w.PutBytes(tlv.ContextTag(0), wifi.SSID)
+		w.PutUint(tlv.ContextTag(1), 4)
+	})
+	cancel()
+	if err != nil && !concurrent && ctx.Err() == nil {
+		c.logf("no ConnectNetwork response (%v): the device has left BLE to join the network", err)
+		return nil
+	}
+	return networkError("ConnectNetwork", res, err)
+}
+
+// waitOperational finds a node with mDNS, waiting for it to join its
+// network.
+func (c *Controller) waitOperational(ctx context.Context, id uint64) (netip.AddrPort, error) {
+	if c.disc == nil {
+		return netip.AddrPort{}, errors.New("controller: discovery is off: give the device's address")
+	}
+	c.logf("waiting for node %d on the IP network", id)
+	wctx, cancel := context.WithTimeout(ctx, operationalWait)
+	defer cancel()
+	for {
+		in, err := c.disc.operational(wctx, c.fab.CompressedFabricID, id)
+		if err == nil {
+			if addrs := instanceAddrs(in); len(addrs) > 0 {
+				c.logf("node %d is at %s", id, addrs[0])
+				return addrs[0], nil
+			}
+		}
+		if wctx.Err() != nil {
+			return netip.AddrPort{}, fmt.Errorf("controller: node %d did not appear on the network within %v", id, operationalWait)
+		}
+		select { // a failed query: try again shortly
+		case <-time.After(time.Second):
+		case <-wctx.Done():
+		}
+	}
 }
 
 func label(given, product string) string {

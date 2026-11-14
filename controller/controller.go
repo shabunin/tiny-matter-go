@@ -1,7 +1,8 @@
 // Package controller is a Matter controller for hosts. It keeps its own
 // fabric (a root CA it generates and stores), commissions devices onto it
-// over the IP network, and reads, writes, invokes and subscribes on them.
-// Devices are found with mDNS. Device attestation is checked against a
+// over the IP network or Bluetooth LE (giving them a Wi-Fi network), and
+// reads, writes, invokes and subscribes on them. Devices are found with
+// mDNS, or in BLE advertisements. Device attestation is checked against a
 // PAA trust store.
 //
 // Commissioned nodes grant Administer to a CASE Authenticated Tag rather
@@ -41,8 +42,8 @@ type Options struct {
 	// commissioned. It is created if needed.
 	Dir string
 	// PAAs are the trusted product attestation authorities, such as
-	// attestation.LoadPAAs of the SDK's production PAA directory plus
-	// attestation.TestPAAs for development devices.
+	// attestation.ProductionPAAs, plus attestation.TestPAAs for
+	// development devices.
 	PAAs []*x509.Certificate
 	// AllowTestCD accepts certification declarations signed with the SDK
 	// test key.
@@ -54,6 +55,9 @@ type Options struct {
 	// NoDiscovery disables mDNS: nodes are reached at their stored or
 	// given addresses only.
 	NoDiscovery bool
+	// Bluetooth is used to commission over BLE. If nil, BlueZ is used
+	// (over D-Bus, on Linux) when first needed.
+	Bluetooth Bluetooth
 }
 
 // ErrClosed is returned by operations on a closed controller.
@@ -85,9 +89,14 @@ type Controller struct {
 	connMu   sync.Mutex
 	connLock map[uint64]*sync.Mutex // serializes CASE attempts per node
 
+	bleMu sync.Mutex
+	ble   Bluetooth
+
 	// Owned by the loop goroutine.
 	sessions map[uint64]*exchange.Session
 	subs     map[uint32]*subState
+	links    map[netip.AddrPort]*bleLink
+	nextLink uint16
 }
 
 type packet struct {
@@ -111,6 +120,7 @@ func Open(opts Options) (*Controller, error) {
 		connLock: make(map[uint64]*sync.Mutex),
 		sessions: make(map[uint64]*exchange.Session),
 		subs:     make(map[uint32]*subState),
+		links:    make(map[netip.AddrPort]*bleLink),
 	}
 	if c.rootKey, err = p256.NewPrivateKey(st.RootKey); err != nil {
 		return nil, err
@@ -168,11 +178,25 @@ func (c *Controller) Close() error {
 	default:
 	}
 	c.CloseSessions(0)
+	var links []*bleLink
+	c.do(func(time.Time) {
+		for _, l := range c.links {
+			links = append(links, l)
+		}
+	})
+	for _, l := range links {
+		l.close()
+	}
 	close(c.quit)
 	<-c.done
 	if c.disc != nil {
 		c.disc.close()
 	}
+	c.bleMu.Lock()
+	if c.ble != nil && c.opts.Bluetooth == nil {
+		closeBluetooth(c.ble)
+	}
+	c.bleMu.Unlock()
 	return c.conn.Close()
 }
 
@@ -238,8 +262,15 @@ func (c *Controller) logf(format string, args ...any) {
 	}
 }
 
-// Send transmits a packet (exchange.Transport).
+// Send transmits a packet (exchange.Transport), over UDP or, for a BLE
+// link's address, BTP. It runs on the loop goroutine.
 func (c *Controller) Send(to exchange.Addr, pkt []byte) error {
+	if isBLE(to) {
+		if l := c.links[to]; l != nil {
+			return l.send(pkt)
+		}
+		return errLinkClosed
+	}
 	_, err := c.conn.WriteToUDPAddrPort(pkt, to)
 	return err
 }
