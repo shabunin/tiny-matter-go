@@ -466,3 +466,49 @@ func TestClockTimesRetransmission(t *testing.T) {
 		t.Fatal("without a clock the stale time should have caused a retransmission (test premise)")
 	}
 }
+
+// reliablePort is a transport that delivers reliably, as BTP does.
+type reliablePort struct{ port }
+
+func (reliablePort) Reliable(to Addr) bool { return true }
+
+func TestReliableTransportSkipsMRP(t *testing.T) {
+	w := newWorld(t)
+	var nodes [2]*node
+	for i := range nodes {
+		addr := netip.AddrPortFrom(netip.MustParseAddr("fe80::1"), uint16(i+1))
+		m, err := NewManager(Config{Transport: reliablePort{port{w.net, addr}}, Rand: rand.Reader})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodes[i] = &node{m: m, addr: addr}
+		w.nodes = append(w.nodes, nodes[i])
+	}
+	a, b := nodes[0], nodes[1]
+	sa, _ := securePair(t, w, a, b)
+	srv := &recorder{reply: []byte("pong"), close: true}
+	b.m.Register(message.ProtocolInteractionModel, func(ex *Exchange) Delegate { return srv })
+
+	cli := &recorder{}
+	ex, _ := a.m.NewExchange(sa, cli)
+	if err := ex.Send(w.now, message.ProtocolInteractionModel, 0x02, []byte("req")); err != nil {
+		t.Fatal(err)
+	}
+	if ex.AwaitingAck() {
+		t.Fatal("awaiting an MRP ack over a reliable transport")
+	}
+	w.deliver()
+	if len(srv.msgs) != 1 || len(cli.msgs) != 1 {
+		t.Fatalf("server got %d, client got %d", len(srv.msgs), len(cli.msgs))
+	}
+	ex.Close(w.now)
+	w.advance(time.Minute)
+	// Request and response only: a message asking for an MRP ack would
+	// have drawn a standalone ack.
+	if w.net.sent != 2 {
+		t.Fatalf("%d packets sent, want 2", w.net.sent)
+	}
+	if len(a.m.exchanges)+len(b.m.exchanges) != 0 {
+		t.Fatal("exchanges left over")
+	}
+}

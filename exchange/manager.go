@@ -38,6 +38,19 @@ type Transport interface {
 	Send(to Addr, pkt []byte) error
 }
 
+// ReliableTransport is implemented by a Transport that delivers some peers'
+// packets reliably and in order, such as BTP over BLE. Messages to those
+// peers do not ask for MRP acknowledgements and are not retransmitted
+// (spec 4.12.1).
+type ReliableTransport interface {
+	Reliable(to Addr) bool
+}
+
+func (m *Manager) reliable(to Addr) bool {
+	r, ok := m.cfg.Transport.(ReliableTransport)
+	return ok && r.Reliable(to)
+}
+
 // Message is an application message delivered to a Delegate. Payload is only
 // valid during the callback.
 type Message struct {

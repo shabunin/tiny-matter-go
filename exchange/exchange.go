@@ -8,7 +8,7 @@ import (
 
 // Exchange is a request/response conversation with a peer (spec 4.10). Every
 // message it sends is reliable (MRP), and at most one may be awaiting
-// acknowledgement at a time.
+// acknowledgement at a time. Over a ReliableTransport, MRP is not used.
 type Exchange struct {
 	m         *Manager
 	s         *Session
@@ -56,8 +56,9 @@ func (ex *Exchange) Send(now time.Time, protocolID uint16, opcode uint8, payload
 		// now may predate slow work such as a PASE or CASE computation.
 		now = ex.m.cfg.Clock()
 	}
+	reliable := ex.m.reliable(ex.s.Peer)
 	ph := message.ProtocolHeader{
-		Initiator: ex.initiator, NeedsAck: true,
+		Initiator: ex.initiator, NeedsAck: !reliable,
 		Opcode: opcode, ExchangeID: ex.id, ProtocolID: protocolID,
 	}
 	if ex.ackPending {
@@ -68,10 +69,13 @@ func (ex *Exchange) Send(now time.Time, protocolID uint16, opcode uint8, payload
 		return err
 	}
 	ex.ackPending = false
+	ex.s.lastUse = now
+	if reliable {
+		return nil
+	}
 	ex.rtPkt = append(ex.rtPkt[:0], pkt...)
 	ex.rtActive, ex.rtCounter, ex.rtSendCount = true, counter, 0
 	ex.rtNext = now.Add(Backoff(ex.s.retransBase(now), 0, randByte(ex.m.cfg.Rand)))
-	ex.s.lastUse = now
 	return nil
 }
 
