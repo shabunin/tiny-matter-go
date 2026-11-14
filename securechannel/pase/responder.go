@@ -52,13 +52,28 @@ type Responder struct {
 	open    bool
 	failed  int
 	current *responderHandshake
+	win     WindowParams // passcode parameters of the open window
+}
+
+// WindowParams are the passcode parameters a commissioning window accepts:
+// the verifier with the PBKDF salt and iterations it was derived with.
+type WindowParams struct {
+	Verifier   *spake2p.Verifier
+	Salt       []byte
+	Iterations uint32
+}
+
+// Valid reports whether the parameters are within the spec limits.
+func (p *WindowParams) Valid() bool {
+	return p.Verifier != nil && len(p.Salt) >= spake2p.MinSaltSize && len(p.Salt) <= spake2p.MaxSaltSize &&
+		p.Iterations >= spake2p.MinIterations && p.Iterations <= spake2p.MaxIterations
 }
 
 // NewResponder returns a Responder and registers it with d for
 // PBKDFParamRequest. The commissioning window starts closed.
 func NewResponder(m *exchange.Manager, d *securechannel.Dispatcher, cfg ResponderConfig) (*Responder, error) {
-	if cfg.Verifier == nil || len(cfg.Salt) < spake2p.MinSaltSize || len(cfg.Salt) > spake2p.MaxSaltSize ||
-		cfg.Iterations < spake2p.MinIterations || cfg.Iterations > spake2p.MaxIterations || cfg.Rand == nil {
+	def := WindowParams{cfg.Verifier, cfg.Salt, cfg.Iterations}
+	if !def.Valid() || cfg.Rand == nil {
 		return nil, errors.New("pase: invalid responder configuration")
 	}
 	if cfg.SessionParams == (securechannel.SessionParams{}) {
@@ -69,8 +84,21 @@ func NewResponder(m *exchange.Manager, d *securechannel.Dispatcher, cfg Responde
 	return r, nil
 }
 
-// OpenWindow allows PASE (opens the commissioning window).
-func (r *Responder) OpenWindow() { r.open, r.failed = true, 0 }
+// OpenWindow allows PASE with the configured passcode (opens the
+// commissioning window).
+func (r *Responder) OpenWindow() {
+	r.OpenWindowWith(WindowParams{r.cfg.Verifier, r.cfg.Salt, r.cfg.Iterations})
+}
+
+// OpenWindowWith allows PASE with other passcode parameters, as for an
+// enhanced commissioning window. It returns false if they are invalid.
+func (r *Responder) OpenWindowWith(p WindowParams) bool {
+	if !p.Valid() {
+		return false
+	}
+	r.open, r.failed, r.win = true, 0, p
+	return true
+}
 
 // CloseWindow stops accepting new PASE handshakes.
 func (r *Responder) CloseWindow() { r.open = false }
@@ -100,6 +128,8 @@ type responderHandshake struct {
 	started time.Time
 	ctx     hash.Hash
 	spake   *spake2p.Session
+	// verifier is the window's, captured when the handshake started.
+	verifier *spake2p.Verifier
 
 	localSessionID uint16
 	peerSessionID  uint16
@@ -207,8 +237,9 @@ func (h *responderHandshake) onPBKDFParamRequest(now time.Time, ex *exchange.Exc
 	if _, err := io.ReadFull(r.cfg.Rand, resp.ResponderRandom[:]); err != nil {
 		return err
 	}
+	h.verifier = r.win.Verifier
 	if !req.HasPBKDFParameters {
-		resp.Iterations, resp.Salt = r.cfg.Iterations, r.cfg.Salt
+		resp.Iterations, resp.Salt = r.win.Iterations, r.win.Salt
 	}
 	respBytes := resp.Encode()
 
@@ -233,7 +264,7 @@ func (h *responderHandshake) onPake1(now time.Time, ex *exchange.Exchange, paylo
 	if err != nil {
 		return err
 	}
-	h.spake, err = spake2p.NewVerifierSession(h.ctx.Sum(nil), nil, nil, h.r.cfg.Verifier)
+	h.spake, err = spake2p.NewVerifierSession(h.ctx.Sum(nil), nil, nil, h.verifier)
 	if err != nil {
 		return err
 	}

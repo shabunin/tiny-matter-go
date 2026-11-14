@@ -36,6 +36,8 @@ type harness struct {
 	devN  *simnet.Node
 	ctl   *simnet.Node
 	light *clusters.OnOff
+	// emptyICAC sends AddNOC with an empty ICAC field, as matter.js does.
+	emptyICAC bool
 }
 
 func newHarness(t *testing.T) *harness { return newHarnessStore(t, nil) }
@@ -115,11 +117,16 @@ func TestCommissioning(t *testing.T) { newHarness(t).commission() }
 // commission runs a full commissioning and returns the controller's fabric
 // and its CASE session.
 func (h *harness) commission() (*fabric.Fabric, *exchange.Session) {
+	return h.commissionWith(passcode, 1)
+}
+
+// commissionWith commissions with code, expecting wantFabrics afterwards.
+func (h *harness) commissionWith(code uint32, wantFabrics int) (*fabric.Fabric, *exchange.Session) {
 	t := h.t
 
 	// PASE.
 	var paseS *exchange.Session
-	err := pase.Pair(h.w.Now, h.ctl.M, h.devN.Addr, pase.InitiatorConfig{Passcode: passcode, Rand: rand.Reader,
+	err := pase.Pair(h.w.Now, h.ctl.M, h.devN.Addr, pase.InitiatorConfig{Passcode: code, Rand: rand.Reader,
 		Done: func(now time.Time, s *exchange.Session, err error) {
 			if err != nil {
 				t.Fatal(err)
@@ -182,6 +189,9 @@ func (h *harness) commission() (*fabric.Fabric, *exchange.Session) {
 	}
 	res = h.invoke(paseS, oc(6), func(w *tlv.Writer) {
 		w.PutBytes(tlv.ContextTag(0), devNOC.Encode())
+		if h.emptyICAC {
+			w.PutBytes(tlv.ContextTag(1), []byte{})
+		}
 		w.PutBytes(tlv.ContextTag(2), ipk)
 		w.PutUint(tlv.ContextTag(3), 0x1B669)
 		w.PutUint(tlv.ContextTag(4), 0xFFF1)
@@ -231,17 +241,18 @@ func (h *harness) commission() (*fabric.Fabric, *exchange.Session) {
 			t.Fatal("device kept its PASE session")
 		}
 	}
-	if h.dev.Fabrics.Committed() != 1 {
+	if h.dev.Fabrics.Committed() != wantFabrics {
 		t.Fatal("fabric not committed")
 	}
 
 	// Operate the light over CASE; the fail-safe no longer rolls back.
+	was := h.light.On
 	res = h.invoke(caseS, im.CommandPath{Endpoint: 1, Cluster: clusters.IDOnOff, Command: 2}, nil)
-	if res.Status != im.Success || !h.light.On {
+	if res.Status != im.Success || h.light.On == was {
 		t.Fatalf("toggle: %+v", res)
 	}
 	h.w.Advance(2 * time.Minute)
-	if h.dev.Fabrics.Committed() != 1 {
+	if h.dev.Fabrics.Committed() != wantFabrics {
 		t.Fatal("fabric lost after the fail-safe period")
 	}
 	return ctlF, caseS

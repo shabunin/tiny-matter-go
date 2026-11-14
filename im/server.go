@@ -494,6 +494,14 @@ type Response struct {
 	w       *tlv.Writer
 	path    CommandPath
 	started bool
+	cluster *uint8 // cluster-specific status
+}
+
+// ClusterStatus fails the command with a cluster-specific status code. The
+// handler returns its result.
+func (r *Response) ClusterStatus(code uint8) Status {
+	r.cluster = &code
+	return Failure
 }
 
 // Fields starts response command cmd and returns the writer for its fields,
@@ -628,7 +636,11 @@ func (h *handler) invokeOne(ctx *Context, w *tlv.Writer, q *invokeRequest) {
 	w.StartStruct(tlv.Anonymous)     // InvokeResponseIB
 	w.StartStruct(tlv.ContextTag(1)) // CommandStatusIB
 	EncodeCommandPath(w, tlv.ContextTag(0), q.path)
-	encodeStatusIB(w, tlv.ContextTag(1), st, nil)
+	var cs *uint8
+	if st == Failure {
+		cs = resp.cluster
+	}
+	encodeStatusIB(w, tlv.ContextTag(1), st, cs)
 	if q.hasRef {
 		w.PutUint(tlv.ContextTag(2), uint64(q.ref))
 	}

@@ -344,7 +344,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		}
 		noc := append([]byte{}, f.bytes[0]...)
 		var icac []byte
-		if f.has(1) && f.bytes[1] != nil {
+		if len(f.bytes[1]) > 0 { // controllers without an ICAC may send it empty (matter.js)
 			icac = append([]byte{}, f.bytes[1]...)
 		}
 		id, err := credentials.ValidateNOCChain(noc, icac, o.pendingRoot)

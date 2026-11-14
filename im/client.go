@@ -140,7 +140,10 @@ func DecodeReportData(b []byte) (*ReportData, error) {
 type InvokeResult struct {
 	Path   CommandPath
 	Status Status
-	Fields []byte // raw response fields structure, if a command was returned
+	// ClusterStatus is the cluster-specific status, if HasClusterStatus.
+	ClusterStatus    uint8
+	HasClusterStatus bool
+	Fields           []byte // raw response fields structure, if a command was returned
 }
 
 // DecodeInvokeResponse decodes an InvokeResponse message.
@@ -160,7 +163,7 @@ func DecodeInvokeResponse(b []byte) ([]InvokeResult, error) {
 					case tag == 0 && f == 1:
 						res.Fields, err = r.RawElement()
 					case tag == 1 && f == 1:
-						res.Status, _, _, err = DecodeStatusIB(r)
+						res.Status, res.ClusterStatus, res.HasClusterStatus, err = DecodeStatusIB(r)
 					}
 					return err
 				})
