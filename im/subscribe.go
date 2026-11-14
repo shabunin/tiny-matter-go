@@ -41,6 +41,10 @@ type subscription struct {
 
 	dirty    []ConcretePath
 	dirtyAll bool
+
+	events    []EventPath
+	eventNext uint64 // number of the first event not yet considered
+	urgent    bool   // an event matching an urgent path is waiting
 }
 
 func (s *Server) removeSub(sub *subscription) {
@@ -68,6 +72,20 @@ func matchesAny(paths []AttributePath, c ConcretePath) bool {
 		}
 	}
 	return false
+}
+
+// logged marks the subscriptions with an urgent path covering an event
+// for a report at their min interval; other events wait for the next
+// report.
+func (s *Server) logged(p ConcreteEventPath) {
+	for _, sub := range s.subs {
+		for i := range sub.events {
+			if sub.events[i].IsUrgent && sub.events[i].Matches(p) {
+				sub.urgent = true
+				break
+			}
+		}
+	}
 }
 
 // changed records an attribute change for the subscriptions covering it.
@@ -99,7 +117,6 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 		keep              bool
 		minFloor, maxCeil uint16
 		haveMin, haveMax  bool
-		haveEvents        bool
 		rs                = &readState{}
 	)
 	err := structFields(tlv.NewReader(b), func(r *tlv.Reader, tag uint8) (err error) {
@@ -125,7 +142,9 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 				return nil
 			})
 		case 4:
-			haveEvents = true // no events are generated; accepted and never reported
+			return rs.decodeEventPaths(r)
+		case 5:
+			return rs.decodeEventFilters(r)
 		case 7:
 			rs.fabricFiltered, err = r.Bool()
 		case 8:
@@ -145,7 +164,7 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 		}
 		return InvalidAction
 	}
-	if !haveMin || !haveMax || minFloor > maxCeil || (len(rs.paths) == 0 && !haveEvents) {
+	if !haveMin || !haveMax || minFloor > maxCeil || (len(rs.paths) == 0 && len(rs.events) == 0) {
 		return InvalidAction
 	}
 	sess := ex.Session()
@@ -175,7 +194,7 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 	}
 	sub := &subscription{
 		id: h.s.nextSubID, session: sess, fabric: sess.FabricIndex, peer: sess.PeerNodeID(),
-		paths: rs.paths, filtered: rs.fabricFiltered,
+		paths: rs.paths, filtered: rs.fabricFiltered, events: rs.events,
 		min: time.Duration(minFloor) * time.Second, max: maxInterval,
 		state: subPriming, last: now,
 	}
@@ -206,7 +225,7 @@ func (h *handler) finishSubReport(now time.Time, ex *exchange.Exchange) {
 
 // due returns when sub next needs a report.
 func (sub *subscription) due() time.Time {
-	if sub.dirtyAll || len(sub.dirty) > 0 {
+	if sub.dirtyAll || len(sub.dirty) > 0 || sub.urgent {
 		return sub.last.Add(sub.min)
 	}
 	return sub.last.Add(sub.max)
@@ -249,11 +268,12 @@ func (s *Server) report(now time.Time, sub *subscription) {
 	if err != nil {
 		return
 	}
-	rs := &readState{paths: sub.paths, fabricFiltered: sub.filtered, sub: sub}
+	rs := &readState{paths: sub.paths, fabricFiltered: sub.filtered, sub: sub,
+		events: sub.events, eventNext: sub.eventNext, eventStatus: true}
 	if !sub.dirtyAll {
 		rs.dirty = append([]ConcretePath{}, sub.dirty...) // non-nil: changes only
 	}
-	sub.dirty, sub.dirtyAll = sub.dirty[:0], false
+	sub.dirty, sub.dirtyAll, sub.urgent = sub.dirty[:0], false, false
 	sub.state, sub.last = subReporting, now
 	h.read = rs
 	h.sendReport(now, ex)

@@ -96,16 +96,24 @@ type clusterEntry struct {
 	version uint32
 }
 
-// Node is the data model of a device: its endpoints and their clusters.
+// Node is the data model of a device: its endpoints and their clusters,
+// and the events they generated.
 type Node struct {
 	endpoints []*Endpoint
 	version   uint32 // next initial data version
 	// OnChange, if set, is called after an attribute changes.
 	OnChange func(p ConcretePath)
+	// Events records the node's events; NewNode creates one with the
+	// default buffer sizes, which may be replaced before use.
+	Events *EventLog
+	// OnEvent, if set, is called after an event is recorded.
+	OnEvent func(p ConcreteEventPath)
 }
 
 // NewNode returns an empty node. seed randomizes initial data versions.
-func NewNode(seed uint32) *Node { return &Node{version: seed} }
+func NewNode(seed uint32) *Node {
+	return &Node{version: seed, Events: NewEventLog(DefaultDebugBuffer, DefaultInfoBuffer, DefaultCriticalBuffer)}
+}
 
 // AddEndpoint adds an endpoint. Endpoints should be added in ascending order.
 func (n *Node) AddEndpoint(id uint16, types ...DeviceType) *Endpoint {
@@ -173,6 +181,29 @@ func (n *Node) Changed(endpoint uint16, cluster, attr uint32) {
 	if n.OnChange != nil {
 		n.OnChange(ConcretePath{endpoint, cluster, attr})
 	}
+}
+
+// Poller is implemented by clusters with timers; Node.Poll runs them.
+type Poller interface {
+	// Poll runs the instance on endpoint of n and returns when it next
+	// needs to run (zero if idle).
+	Poll(n *Node, endpoint uint16, now time.Time) time.Time
+}
+
+// Poll runs the timers of the clusters that implement Poller and returns
+// when it next needs to run (zero if idle).
+func (n *Node) Poll(now time.Time) time.Time {
+	var next time.Time
+	for _, e := range n.endpoints {
+		for i := range e.clusters {
+			if p, ok := e.clusters[i].c.(Poller); ok {
+				if t := p.Poll(n, e.ID, now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+					next = t
+				}
+			}
+		}
+	}
+	return next
 }
 
 // DataVersion returns the data version of a cluster instance.

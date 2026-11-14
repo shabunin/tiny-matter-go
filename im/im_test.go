@@ -42,6 +42,7 @@ type fixture struct {
 	onoff    *clusters.OnOff
 	basic    *clusters.BasicInformation
 	failSafe *clusters.FailSafe
+	router   *subRouter
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -366,8 +367,14 @@ func FuzzServer(f *testing.F) {
 	f.Add(uint8(im.OpWriteRequest), im.EncodeWriteRequest(path(0, 0x28, 5), false, func(w *tlv.Writer, tag tlv.Tag) { w.PutString(tag, "x") }))
 	f.Add(uint8(im.OpTimedRequest), im.EncodeTimedRequest(100))
 	f.Add(uint8(im.OpSubscribeRequest), im.EncodeSubscribeRequest([]im.AttributePath{{AnyEndpoint: true, AnyCluster: true, AnyAttribute: true}}, 0, 10, false, true))
+	f.Add(uint8(im.OpReadRequest), im.EncodeRead(im.Request{Events: []im.EventPath{anyEvent, {Endpoint: 3, Cluster: evClusterID, Event: 1}}, EventMin: 2}))
+	f.Add(uint8(im.OpSubscribeRequest), im.EncodeSubscribe(im.Request{
+		Attributes: []im.AttributePath{onOffPath},
+		Events:     []im.EventPath{{AnyEndpoint: true, AnyCluster: true, AnyEvent: true, IsUrgent: true}},
+	}, 0, 10, false))
 	f.Fuzz(func(t *testing.T, op uint8, payload []byte) {
-		fx := newFixture(&testing.T{})
+		fx := newFixture(&testing.T{}).withEvents()
+		fx.emit(1, im.PriorityInfo, 1, "x")
 		c := &client{}
 		ex, err := fx.ctl.M.NewExchange(fx.cs, c)
 		if err != nil {
@@ -378,6 +385,7 @@ func FuzzServer(f *testing.F) {
 		}
 		fx.w.Advance(time.Second)
 		fx.onoff.Set(fx.node, 1, true) // exercise subscription reports
+		fx.emit(2, im.PriorityCritical, 0, "y")
 		fx.w.Advance(time.Minute)
 	})
 }

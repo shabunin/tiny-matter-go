@@ -12,7 +12,8 @@ import (
 const (
 	// MaxPathsPerInvoke matches the session parameter we advertise.
 	MaxPathsPerInvoke = 1
-	// maxReadPaths bounds the attribute paths accepted in one read.
+	// maxReadPaths bounds the attribute paths, and separately the event
+	// paths, accepted in one read or subscription.
 	maxReadPaths = 9
 	// maxVersionFilters bounds the data version filters kept from a read.
 	maxVersionFilters = 9
@@ -33,8 +34,8 @@ type Server struct {
 }
 
 // NewServer returns a Server for n and registers it with m. It chains
-// itself into n.OnChange to drive subscriptions; call Poll to send their
-// reports.
+// itself into n.OnChange and n.OnEvent to drive subscriptions; call Poll
+// to send their reports.
 func NewServer(m *exchange.Manager, n *Node) *Server {
 	s := &Server{node: n, m: m, buf: make([]byte, 0, message.MaxPacketSize), nextSubID: n.version * 0x9E3779B1}
 	m.Register(message.ProtocolInteractionModel, s.factory)
@@ -43,6 +44,13 @@ func NewServer(m *exchange.Manager, n *Node) *Server {
 		s.changed(p)
 		if prev != nil {
 			prev(p)
+		}
+	}
+	prevEvent := n.OnEvent
+	n.OnEvent = func(p ConcreteEventPath) {
+		s.logged(p)
+		if prevEvent != nil {
+			prevEvent(p)
 		}
 	}
 	return s
@@ -66,6 +74,10 @@ type readState struct {
 	filters        []versionFilter
 	fabricFiltered bool
 	next           int // index of the first candidate path not yet reported
+
+	events      []EventPath
+	eventNext   uint64 // number of the first event not yet considered
+	eventStatus bool   // statuses of the concrete event paths were sent
 
 	// Subscriptions only.
 	sub   *subscription
@@ -224,6 +236,10 @@ func (h *handler) onRead(now time.Time, ex *exchange.Exchange, b []byte) Status 
 				rs.paths = append(rs.paths, p)
 				return nil
 			})
+		case 1:
+			return rs.decodeEventPaths(r)
+		case 2:
+			return rs.decodeEventFilters(r)
 		case 3:
 			rs.fabricFiltered, err = r.Bool()
 		case 4:
@@ -246,6 +262,31 @@ func (h *handler) onRead(now time.Time, ex *exchange.Exchange, b []byte) Status 
 	h.read = rs
 	h.sendReport(now, ex)
 	return Success
+}
+
+func (rs *readState) decodeEventPaths(r *tlv.Reader) error {
+	return arrayItems(r, func() error {
+		p, err := DecodeEventPath(r)
+		if err != nil {
+			return err
+		}
+		if len(rs.events) >= maxReadPaths {
+			return PathsExhausted
+		}
+		rs.events = append(rs.events, p)
+		return nil
+	})
+}
+
+// decodeEventFilters keeps the highest EventMin of the filters.
+func (rs *readState) decodeEventFilters(r *tlv.Reader) error {
+	return arrayItems(r, func() error {
+		min, err := decodeEventFilter(r)
+		if min > rs.eventNext {
+			rs.eventNext = min
+		}
+		return err
+	})
 }
 
 func decodeVersionFilter(r *tlv.Reader) (f versionFilter, ok bool, err error) {
@@ -381,7 +422,8 @@ func filtered(rs *readState, endpoint uint16, cluster, version uint32) bool {
 	return false
 }
 
-// sendReport sends the next ReportData chunk of the read in progress.
+// sendReport sends the next ReportData chunk of the read in progress:
+// attribute reports first, then events.
 func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 	rs := h.read
 	ctx := h.ctx(now, ex)
@@ -393,9 +435,37 @@ func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 	if rs.sub != nil {
 		w.PutUint(tlv.ContextTag(0), uint64(rs.sub.id))
 	}
+	inChunk, more := h.encodeAttributes(ctx, rs, w, limit)
+	if !more && len(rs.events) > 0 {
+		more = h.encodeEvents(ctx, rs, w, limit, inChunk > 0)
+		if rs.sub != nil {
+			rs.sub.eventNext = rs.eventNext
+		}
+	}
+	if more {
+		w.PutBool(tlv.ContextTag(3), true)
+	} else if rs.sub == nil {
+		w.PutBool(tlv.ContextTag(4), true) // SuppressResponse
+	}
+	w.PutUint(tlv.ContextTag(tagIMRevision), Revision)
+	w.EndContainer()
+	ex.Send(now, message.ProtocolInteractionModel, OpReportData, w.Bytes())
+	if !more {
+		if rs.sub == nil {
+			h.read = nil
+			ex.Close(now)
+		} else {
+			rs.done = true // subscriptions want a StatusResponse
+		}
+	}
+}
+
+// encodeAttributes writes the AttributeReports of the next chunk,
+// returning how many it wrote and whether more remain for later chunks.
+func (h *handler) encodeAttributes(ctx *Context, rs *readState, w *tlv.Writer, limit int) (inChunk int, more bool) {
 	arrayStart := w.Checkpoint()
 	w.StartArray(tlv.ContextTag(1))
-	index, inChunk, more := 0, 0, false
+	index := 0
 	h.candidates(rs, func(c *candidate) bool {
 		i := index
 		index++
@@ -433,22 +503,102 @@ func (h *handler) sendReport(now time.Time, ex *exchange.Exchange) {
 	} else {
 		w.EndContainer()
 	}
-	if more {
-		w.PutBool(tlv.ContextTag(3), true)
-	} else if rs.sub == nil {
-		w.PutBool(tlv.ContextTag(4), true) // SuppressResponse
+	return inChunk, more
+}
+
+// encodeEvents writes the EventReports of the next chunk: once, the
+// statuses of invalid concrete paths, then the readable events from
+// rs.eventNext on. used tells whether the chunk already holds reports; it
+// returns whether more remain for later chunks.
+func (h *handler) encodeEvents(ctx *Context, rs *readState, w *tlv.Writer, limit int, used bool) (more bool) {
+	log := h.s.node.Events
+	start := w.Checkpoint()
+	w.StartArray(tlv.ContextTag(2))
+	n := 0
+	if !rs.eventStatus {
+		for i := range rs.events {
+			p := &rs.events[i]
+			if p.IsWildcard() {
+				continue
+			}
+			c := ConcreteEventPath{p.Endpoint, p.Cluster, p.Event}
+			if st := h.eventPathStatus(ctx, c); st != Success {
+				encodeEventStatus(w, c, st)
+				n++
+			}
+		}
+		if w.Len() > limit && used {
+			w.Rollback(start) // the statuses start the next chunk
+			return true
+		}
+		rs.eventStatus = true
 	}
-	w.PutUint(tlv.ContextTag(tagIMRevision), Revision)
-	w.EndContainer()
-	ex.Send(now, message.ProtocolInteractionModel, OpReportData, w.Bytes())
+	log.each(rs.eventNext, func(e *eventRecord) bool {
+		if matchesAnyEvent(rs.events, e.path) && h.eventReadable(ctx, e) {
+			cp := w.Checkpoint()
+			encodeEventData(w, e)
+			if w.Len() > limit {
+				w.Rollback(cp)
+				if n > 0 || used {
+					more = true
+					return false
+				}
+				// A single event too large for a message is skipped.
+			} else {
+				n++
+			}
+		}
+		rs.eventNext = e.number + 1
+		return true
+	})
 	if !more {
-		if rs.sub == nil {
-			h.read = nil
-			ex.Close(now)
-		} else {
-			rs.done = true // subscriptions want a StatusResponse
+		rs.eventNext = log.Next()
+	}
+	if n == 0 {
+		w.Rollback(start)
+	} else {
+		w.EndContainer()
+	}
+	return more
+}
+
+// eventPathStatus checks a concrete event path of a request.
+func (h *handler) eventPathStatus(ctx *Context, p ConcreteEventPath) Status {
+	e := h.s.node.Endpoint(p.Endpoint)
+	if e == nil {
+		return UnsupportedEndpoint
+	}
+	c := e.Cluster(p.Cluster)
+	if c == nil {
+		return UnsupportedCluster
+	}
+	if !hasID(eventIDs(c), p.Event) {
+		return UnsupportedEvent
+	}
+	if !h.s.allowed(ctx, p.Endpoint, p.Cluster, eventPrivilege(c, p.Event)) {
+		return UnsupportedAccess
+	}
+	return Success
+}
+
+// eventReadable reports whether the subject of ctx may read e: a
+// fabric-sensitive event only by its fabric, and every event only with
+// its read privilege.
+func (h *handler) eventReadable(ctx *Context, e *eventRecord) bool {
+	if e.sensitive {
+		if ctx.Session == nil || ctx.Session.FabricIndex == 0 || ctx.Session.FabricIndex != e.fabric {
+			return false
 		}
 	}
+	ep := h.s.node.Endpoint(e.path.Endpoint)
+	if ep == nil {
+		return false
+	}
+	c := ep.Cluster(e.path.Cluster)
+	if c == nil {
+		return false
+	}
+	return h.s.allowed(ctx, e.path.Endpoint, e.path.Cluster, eventPrivilege(c, e.path.Event))
 }
 
 // encodeReport writes the AttributeReportIB of c, reporting whether it wrote

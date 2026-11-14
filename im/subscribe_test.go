@@ -42,16 +42,43 @@ func (c *subClient) OnError(time.Time, *exchange.Exchange, error) {}
 
 func (f *fixture) subscribe(c *subClient, keep bool, minFloor, maxCeil uint16, paths ...im.AttributePath) {
 	f.t.Helper()
-	// Reports arrive on exchanges the device starts.
-	f.ctl.M.Register(message.ProtocolInteractionModel, func(*exchange.Exchange) exchange.Delegate { return c })
+	f.subscribeWith(c, im.EncodeSubscribeRequest(paths, minFloor, maxCeil, keep, true))
+}
+
+// subscribeWith sends a SubscribeRequest and runs until it is established.
+func (f *fixture) subscribeWith(c *subClient, req []byte) {
+	f.t.Helper()
+	// Reports arrive on exchanges the device starts; the router hands them
+	// to the client of their subscription.
+	if f.router == nil {
+		f.router = &subRouter{}
+		f.ctl.M.Register(message.ProtocolInteractionModel, func(*exchange.Exchange) exchange.Delegate { return f.router })
+	}
+	f.router.clients = append(f.router.clients, c)
 	ex, err := f.ctl.M.NewExchange(f.cs, c)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	ex.Send(f.w.Now, message.ProtocolInteractionModel, im.OpSubscribeRequest,
-		im.EncodeSubscribeRequest(paths, minFloor, maxCeil, keep, true))
+	ex.Send(f.w.Now, message.ProtocolInteractionModel, im.OpSubscribeRequest, req)
 	f.w.Advance(100 * time.Millisecond)
 }
+
+// subRouter passes device-initiated reports to the client of their
+// subscription (the latest client if none matches).
+type subRouter struct{ clients []*subClient }
+
+func (r *subRouter) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+	c := r.clients[len(r.clients)-1]
+	if rd, err := im.DecodeReportData(msg.Payload); err == nil && msg.Opcode == im.OpReportData {
+		for _, x := range r.clients {
+			if x.subID == rd.SubscriptionID {
+				c = x
+			}
+		}
+	}
+	c.OnMessage(now, ex, msg)
+}
+func (r *subRouter) OnError(time.Time, *exchange.Exchange, error) {}
 
 var onOffPath = im.AttributePath{Endpoint: 1, Cluster: clusters.IDOnOff, Attribute: 0}
 
