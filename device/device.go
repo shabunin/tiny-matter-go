@@ -76,6 +76,9 @@ type Device struct {
 	Admin    *clusters.AdminCommissioning
 	// Net is the Network Commissioning cluster (nil unless Config.WiFi).
 	Net *clusters.NetworkCommissioning
+	// Diagnostics is the General Diagnostics cluster. Set its BootReason
+	// and Interfaces before the first Poll, which records the boot events.
+	Diagnostics *clusters.GeneralDiagnostics
 	// HoldSaves postpones writing the store while set, for example while a
 	// BLE link would not survive the stall of a flash erase. Pending
 	// changes are written by the first Poll after it is cleared.
@@ -90,6 +93,8 @@ type Device struct {
 	windowDeadline time.Time
 	dirty          bool   // persistent state changed since the last save
 	saved          []byte // last saved state
+	started        bool   // the boot events were recorded
+	eventLimit     uint64 // event numbers reserved in the store
 }
 
 // New creates a device. Its commissioning window starts closed; call
@@ -137,6 +142,7 @@ func New(cfg Config) (*Device, error) {
 	d.General.Complete = d.commissioningComplete
 	d.OpCreds = clusters.NewOperationalCredentials(cfg.Attestation, d.Fabrics, d.FailSafe, d.ACL, cfg.Rand)
 	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
+		d.Node.Events.RemoveFabric(index)
 		d.later(func(now time.Time) {
 			d.closeFabricSessions(now, index)
 			if d.Admin.AdminFabricIndex == index {
@@ -157,10 +163,13 @@ func New(cfg Config) (*Device, error) {
 		d.log("fail-safe expired: commissioning rolled back")
 	})
 
+	d.OpCreds.OnFabricLeave = func(now time.Time, index uint8) { cfg.Basic.Leave(d.Node, now, index) }
+
 	d.Admin = &clusters.AdminCommissioning{Open: d.adminOpen, Revoke: d.adminRevoke}
+	d.Diagnostics = &clusters.GeneralDiagnostics{}
 
 	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
-	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Admin, d.OpCreds)
+	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Admin, d.OpCreds)
 	if cfg.WiFi {
 		d.Net = clusters.NewNetworkCommissioning(d.FailSafe, nil)
 		d.Net.FabricIndex = d.General.FabricIndex
@@ -188,9 +197,29 @@ func New(cfg Config) (*Device, error) {
 			d.log("restored " + strconv.Itoa(n) + " fabric(s)")
 		}
 		d.saved = d.encodeState()
+		// Event numbers continue past those reserved before the restart,
+		// and the reboot is counted; both are saved now.
+		d.eventLimit = d.Node.Events.Start(d.eventLimit)
+		d.Node.Events.OnReserve = func(limit uint64) {
+			d.eventLimit = limit
+			d.dirty = true
+		}
+		if d.Diagnostics.RebootCount < 0xFFFF {
+			d.Diagnostics.RebootCount++
+		}
+		d.save()
 		d.advertise()
 	}
+	if cfg.Clock != nil {
+		d.boot(cfg.Clock())
+	}
 	return d, nil
+}
+
+// boot sets the time the node booted.
+func (d *Device) boot(t time.Time) {
+	d.Node.Events.Boot = t
+	d.Diagnostics.Boot = t
 }
 
 // Commissioned reports whether the node belongs to at least one fabric.
@@ -213,6 +242,14 @@ func (d *Device) HandlePacket(now time.Time, from exchange.Addr, pkt []byte) err
 // Poll runs timers and deferred work, returning when it next needs to run
 // (zero if idle).
 func (d *Device) Poll(now time.Time) time.Time {
+	if !d.started {
+		d.started = true
+		if d.Diagnostics.Boot.IsZero() {
+			d.boot(now)
+		}
+		d.cfg.Basic.StartUp(d.Node, now)
+		d.Diagnostics.BootReasonEvent(d.Node, now)
+	}
 	for len(d.deferred) > 0 {
 		f := d.deferred[0]
 		d.deferred = d.deferred[1:]
@@ -231,6 +268,9 @@ func (d *Device) Poll(now time.Time) time.Time {
 		next = t
 	}
 	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
+	if t := d.Node.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
 	if t := d.Server.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {

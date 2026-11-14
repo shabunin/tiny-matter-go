@@ -17,6 +17,8 @@ import (
 //	       6: NOC, 7: operational private key, 8: IPK epoch key } ]
 //	4: ACL entries (AccessControlEntryStruct with fabric index)
 //	5: Wi-Fi networks [ { 1: SSID, 2: credentials } ] (committed)
+//	6: first event number after a restart (reserved before it)
+//	7: reboot count
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -60,6 +62,12 @@ func (d *Device) encodeState() []byte {
 		}
 		w.EndContainer()
 	}
+	if d.eventLimit != 0 {
+		w.PutUint(tlv.ContextTag(6), d.eventLimit)
+	}
+	if d.Diagnostics.RebootCount != 0 {
+		w.PutUint(tlv.ContextTag(7), uint64(d.Diagnostics.RebootCount))
+	}
 	w.EndContainer()
 	return w.Bytes()
 }
@@ -92,6 +100,14 @@ func (d *Device) decodeState(b []byte) error {
 			return d.ACL.DecodeEntries(r)
 		case 5:
 			return d.decodeNetworks(r)
+		case 6:
+			v, err := r.Uint()
+			d.eventLimit = v
+			return err
+		case 7:
+			v, err := r.Uint16()
+			d.Diagnostics.RebootCount = v
+			return err
 		}
 		return nil
 	})
@@ -195,6 +211,7 @@ func (d *Device) load() error {
 		if d.Net != nil {
 			d.Net.Restore(nil)
 		}
+		d.eventLimit, d.Diagnostics.RebootCount = 0, 0
 		return err
 	}
 	return nil
