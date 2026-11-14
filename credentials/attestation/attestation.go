@@ -99,13 +99,24 @@ func vidPID(c *x509.Certificate) (vid, pid uint16, hasVID, hasPID bool, err erro
 //go:embed testpaa/*.der
 var testPAAFiles embed.FS
 
+//go:embed prodpaa/*.der
+var prodPAAFiles embed.FS
+
 // TestPAAs returns the SDK's test PAAs, which issue the PAIs of
 // development devices (vendor IDs 0xFFF1 to 0xFFF4).
-func TestPAAs() []*x509.Certificate {
-	entries, _ := testPAAFiles.ReadDir("testpaa")
+func TestPAAs() []*x509.Certificate { return embedded(testPAAFiles, "testpaa") }
+
+// ProductionPAAs returns the production PAAs of certified devices: the
+// Distributed Compliance Ledger's PAA roots as mirrored in the Matter SDK
+// (credentials/production/paa-root-certs; see prodpaa/SOURCE.md for the
+// version). PAAs approved since then are added with LoadPAAs.
+func ProductionPAAs() []*x509.Certificate { return embedded(prodPAAFiles, "prodpaa") }
+
+func embedded(fsys embed.FS, dir string) []*x509.Certificate {
+	entries, _ := fsys.ReadDir(dir)
 	var out []*x509.Certificate
 	for _, e := range entries {
-		b, _ := testPAAFiles.ReadFile("testpaa/" + e.Name())
+		b, _ := fsys.ReadFile(dir + "/" + e.Name())
 		if c, err := x509.ParseCertificate(b); err == nil {
 			out = append(out, c)
 		}

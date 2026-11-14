@@ -14,7 +14,6 @@ package main
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,7 +32,7 @@ import (
 
 var (
 	stateDir = flag.String("dir", defaultDir(), "controller state `directory` (fabric keys and nodes)")
-	paaDir   = flag.String("paa", "", "`directory` of trusted production PAA certificates (default <dir>/paa)")
+	paaDir   = flag.String("paa", "", "`directory` of more trusted PAA certificates, besides the bundled production ones (default <dir>/paa)")
 	strict   = flag.Bool("strict", false, "trust production PAAs and certification declarations only, not test ones")
 	verbose  = flag.Bool("v", false, "log progress")
 	timeout  = flag.Duration("timeout", 30*time.Second, "time limit for an operation")
@@ -160,9 +159,9 @@ func flagSet(name string) *flag.FlagSet {
 
 // open opens the controller with the configured trust store.
 func open(logAlways bool) (*controller.Controller, error) {
-	var paas []*x509.Certificate
+	paas := attestation.ProductionPAAs()
 	if !*strict {
-		paas = attestation.TestPAAs()
+		paas = append(paas, attestation.TestPAAs()...)
 	}
 	dir := *paaDir
 	if dir == "" {

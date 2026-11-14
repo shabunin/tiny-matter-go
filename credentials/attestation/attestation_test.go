@@ -158,3 +158,33 @@ func TestLoadPAAs(t *testing.T) {
 	}
 	var _ []*x509.Certificate = paas
 }
+
+func TestProductionPAAs(t *testing.T) {
+	paas := ProductionPAAs()
+	if len(paas) != 73 {
+		t.Fatalf("%d production PAAs, want 73", len(paas))
+	}
+	seen := map[string]bool{}
+	for _, c := range paas {
+		name := c.Subject.String()
+		if err := c.CheckSignatureFrom(c); err != nil {
+			t.Errorf("%s: not self-signed: %v", name, err)
+		}
+		if !c.IsCA || c.KeyUsage&x509.KeyUsageCertSign == 0 || c.SignatureAlgorithm != x509.ECDSAWithSHA256 {
+			t.Errorf("%s: not an ECDSA-SHA256 signing CA", name)
+		}
+		if len(c.SubjectKeyId) == 0 || seen[string(c.SubjectKeyId)] {
+			t.Errorf("%s: missing or duplicate subject key ID", name)
+		}
+		seen[string(c.SubjectKeyId)] = true
+		if _, _, _, hasPID, err := vidPID(c); err != nil || hasPID {
+			t.Errorf("%s: a PAA carries no product ID (err %v)", name, err)
+		}
+	}
+	// None of the SDK test PAAs is among them.
+	for _, tp := range TestPAAs() {
+		if seen[string(tp.SubjectKeyId)] {
+			t.Errorf("test PAA %s in the production set", tp.Subject)
+		}
+	}
+}
