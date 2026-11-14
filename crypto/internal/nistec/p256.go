@@ -480,6 +480,18 @@ func boothW5(in uint64) (uint8, int) {
 	return uint8(d), int(s & 1)
 }
 
+// Yield, if set, is called a few dozen times during each scalar
+// multiplication. A cooperative scheduler uses it to run other tasks (such
+// as a radio controller with real-time deadlines) during the long
+// computations. It must not touch the point being computed.
+var Yield func()
+
+func yield() {
+	if Yield != nil {
+		Yield()
+	}
+}
+
 // ScalarMult sets r = scalar * q, where scalar is a 32-byte big endian value,
 // and returns r. If scalar is not 32 bytes long, ScalarMult returns an error
 // and the receiver is unchanged.
@@ -506,6 +518,7 @@ func (p *P256Point) ScalarMult(q *P256Point, scalar []byte) (*P256Point, error) 
 	t := NewP256Point()
 	for index >= 4 {
 		index -= 5
+		yield()
 
 		p.Double(p)
 		p.Double(p)
@@ -598,6 +611,7 @@ func (p *P256Point) ScalarBaseMult(scalar []byte) (*P256Point, error) {
 
 	for index >= 5 {
 		index -= 6
+		yield()
 
 		if index >= 0 {
 			sel, sign = boothW6(s.Rsh(index) & 0b1111111)

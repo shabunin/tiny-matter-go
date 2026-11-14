@@ -86,3 +86,13 @@ func readFull(r io.Reader) func([]byte) error {
 		return err
 	}
 }
+
+// SetYield installs f to be called periodically during scalar
+// multiplications and modular exponentiations, so that on a cooperative
+// scheduler other tasks (a radio controller, say) keep running during the
+// tens to hundreds of milliseconds these take on a microcontroller. Nil
+// removes it. It is not safe to change while computations run.
+func SetYield(f func()) {
+	nistec.Yield = f
+	bigmod.Yield = f
+}

@@ -975,6 +975,9 @@ func (x *Nat) Mul(y *Nat, m *Modulus) *Nat {
 	}
 }
 
+// Yield, if set, is called once per exponent byte by Exp; see nistec.Yield.
+var Yield func()
+
 // Exp calculates out = x^e mod m.
 //
 // The exponent e is represented in big-endian order. The output will be resized
@@ -1009,6 +1012,9 @@ func (out *Nat) Exp(x *Nat, e []byte, m *Modulus) *Nat {
 	out.montgomeryRepresentation(m)
 	tmp := NewNat().ExpandFor(m)
 	for _, b := range e {
+		if Yield != nil {
+			Yield()
+		}
 		for _, j := range []int{4, 0} {
 			// Square four times. Optimization note: this can be implemented
 			// more efficiently than with generic Montgomery multiplication.

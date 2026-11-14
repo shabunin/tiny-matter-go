@@ -210,3 +210,21 @@ func BenchmarkVerify(b *testing.B) {
 		k.PublicKey().Verify(h[:], sig)
 	}
 }
+
+func TestYield(t *testing.T) {
+	n := 0
+	SetYield(func() { n++ })
+	defer SetYield(nil)
+	k, err := GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 40 {
+		t.Fatalf("ScalarBaseMult yielded %d times", n)
+	}
+	n = 0
+	sig, _ := k.SignMessage(rand.Reader, []byte("m"))
+	if !k.PublicKey().VerifyMessage([]byte("m"), sig) || n < 100 {
+		t.Fatalf("sign+verify yielded %d times", n)
+	}
+}
