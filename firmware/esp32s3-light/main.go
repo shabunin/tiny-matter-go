@@ -18,7 +18,17 @@
 // commissioned. Hold the G0 button for 5 s to erase them (factory reset).
 // The RGB LED shows the light state (red when on); dim cyan means it waits
 // for BLE commissioning, dim purple for commissioning over IP, yellow
-// means a factory reset.
+// means a factory reset. It blinks while a controller identifies an
+// endpoint: white for the light, green for the button.
+//
+// Endpoint 1 is the light; endpoint 2 is a Generic Switch, the G0 button,
+// whose presses are Switch events (InitialPress, LongPress after 1 s,
+// ShortRelease or LongRelease). A test build can enable the General
+// Diagnostics test event triggers with a 16-byte key,
+// -X main.testEventKey=<32 hex digits>; then trigger 0x003B000000000001
+// clicks the button and 0x003B000000000002 holds it for 1.5 s:
+//
+//	chip-tool generaldiagnostics test-event-trigger hex:<key> 0x003B000000000001 1 0
 //
 // It speaks IPv6 (link-local) and IPv4 (DHCP), and advertises itself with
 // mDNS on both, so controllers that look over either family find it.
@@ -32,6 +42,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"machine"
 	"net/netip"
 	"runtime"
@@ -56,6 +67,7 @@ import (
 var (
 	ssid, password string // optional compiled-in network, set with -ldflags -X
 	stateSlot      string // "1" keeps state in a second flash area (testing)
+	testEventKey   string // hex key enabling test event triggers (testing)
 )
 
 const (
@@ -149,27 +161,7 @@ func stateStore() *storage.Flash {
 	return &storage.Flash{Dev: machine.Flash, Offset: off, SlotSize: slot}
 }
 
-var (
-	pressedSince time.Time
-	wifiOn       bool
-)
-
-// checkButton erases the stored state and restarts when G0 is held 5 s.
-func checkButton(now time.Time, store *storage.Flash) {
-	if !buttonPressed() {
-		pressedSince = time.Time{}
-		return
-	}
-	if pressedSince.IsZero() {
-		pressedSince = now
-	} else if now.Sub(pressedSince) > 5*time.Second {
-		println("factory reset")
-		setLED(40, 30, 0) // yellow: erasing
-		store.Erase()
-		time.Sleep(500 * time.Millisecond)
-		restart()
-	}
-}
+var wifiOn bool
 
 func main() {
 	initBoard()
@@ -229,18 +221,37 @@ func main() {
 	if err != nil {
 		fatal("device", err)
 	}
-	ep := d.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
-	d.Node.AddCluster(ep, clusters.Descriptor{}, &clusters.OnOff{
-		OnChange: func(on bool) {
-			if on {
-				println("LIGHT ON")
-				setLED(80, 0, 0) // red
-			} else {
-				println("LIGHT OFF")
-				setLED(0, 0, 0)
-			}
-		},
-	})
+	u := newUI(d, store)
+	cause := resetCause()
+	d.Diagnostics.BootReason = bootReason(cause)
+	println("reset cause", cause, "boot reason", d.Diagnostics.BootReason, "reboot count", d.Diagnostics.RebootCount)
+	if testEventKey != "" {
+		key, err := hex.DecodeString(testEventKey)
+		if err != nil || len(key) != 16 {
+			println("testEventKey wants 32 hex digits: test event triggers disabled")
+		} else {
+			copy(d.Diagnostics.EnableKey[:], key)
+			d.Diagnostics.Trigger = u.trigger
+			println("test event triggers enabled")
+		}
+	}
+	// The Wi-Fi station interface, for General Diagnostics.
+	var (
+		stack  *ip6.Stack
+		ipv4   netip.Addr
+		linkUp bool
+	)
+	d.Diagnostics.Interfaces = func() []clusters.NetworkInterface {
+		ni := clusters.NetworkInterface{Name: "wlan0", Operational: linkUp,
+			HardwareAddress: mac[:], Type: clusters.InterfaceWiFi}
+		if stack != nil {
+			ni.IPv6 = []netip.Addr{stack.Addr()}
+		}
+		if ipv4.IsValid() {
+			ni.IPv4 = []netip.Addr{ipv4}
+		}
+		return []clusters.NetworkInterface{ni}
+	}
 	d.Net.Scan = func(ctx *im.Context, want []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
 		if !wifiOn {
 			return nil, clusters.NetworkOK // the radio is not up during BLE commissioning
@@ -273,7 +284,7 @@ func main() {
 	case ssid != "":
 		nw = clusters.WiFiNetwork{SSID: []byte(ssid), Credentials: []byte(password)}
 	default:
-		nw = commissionOverBLE(d, tr, store)
+		nw = commissionOverBLE(d, tr, u)
 		viaBLE = true
 	}
 	if viaBLE {
@@ -302,6 +313,7 @@ func main() {
 	reconnected := false
 	link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
 		println("wifi link connected:", connected)
+		linkUp = connected
 		if !connected {
 			d.Net.SetConnected(d.Node, nil)
 			return 3, params
@@ -323,6 +335,7 @@ func main() {
 		}
 		time.Sleep(3 * time.Second)
 	}
+	linkUp = true
 	d.Net.SetConnected(d.Node, nw.SSID)
 	d.Net.SetLastConnect(d.Node, nw.SSID, clusters.NetworkOK, 0, false)
 	nd := link.NetDev()
@@ -337,7 +350,7 @@ func main() {
 		}
 		return err
 	}
-	stack := ip6.New(mac, sendFrame)
+	stack = ip6.New(mac, sendFrame)
 	stack4 := ip4.New(mac, sendFrame)
 	net := &network{stack, stack4}
 	println("wifi up, mac", hexMAC(mac), "address", stack.Addr().String())
@@ -351,9 +364,11 @@ func main() {
 	stack4.Join(mdns.Group4)
 	stack4.StartDHCP(hexMAC(mac), func(p netip.Prefix, gw netip.Addr) {
 		addrs := []netip.Addr{stack.Addr()}
+		ipv4 = netip.Addr{}
 		if p.IsValid() {
 			println("ipv4 address", p.String(), "gateway", gw.String())
 			addrs = append(addrs, p.Addr())
+			ipv4 = p.Addr()
 		} else {
 			println("ipv4 address lost")
 		}
@@ -378,9 +393,6 @@ func main() {
 	stack4.Listen(mdns.Port, onMDNS)
 	if d.Commissioned() {
 		println("commissioned; reachable over CASE")
-		setLED(0, 0, 0)
-	} else {
-		setLED(8, 0, 8) // dim purple: waiting to be commissioned
 	}
 
 	var frame [espradio.MaxFrameSize]byte
@@ -407,7 +419,7 @@ func main() {
 		d.Poll(now)
 		resp.Poll(now)
 		stack4.Poll(now)
-		checkButton(now, store)
+		u.poll(now)
 		if now.Sub(lastReport) > 30*time.Second {
 			lastReport = now
 			rx, drops := espradio.NetifRxStats()
@@ -420,7 +432,7 @@ func main() {
 // commissionOverBLE advertises the Matter BLE service and serves the
 // commissioner over BTP until it provisions a network with ConnectNetwork,
 // then closes the BLE link and returns the network to join.
-func commissionOverBLE(d *device.Device, tr *transport, store *storage.Flash) clusters.WiFiNetwork {
+func commissionOverBLE(d *device.Device, tr *transport, u *ui) clusters.WiFiNetwork {
 	if err := espradio.BLEInit(); err != nil {
 		fatal("ble init", err)
 	}
@@ -438,7 +450,7 @@ func commissionOverBLE(d *device.Device, tr *transport, store *storage.Flash) cl
 	}
 	d.HoldSaves = true // a flash erase would stall the link past its timeout
 	println("BLE advertising: discriminator", discriminator)
-	setLED(0, 8, 8) // dim cyan: waiting for BLE commissioning
+	u.ble = true
 	for {
 		now := time.Now()
 		b.Poll(now, func(msg []byte) {
@@ -451,10 +463,11 @@ func commissionOverBLE(d *device.Device, tr *transport, store *storage.Flash) cl
 			break
 		}
 		b.Advertise(!b.Connected() && join == nil && d.PASE.WindowOpen())
-		checkButton(now, store)
+		u.poll(now)
 		time.Sleep(2 * time.Millisecond)
 	}
 	b.Advertise(false)
+	u.ble = false
 	d.HoldSaves = false
 	tr.ble = nil
 	d.Net.Connect = nil

@@ -75,6 +75,9 @@ func initBoard() {
 
 func buttonPressed() bool { return !buttonPin.Get() }
 
+// resetCause returns why the CPU last reset (RTC_CNTL_RESET_CAUSE_PROCPU).
+func resetCause() uint32 { return esp.RTC_CNTL.GetRESET_STATE_RESET_CAUSE_PROCPU() }
+
 // restart performs a software system reset.
 func restart() {
 	esp.RTC_CNTL.OPTIONS0.SetBits(esp.RTC_CNTL_OPTIONS0_SW_SYS_RST)
