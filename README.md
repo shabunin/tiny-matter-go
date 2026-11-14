@@ -11,7 +11,8 @@ allocation-conscious and safe on 32-bit targets.
 (M5Stack Cardputer) on/off light is commissioned and controlled over Wi-Fi by
 chip-tool, [matter.js](https://github.com/matter-js/matter.js) and
 [matterctl](https://github.com/cybergarage/go-matter), all at once, and
-chip-tool commissions it over Bluetooth LE and hands it the Wi-Fi network.
+chip-tool and this project's controller, `tmctl`, commission it over
+Bluetooth LE and hand it the Wi-Fi network.
 Its button is a Generic Switch whose presses reach subscribed controllers
 as events. The device persists its fabrics and network in flash. APIs will change. The examples use the
 public SDK **test** attestation credentials, so only controllers in
@@ -27,6 +28,8 @@ waits to be given a network:
     cd firmware
     tinygo flash -target esp32s3-generic -port /dev/ttyACM0 ./esp32s3-light
     chip-tool pairing ble-wifi 1 YOUR_SSID YOUR_PASSWORD 20202021 3840
+    # or, with this project's controller (see below):
+    TMCTL_WIFI_PASSWORD=YOUR_PASSWORD tmctl commission 34970112332 -ssid YOUR_SSID
 
 Or compile the credentials in and commission over the IP network:
 
@@ -63,12 +66,14 @@ identify 10 1 1` blinks the LED.
 `cmd/tmctl` is a command-line Matter controller for Linux (and other hosts)
 built on the `controller` package. It keeps its own fabric, a root CA it
 generates with the keys in `~/.local/share/tiny-matter-go/controller/`
-(readable only by you), commissions devices onto it over the IP network,
-and works with them:
+(readable only by you), commissions devices onto it over the IP network
+or Bluetooth LE, and works with them:
 
     go install github.com/shabunin/tiny-matter-go/cmd/tmctl@latest
     tmctl discover                          # devices in commissioning mode
     tmctl commission 34970112332 -label lamp
+    tmctl discover -ble                     # also those advertising over BLE
+    TMCTL_WIFI_PASSWORD=... tmctl commission 34970112332 -ssid MyWiFi -label lamp
     tmctl invoke lamp 1 OnOff Toggle
     tmctl read lamp 1 OnOff onOff
     tmctl write lamp 0 BasicInformation NodeLabel "desk lamp"
@@ -84,18 +89,29 @@ BasicInformation), or by number; `tmctl clusters [cluster]` lists them.
 Lists and structs are written as JSON. Subscriptions come back by
 themselves after the device restarts.
 
-Device attestation is verified. The SDK test PAAs and test certification
-declarations are trusted, for development devices such as the ones here,
-unless `-strict` is given. For production devices, put the PAA
-certificates (such as the SDK's `credentials/production/paa-root-certs`)
-in `~/.local/share/tiny-matter-go/controller/paa` or pass `-paa`. A device
+With `-ssid`, the device is found over Bluetooth LE, commissioned over
+BTP, given the Wi-Fi network (Network Commissioning) and told to join it,
+then reached on the IP network for CASE and CommissioningComplete; `-ble`
+alone commissions over BLE a device that is on the network already.
+Bluetooth goes through BlueZ over the D-Bus system bus (Linux). Thread
+networks are not supported.
+
+Device attestation is verified against the production PAAs of the Matter
+Distributed Compliance Ledger, which are built in (see Third-party data),
+and the CSA's certification declaration keys. The SDK test PAAs and test
+certification declarations are trusted too, for development devices such
+as the ones here, unless `-strict` is given. More PAAs go in
+`~/.local/share/tiny-matter-go/controller/paa`, or pass `-paa`. A device
 that already has a controller joins through a commissioning window opened
 there, for example `chip-tool pairing open-commissioning-window <node> 1
 600 1000 3840`, whose code goes to `tmctl commission`.
 
-Tested against the devices here, a [matter.js](https://github.com/matter-js/matter.js)
-device, and chip-tool, which commissions devices through windows `tmctl
-open-window` opens. Commissioning over BLE is not supported yet.
+Tested against the devices here (over BLE, the Cardputer is commissioned
+onto Wi-Fi in about 25 s, most of it spent joining the network), a
+[matter.js](https://github.com/matter-js/matter.js) device, and chip-tool,
+which commissions devices through windows `tmctl open-window` opens; the
+production trust store was checked against a commercial device's
+attestation chain and certification declaration.
 
 ## Layout
 
@@ -106,7 +122,7 @@ open-window` opens. Commissioning over BLE is not supported yet.
 | `crypto/ccm/` | AES-CCM as a `cipher.AEAD`, allocation-free |
 | `message/` | Message and protocol headers, message encryption (`Cipher`), counters and replay windows |
 | `exchange/` | Sessions, exchanges and MRP (acks, retransmission, backoff; skipped on reliable transports such as BTP); sans-IO, driven by `HandlePacket` and `Poll(now)` |
-| `btp/` | Bluetooth Transport Protocol (spec 4.19), sans-IO server side: handshake, segmentation and reassembly, windows and acks; BLE advertising data |
+| `btp/` | Bluetooth Transport Protocol (spec 4.19), sans-IO, peripheral and central: handshake, segmentation and reassembly, windows and acks; BLE advertising data, and parsing it |
 | `crypto/spake2p/` | SPAKE2+ (P-256, RFC 9383 as used by Matter) and the passcode verifier (W0, L) |
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
@@ -120,9 +136,11 @@ open-window` opens. Commissioning over BLE is not supported yet.
 | `ip4/` | Minimal IPv4 host over the same frames: DHCP client (renew/rebind/expiry), ARP, default gateway, Echo, IGMPv2 reports, UDP |
 | `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies; a `dnssd.Advertiser`) and querier (browse, resolve, cache) |
 | `onboarding/` | Onboarding payloads: QR codes (`MT:` base-38) and 11/21-digit manual pairing codes (Verhoeff check digit) |
-| `credentials/attestation/` | Device attestation for commissioners: DAC/PAI/PAA chain, certification declaration (CMS, CSA and SDK test signing keys), attestation and NOCSR signatures; PAA trust stores |
-| `controller/` | Matter controller for hosts: own fabric (persisted), mDNS discovery, commissioning (PASE, attestation, CSR, NOC, CASE), read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal |
+| `credentials/attestation/` | Device attestation for commissioners: DAC/PAI/PAA chain, certification declaration (CMS, CSA and SDK test signing keys), attestation and NOCSR signatures; PAA trust stores, with the production and SDK test PAAs built in |
+| `controller/` | Matter controller for hosts: own fabric (persisted), mDNS and BLE discovery, commissioning over IP or BLE (PASE, attestation, CSR, NOC, Wi-Fi network provisioning, CASE), read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal |
 | `cmd/tmctl/` | Command-line controller over `controller` (see above) |
+| `internal/dbus/` | Minimal D-Bus client: wire format by signature, system bus connection (EXTERNAL auth), method calls, signals |
+| `internal/bluez/` | BLE central over BlueZ's D-Bus API: LE discovery with service data, connect, GATT writes and indications for the Matter service |
 | `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
 | `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, Wi-Fi networks, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
@@ -152,6 +170,9 @@ Matter SDK (Apache-2.0, Copyright Project CHIP Authors):
   testing;
 - the test PAA certificates in `credentials/attestation/testpaa/`, which
   `attestation.TestPAAs` trusts for development devices;
+- the production PAA certificates in `credentials/attestation/prodpaa/`
+  (the SDK's mirror of the Distributed Compliance Ledger's PAAs; see
+  `SOURCE.md` there), which `attestation.ProductionPAAs` trusts;
 - `internal/datamodel/controller-clusters.matter`, the IDL of the clusters
   a controller knows, embedded in `tmctl` for names and types.
 
