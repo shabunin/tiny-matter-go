@@ -38,11 +38,17 @@ type harness struct {
 	light *clusters.OnOff
 	// emptyICAC sends AddNOC with an empty ICAC field, as matter.js does.
 	emptyICAC bool
+	// afterArm, if set, runs on the PASE session after ArmFailSafe.
+	afterArm func(s *exchange.Session)
 }
 
 func newHarness(t *testing.T) *harness { return newHarnessStore(t, nil) }
 
 func newHarnessStore(t *testing.T, store storage.Store) *harness {
+	return newHarnessWith(t, store, false)
+}
+
+func newHarnessWith(t *testing.T, store storage.Store, wifi bool) *harness {
 	h := &harness{t: t, w: simnet.New(t)}
 	h.ctl = h.w.Node(5550)
 	h.devN = h.w.ExternalNode(5540)
@@ -55,7 +61,7 @@ func newHarnessStore(t *testing.T, store storage.Store) *harness {
 		Attestation: &clusters.Attestation{DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
 			CertificationDeclaration: devcreds.CertificationDeclaration},
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: 0xFFF1, ProductName: "P", ProductID: 0x8000},
-		Store: store,
+		Store: store, WiFi: wifi,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +157,9 @@ func (h *harness) commissionWith(code uint32, wantFabrics int) (*fabric.Fabric, 
 	res := h.invoke(paseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) })
 	if code, _ := field(t, res.Fields, 0).Uint(); code != 0 {
 		t.Fatalf("ArmFailSafe: %d", code)
+	}
+	if h.afterArm != nil {
+		h.afterArm(paseS)
 	}
 
 	// Attestation: the signature covers elements || challenge.

@@ -53,6 +53,11 @@ type Config struct {
 	// Clock, if set, returns the current time (time.Now on real
 	// hardware); see exchange.Config.Clock.
 	Clock func() time.Time
+
+	// WiFi adds the Network Commissioning cluster (Wi-Fi, non-concurrent),
+	// so a commissioner can provision the network, typically over BLE.
+	// Set Net.Connect (and optionally Net.Scan) after New.
+	WiFi bool
 }
 
 // Device is a Matter node.
@@ -69,6 +74,12 @@ type Device struct {
 	General  *clusters.GeneralCommissioning
 	OpCreds  *clusters.OperationalCredentials
 	Admin    *clusters.AdminCommissioning
+	// Net is the Network Commissioning cluster (nil unless Config.WiFi).
+	Net *clusters.NetworkCommissioning
+	// HoldSaves postpones writing the store while set, for example while a
+	// BLE link would not survive the stall of a flash erase. Pending
+	// changes are written by the first Poll after it is cleared.
+	HoldSaves bool
 
 	deferred []func(now time.Time)
 	instance uint64 // commissionable instance name
@@ -150,6 +161,17 @@ func New(cfg Config) (*Device, error) {
 
 	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
 	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Admin, d.OpCreds)
+	if cfg.WiFi {
+		d.Net = clusters.NewNetworkCommissioning(d.FailSafe, nil)
+		d.Net.FabricIndex = d.General.FabricIndex
+		d.General.SupportsConcurrentConnection = false
+		d.FailSafe.OnExpire = append(d.FailSafe.OnExpire, func(now time.Time) {
+			if d.Net.Rollback(d.Node) {
+				d.log("network configuration rolled back")
+			}
+		})
+		d.Node.AddCluster(d.Root, d.Net)
+	}
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
 	serverHook := d.Node.OnChange // subscriptions
@@ -196,7 +218,7 @@ func (d *Device) Poll(now time.Time) time.Time {
 		d.deferred = d.deferred[1:]
 		f(now)
 	}
-	if d.dirty {
+	if d.dirty && !d.HoldSaves {
 		d.dirty = false
 		d.save()
 	}
@@ -291,6 +313,9 @@ func (d *Device) commissioningComplete(ctx *im.Context) clusters.CommissioningEr
 		return clusters.InvalidAuthentication
 	}
 	d.Fabrics.Commit()
+	if d.Net != nil {
+		d.Net.Commit()
+	}
 	d.dirty = true
 	d.OpCreds.Reset()
 	d.closeWindow()

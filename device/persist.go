@@ -16,6 +16,7 @@ import (
 //	3: [ { 1: index, 2: vendor ID, 3: label, 4: RCAC, 5: ICAC (optional),
 //	       6: NOC, 7: operational private key, 8: IPK epoch key } ]
 //	4: ACL entries (AccessControlEntryStruct with fabric index)
+//	5: Wi-Fi networks [ { 1: SSID, 2: credentials } ] (committed)
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -49,6 +50,16 @@ func (d *Device) encodeState() []byte {
 		f := d.Fabrics.Get(index)
 		return f != nil && !f.Pending
 	})
+	if d.Net != nil && len(d.Net.Committed()) > 0 {
+		w.StartArray(tlv.ContextTag(5))
+		for _, n := range d.Net.Committed() {
+			w.StartStruct(tlv.Anonymous)
+			w.PutBytes(tlv.ContextTag(1), n.SSID)
+			w.PutBytes(tlv.ContextTag(2), n.Credentials)
+			w.EndContainer()
+		}
+		w.EndContainer()
+	}
 	w.EndContainer()
 	return w.Bytes()
 }
@@ -79,6 +90,8 @@ func (d *Device) decodeState(b []byte) error {
 			return r.ExitContainer()
 		case 4:
 			return d.ACL.DecodeEntries(r)
+		case 5:
+			return d.decodeNetworks(r)
 		}
 		return nil
 	})
@@ -137,6 +150,36 @@ func (d *Device) decodeFabric(r *tlv.Reader) error {
 	return err
 }
 
+func (d *Device) decodeNetworks(r *tlv.Reader) error {
+	if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+		return errState
+	}
+	var ns []clusters.WiFiNetwork
+	for r.Next() == nil {
+		var n clusters.WiFiNetwork
+		err := im.ForEachField(r, func(r *tlv.Reader, tag uint8) error {
+			if tag != 1 && tag != 2 {
+				return nil
+			}
+			v, err := r.Bytes()
+			if tag == 1 {
+				n.SSID = v
+			} else {
+				n.Credentials = v
+			}
+			return err
+		})
+		if err != nil || len(n.SSID) == 0 {
+			return errState
+		}
+		ns = append(ns, n)
+	}
+	if d.Net != nil {
+		d.Net.Restore(ns)
+	}
+	return r.ExitContainer()
+}
+
 // load restores state from the store.
 func (d *Device) load() error {
 	b, err := d.cfg.Store.Load()
@@ -149,6 +192,9 @@ func (d *Device) load() error {
 			d.Fabrics.Remove(f.Index)
 		}
 		d.ACL.Entries = nil
+		if d.Net != nil {
+			d.Net.Restore(nil)
+		}
 		return err
 	}
 	return nil
