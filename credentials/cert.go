@@ -502,8 +502,11 @@ func nameDER(dn DN) []byte {
 // Unix seconds.
 const MatterEpoch = 946684800
 
-func timeDER(v uint32, notAfter bool) []byte {
-	if notAfter && v == 0 {
+// timeDER converts a validity time to X.509. Zero, "no well-defined
+// time", becomes 99991231235959Z (RFC 5280 4.1.2.5) for not-before as
+// well as not-after, as the Matter SDK and matter.js convert it.
+func timeDER(v uint32) []byte {
+	if v == 0 {
 		return der(derGenTime, []byte("99991231235959Z"))
 	}
 	t := time.Unix(MatterEpoch+int64(v), 0).UTC()
@@ -582,7 +585,7 @@ func (c *Cert) TBS() []byte {
 		der(derInteger, c.SerialNumber),
 		der(derSequence, der(derOID, oidECDSAWithSHA256)),
 		nameDER(c.Issuer),
-		der(derSequence, timeDER(c.NotBefore, false), timeDER(c.NotAfter, true)),
+		der(derSequence, timeDER(c.NotBefore), timeDER(c.NotAfter)),
 		nameDER(c.Subject),
 		der(derSequence,
 			der(derSequence, der(derOID, oidECPublicKey), der(derOID, oidPrime256v1)),

@@ -3,6 +3,8 @@ package credentials
 import (
 	"crypto/rand"
 	"crypto/sha1"
+	"math"
+	"time"
 
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 )
@@ -14,11 +16,32 @@ func keyID(pub []byte) []byte {
 	return h[:]
 }
 
+// serial returns a random positive 8-byte serial number, so the
+// certificates an issuer signs are told apart.
+func serial() []byte {
+	b := make([]byte, 8)
+	rand.Read(b)
+	b[0] = b[0]&0x7F | 0x40
+	return b
+}
+
+// validFrom is the not-before time of issued certificates: an hour ago,
+// against clock skew, or zero (no well-defined time) on a device whose
+// clock is not set. They do not expire.
+func validFrom() uint32 {
+	t := time.Now().Add(-time.Hour).Unix() - MatterEpoch
+	if t <= 0 || t > math.MaxUint32 {
+		return 0
+	}
+	return uint32(t)
+}
+
 // IssueRoot returns a self-signed root (RCAC) for rcacID.
 func IssueRoot(key *p256.PrivateKey, rcacID uint64) (*Cert, error) {
 	pub := key.PublicKey().Bytes()
 	c := &Cert{
-		SerialNumber: []byte{1},
+		SerialNumber: serial(),
+		NotBefore:    validFrom(),
 		Issuer:       DN{{Tag: DNMatterRCACID, Uint: rcacID}},
 		Subject:      DN{{Tag: DNMatterRCACID, Uint: rcacID}},
 		PublicKey:    pub,
@@ -38,7 +61,8 @@ func IssueNOC(issuer *Cert, issuerKey *p256.PrivateKey, nodePub []byte, fabricID
 		subj = append(subj, DNAttr{Tag: DNMatterNOCCAT, Uint: uint64(c)})
 	}
 	c := &Cert{
-		SerialNumber:   []byte{2},
+		SerialNumber:   serial(),
+		NotBefore:      validFrom(),
 		Issuer:         issuer.Subject,
 		Subject:        subj,
 		PublicKey:      nodePub,

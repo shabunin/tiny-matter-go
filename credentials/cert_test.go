@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 )
@@ -144,5 +146,37 @@ func TestCSR(t *testing.T) {
 	}
 	if csr.Subject.Organization[0] != "CSR" {
 		t.Fatalf("subject %v", csr.Subject)
+	}
+}
+
+// A zero validity time is "no well-defined time" for not-before as well
+// as not-after: X.509 99991231235959Z, as the SDK's ChipEpochToASN1Time
+// and matter.js convert it. Signatures cover this form.
+func TestZeroValidityDER(t *testing.T) {
+	c := &Cert{SerialNumber: []byte{1}, PathLen: -1, NotBefore: 0, NotAfter: 0}
+	never := "180f39393939313233313233353935395a" // GeneralizedTime 99991231235959Z
+	if !strings.Contains(hex.EncodeToString(c.TBS()), "30"+"22"+never+never) {
+		t.Errorf("zero validity: %x", c.TBS())
+	}
+	c.NotBefore, c.NotAfter = 1, 0x7FFFFFFF // 2000-01-01T00:00:01Z, 2068-01-19T03:14:07Z
+	want := "3020" + hex.EncodeToString(append([]byte{0x17, 13}, "000101000001Z"...)) +
+		hex.EncodeToString(append([]byte{0x18, 15}, "20680119031407Z"...))
+	if !strings.Contains(hex.EncodeToString(c.TBS()), want) {
+		t.Errorf("validity: %x, want %s", c.TBS(), want)
+	}
+}
+
+func TestIssuedValidity(t *testing.T) {
+	key, _ := p256.GenerateKey(rand.Reader)
+	root, err := IssueRoot(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := uint32(time.Now().Unix() - MatterEpoch)
+	if root.NotBefore == 0 || root.NotBefore > now || now-root.NotBefore > 2*3600 || root.NotAfter != 0 {
+		t.Errorf("validity %d..%d, now %d", root.NotBefore, root.NotAfter, now)
+	}
+	if err := root.VerifySignature(root.PublicKey); err != nil {
+		t.Error(err)
 	}
 }
