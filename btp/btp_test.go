@@ -439,3 +439,201 @@ func FuzzHandleWrite(f *testing.F) {
 		}
 	})
 }
+
+// pump moves packets between a central and a peripheral Conn until neither
+// has anything to send, and returns the messages each side completed.
+func pump(t *testing.T, cen, per *Conn, now time.Time) (toCen, toPer [][]byte) {
+	t.Helper()
+	for range 1000 {
+		moved := false
+		for {
+			p, _, err := per.Poll(now)
+			if err != nil {
+				t.Fatal("peripheral:", err)
+			}
+			if p == nil {
+				break
+			}
+			m, err := cen.HandleIndication(now, p)
+			if err != nil {
+				t.Fatalf("central: % x: %v", p, err)
+			}
+			if m != nil {
+				toCen = append(toCen, bytes.Clone(m))
+			}
+			moved = true
+		}
+		for {
+			p, _, err := cen.Poll(now)
+			if err != nil {
+				t.Fatal("central:", err)
+			}
+			if p == nil {
+				break
+			}
+			m, err := per.HandleWrite(now, p)
+			if err != nil {
+				t.Fatalf("peripheral: % x: %v", p, err)
+			}
+			if m != nil {
+				toPer = append(toPer, bytes.Clone(m))
+			}
+			moved = true
+		}
+		if !moved {
+			return
+		}
+	}
+	t.Fatal("still sending after 1000 rounds")
+	return
+}
+
+func openCentral(t *testing.T, mtu int) (cen, per *Conn) {
+	t.Helper()
+	cen, per = NewCentral(mtu), NewConn(247)
+	req := cen.HandshakeRequest()
+	if want := []byte{0x65, 0x6C, 4, 0, 0, 0, byte(mtu), byte(mtu >> 8), MaxWindow}; !bytes.Equal(req, want) {
+		t.Fatalf("request % x, want % x", req, want)
+	}
+	if _, err := per.HandleWrite(t0, req); err != nil {
+		t.Fatal(err)
+	}
+	per.Subscribed(t0)
+	resp, _, err := per.Poll(t0)
+	if err != nil || resp == nil {
+		t.Fatal("no response:", err)
+	}
+	if cen.Open() {
+		t.Fatal("open before the response")
+	}
+	if _, err := cen.HandleIndication(t0, resp); err != nil {
+		t.Fatal(err)
+	}
+	if !cen.Open() || !per.Open() {
+		t.Fatal("not open")
+	}
+	return cen, per
+}
+
+func TestCentral(t *testing.T) {
+	cen, per := openCentral(t, 185)
+	if cen.FragmentSize() != 182 || per.FragmentSize() != 182 || cen.Window() != MaxWindow {
+		t.Fatalf("fragment %d/%d window %d", cen.FragmentSize(), per.FragmentSize(), cen.Window())
+	}
+	// Messages both ways, several segments each, at once.
+	a, b := msg(1000, 1), msg(700, 2)
+	if err := cen.Send(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := per.Send(b); err != nil {
+		t.Fatal(err)
+	}
+	toCen, toPer := pump(t, cen, per, t0)
+	if len(toPer) != 1 || !bytes.Equal(toPer[0], a) || len(toCen) != 1 || !bytes.Equal(toCen[0], b) {
+		t.Fatalf("got %d/%d messages", len(toPer), len(toCen))
+	}
+	// A full queue each way, more segments than a window.
+	var sent [][]byte
+	for i := range queueLen {
+		m := msg(300+i, byte(10+i))
+		sent = append(sent, m)
+		if err := cen.Send(m); err != nil {
+			t.Fatal(err)
+		}
+		if err := per.Send(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := t0.Add(time.Second)
+	toCen, toPer = pump(t, cen, per, now)
+	// The send-ack timers release the rest. After that the peers keep
+	// acknowledging each other's standalone acknowledgements, which keeps
+	// an idle connection alive.
+	for range 20 {
+		now = now.Add(SendAckDelay)
+		c, p := pump(t, cen, per, now)
+		toCen, toPer = append(toCen, c...), append(toPer, p...)
+	}
+	if len(toCen) != queueLen || len(toPer) != queueLen {
+		t.Fatalf("got %d/%d of %d messages", len(toCen), len(toPer), queueLen)
+	}
+	for i := range sent {
+		if !bytes.Equal(toCen[i], sent[i]) || !bytes.Equal(toPer[i], sent[i]) {
+			t.Fatalf("message %d differs", i)
+		}
+	}
+	if cen.qLen != 0 || per.qLen != 0 {
+		t.Fatal("messages left in the queues")
+	}
+}
+
+// TestCentralUnknownMTU: without an MTU the peripheral uses what it knows.
+func TestCentralUnknownMTU(t *testing.T) {
+	cen, per := openCentral(t, 0)
+	if cen.FragmentSize() != defaultFragment || per.FragmentSize() != defaultFragment {
+		t.Fatalf("fragment %d/%d", cen.FragmentSize(), per.FragmentSize())
+	}
+	m := msg(200, 3)
+	cen.Send(m)
+	if _, toPer := pump(t, cen, per, t0); len(toPer) != 1 || !bytes.Equal(toPer[0], m) {
+		t.Fatal("message lost")
+	}
+}
+
+// TestCentralAcksResponse: the central acknowledges the handshake response
+// on its own when it has nothing to send.
+func TestCentralAcksResponse(t *testing.T) {
+	cen, per := openCentral(t, 247)
+	if p, next, _ := cen.Poll(t0); p != nil || !next.Equal(t0.Add(SendAckDelay)) {
+		t.Fatalf("poll % x next %v", p, next)
+	}
+	p, _, _ := cen.Poll(t0.Add(SendAckDelay))
+	if len(p) != 3 || p[0] != flagAck || p[1] != 0 || p[2] != 0 {
+		t.Fatalf("standalone ack % x", p)
+	}
+	if _, err := per.HandleWrite(t0.Add(SendAckDelay), p); err != nil || !per.Flushed() {
+		t.Fatal("peripheral did not take the ack:", err)
+	}
+}
+
+func TestCentralHandshakeErrors(t *testing.T) {
+	for _, c := range []struct {
+		resp []byte
+		err  error
+	}{
+		{[]byte{0x65, 0x6C, 4, 20, 0}, ErrHandshake},               // short
+		{[]byte{0x65, 0x6D, 4, 20, 0, 4}, ErrHandshake},            // opcode
+		{[]byte{0x65, 0x6C, 0, 20, 0, 4}, ErrVersion},              // rejected
+		{[]byte{0x65, 0x6C, 3, 20, 0, 4}, ErrVersion},              // older version
+		{[]byte{0x65, 0x6C, 4, 20, 0, 0}, ErrHandshake},            // no window
+		{[]byte{0x65, 0x6C, 4, 2, 0, 4}, ErrHandshake},             // fragment too small
+		{[]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00}, ErrHandshake}, // a segment
+	} {
+		cen := NewCentral(247)
+		if _, err := cen.HandleIndication(t0, c.resp); !errors.Is(err, c.err) || cen.Open() {
+			t.Errorf("% x: %v, open %v", c.resp, err, cen.Open())
+		}
+	}
+	// A peripheral offering only another version answers with version 0.
+	per := NewConn(247)
+	per.HandleWrite(t0, handshakeReq(247, 4, 3))
+	per.Subscribed(t0)
+	resp, _, _ := per.Poll(t0)
+	if _, err := NewCentral(247).HandleIndication(t0, resp); !errors.Is(err, ErrVersion) {
+		t.Errorf("rejection: %v", err)
+	}
+}
+
+func TestParseServiceData(t *testing.T) {
+	sd := ServiceData(3840, 0xFFF1, 0x8000, true)
+	a, ok := ParseServiceData(sd[:])
+	if !ok || a != (Advertisement{Discriminator: 3840, VendorID: 0xFFF1, ProductID: 0x8000, ExtendedAnnouncement: true}) {
+		t.Fatalf("%+v %v", a, ok)
+	}
+	if _, ok := ParseServiceData([]byte{1, 0, 15, 0xF1, 0xFF, 0, 0x80, 0}); ok {
+		t.Error("accepted another opcode")
+	}
+	if _, ok := ParseServiceData(sd[:6]); ok {
+		t.Error("accepted short data")
+	}
+}

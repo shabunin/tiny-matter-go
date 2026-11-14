@@ -1,10 +1,14 @@
-// Package btp implements the peripheral (server) side of the Bluetooth
-// Transport Protocol (Matter spec 4.19), which carries Matter messages over
-// a GATT service during BLE commissioning.
+// Package btp implements the Bluetooth Transport Protocol (Matter spec
+// 4.19), which carries Matter messages over a GATT service during BLE
+// commissioning: the peripheral (server) side, which a device runs, and the
+// central (client) side, which a commissioner runs.
 //
-// A Conn is sans-IO: the caller feeds it the writes the central makes to
-// characteristic C1 and the C2 subscription, and sends whatever Poll returns
-// as C2 notifications or indications. One Conn serves one BLE connection.
+// A Conn is sans-IO. On a peripheral (NewConn), the caller feeds it the
+// writes the central makes to characteristic C1 and the C2 subscription,
+// and sends whatever Poll returns as C2 indications. On a central
+// (NewCentral), the caller writes HandshakeRequest to C1, subscribes to C2,
+// feeds the C2 indications to HandleIndication, and writes whatever Poll
+// returns to C1. One Conn serves one BLE connection.
 package btp
 
 import (
@@ -81,9 +85,10 @@ type state uint8
 const (
 	stateIdle      state = iota // waiting for the handshake request
 	stateHandshake              // request received; waiting for the C2 subscription
-	stateOpen                   // response sent (or queued)
+	stateOpen                   // response sent (or queued); on a central, received
 	stateRejected               // send the response, then close
 	stateClosed
+	stateRequested // central: request written, waiting for the response
 )
 
 const queueLen = 4
@@ -141,6 +146,60 @@ func (c *Conn) Reset(maxMTU int) {
 	for i := range q {
 		c.queue[i] = q[i][:0]
 	}
+}
+
+// NewCentral returns a Conn for the central side of a new BLE connection.
+// attMTU is the connection's ATT MTU, or 0 if unknown (the peripheral then
+// chooses the segment size from what it knows).
+func NewCentral(attMTU int) *Conn {
+	return &Conn{st: stateRequested, attMTU: min(max(attMTU, 0), 0xFFFF)}
+}
+
+// HandshakeRequest returns the handshake request a central writes to C1,
+// after which it subscribes to C2.
+func (c *Conn) HandshakeRequest() []byte {
+	b := make([]byte, handshakeReqLen)
+	b[0], b[1] = handshakeFlags, handshakeOpcode
+	b[2] = Version // the supported versions, low nibble first, 0-terminated
+	binary.LittleEndian.PutUint16(b[6:], uint16(c.attMTU))
+	b[8] = MaxWindow
+	return b
+}
+
+// HandleIndication processes a value the peripheral indicated on C2: the
+// handshake response, then segments. When it completes a message, the
+// message is returned; it is valid until the next call. An error means the
+// BTP session is broken and the BLE connection should be dropped.
+func (c *Conn) HandleIndication(now time.Time, b []byte) ([]byte, error) {
+	switch c.st {
+	case stateRequested:
+		return nil, c.handshakeResponse(now, b)
+	case stateOpen:
+		return c.segment(now, b)
+	}
+	return nil, ErrState
+}
+
+func (c *Conn) handshakeResponse(now time.Time, b []byte) error {
+	if len(b) < 6 || b[0] != handshakeFlags || b[1] != handshakeOpcode {
+		return ErrHandshake
+	}
+	if b[2]&0x0F != Version {
+		return ErrVersion
+	}
+	frag := int(binary.LittleEndian.Uint16(b[3:]))
+	if frag < minFragment || b[5] == 0 {
+		return ErrHandshake
+	}
+	c.version, c.frag = Version, min(frag, maxFragment)
+	c.window = min(b[5], MaxWindow)
+	c.remoteWindow = c.window
+	// The response is the peripheral's segment 0, which we acknowledge.
+	c.localWindow = c.window - 1
+	c.rxNext, c.rxNewest, c.rxUnacked = 1, 0, true
+	c.sendAckAt = now.Add(SendAckDelay)
+	c.st, c.respSent = stateOpen, true
+	return nil
 }
 
 // SetMTU records the connection's ATT MTU, used when the central's handshake
@@ -454,4 +513,31 @@ func AdvertisingData(discriminator, vendorID, productID uint16) []byte {
 	sd := ServiceData(discriminator, vendorID, productID, false)
 	b := []byte{0x02, 0x01, 0x06, 0x0B, 0x16, ServiceUUID16 & 0xFF, ServiceUUID16 >> 8}
 	return append(b, sd[:]...)
+}
+
+// Advertisement is what a commissionable device's Matter BLE service data
+// says (spec 5.4.2.5.6).
+type Advertisement struct {
+	Discriminator        uint16 // 12 bits
+	Version              uint8  // advertisement version (0)
+	VendorID, ProductID  uint16
+	AdditionalData       bool // C3 holds additional commissioning data
+	ExtendedAnnouncement bool
+}
+
+// ParseServiceData decodes the service data of UUID 0xFFF6. ok is false if
+// it is not a commissionable-device advertisement.
+func ParseServiceData(b []byte) (a Advertisement, ok bool) {
+	if len(b) < 7 || b[0] != 0 {
+		return a, false
+	}
+	v := binary.LittleEndian.Uint16(b[1:])
+	a.Discriminator, a.Version = v&0xFFF, uint8(v>>12)
+	a.VendorID = binary.LittleEndian.Uint16(b[3:])
+	a.ProductID = binary.LittleEndian.Uint16(b[5:])
+	if len(b) > 7 {
+		a.AdditionalData = b[7]&0x01 != 0
+		a.ExtendedAnnouncement = b[7]&0x02 != 0
+	}
+	return a, true
 }
