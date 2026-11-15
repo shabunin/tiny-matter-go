@@ -253,22 +253,14 @@ func main() {
 		return []clusters.NetworkInterface{ni}
 	}
 	d.Net.Scan = func(ctx *im.Context, want []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
-		if !wifiOn {
-			return nil, clusters.NetworkOK // the radio is not up during BLE commissioning
-		}
-		aps, err := espradio.Scan()
-		if err != nil {
-			return nil, clusters.NetworkUnknownError
-		}
-		var res []clusters.WiFiScanResult
-		for _, ap := range aps {
-			if want != nil && ap.SSID != string(want) || len(res) == 8 {
-				continue
+		aps := bootScan // during BLE commissioning, BLE has the radio
+		if wifiOn {
+			var err error
+			if aps, err = espradio.Scan(); err != nil {
+				return nil, clusters.NetworkUnknownError
 			}
-			res = append(res, clusters.WiFiScanResult{Security: clusters.WiFiWPA2, SSID: []byte(ap.SSID),
-				Band: clusters.WiFiBand2G4, RSSI: int8(max(ap.RSSI, -128))})
 		}
-		return res, clusters.NetworkOK
+		return scanResults(aps, want), clusters.NetworkOK
 	}
 	if !d.Commissioned() {
 		d.OpenCommissioningWindow()
@@ -429,6 +421,57 @@ func main() {
 	}
 }
 
+// bootScan is what a Wi-Fi scan saw as BLE commissioning started.
+var bootScan []espradio.AccessPoint
+
+// scanOnce starts Wi-Fi just to scan, so that a commissioner can be told
+// which networks are around while BLE has the radio.
+func scanOnce() []espradio.AccessPoint {
+	if err := espradio.Start(); err != nil {
+		println("wifi scan: start:", err.Error())
+		return nil
+	}
+	aps, err := espradio.Scan()
+	if err != nil {
+		println("wifi scan:", err.Error())
+	}
+	if err := espradio.Stop(); err != nil {
+		println("wifi scan: stop:", err.Error())
+	}
+	println("wifi scan: access points seen", len(aps))
+	return aps
+}
+
+// scanResults lists the networks of aps (only want, if set), strongest
+// first, each once, at most 8. The radio reports only names and signal
+// strengths: WPA2 on 2.4 GHz is assumed.
+func scanResults(aps []espradio.AccessPoint, want []byte) []clusters.WiFiScanResult {
+	sorted := append([]espradio.AccessPoint(nil), aps...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].RSSI > sorted[j-1].RSSI; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	var res []clusters.WiFiScanResult
+next:
+	for _, ap := range sorted {
+		if ap.SSID == "" || want != nil && ap.SSID != string(want) {
+			continue
+		}
+		for _, r := range res {
+			if string(r.SSID) == ap.SSID {
+				continue next
+			}
+		}
+		res = append(res, clusters.WiFiScanResult{Security: clusters.WiFiWPA2, SSID: []byte(ap.SSID),
+			Band: clusters.WiFiBand2G4, RSSI: int8(max(min(ap.RSSI, 0), -128))})
+		if len(res) == 8 {
+			break
+		}
+	}
+	return res
+}
+
 // commissionOverBLE advertises the Matter BLE service and serves the
 // commissioner over BTP until it provisions a network with ConnectNetwork,
 // then closes the BLE link and returns the network to join.
@@ -436,6 +479,9 @@ func commissionOverBLE(d *device.Device, tr *transport, u *ui) clusters.WiFiNetw
 	if err := espradio.BLEInit(); err != nil {
 		fatal("ble init", err)
 	}
+	// Scan before advertising, after BLEInit: BLE keeps the PHY powered
+	// when Wi-Fi stops (stopping Wi-Fi first leaves BLE unable to advertise).
+	bootScan = scanOnce()
 	matterble.Log = func(msg string) { println(msg) }
 	b, err := matterble.New(matterble.NewTransport(espradio.VHCITransport{}), discriminator, devcreds.VendorID, devcreds.ProductID)
 	if err != nil {
