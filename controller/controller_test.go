@@ -56,11 +56,20 @@ func (u udpTransport) Send(to exchange.Addr, pkt []byte) error {
 
 func (u udpTransport) Reliable(to exchange.Addr) bool { return to == blePeer }
 
-func startDevice(t *testing.T) *testDevice { return startDeviceWith(t, false, nil) }
+func startDevice(t *testing.T) *testDevice { return startDeviceWith(t, noNetwork, nil) }
 
-// startDeviceWith starts a device, with Network Commissioning (Wi-Fi) if
-// wifi, and reachable over BLE through ble if not nil.
-func startDeviceWith(t *testing.T, wifi bool, ble *blePeripheral) *testDevice {
+// netKind is the network interface a test device has.
+type netKind int
+
+const (
+	noNetwork netKind = iota
+	wifiNetwork
+	threadNetwork
+)
+
+// startDeviceWith starts a device, with Network Commissioning for a kind
+// of network, and reachable over BLE through ble if not nil.
+func startDeviceWith(t *testing.T, kind netKind, ble *blePeripheral) *testDevice {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -76,7 +85,7 @@ func startDeviceWith(t *testing.T, wifi bool, ble *blePeripheral) *testDevice {
 			CertificationDeclaration: devcreds.CertificationDeclaration},
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: devcreds.VendorID,
 			ProductName: "Test Light", ProductID: devcreds.ProductID},
-		WiFi: wifi,
+		WiFi: kind == wifiNetwork, Thread: kind == threadNetwork,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -154,29 +154,29 @@ func (c *Controller) findBLE(ctx context.Context, bt Bluetooth, p *onboarding.Pa
 	if found {
 		return dev, nil
 	}
-	if err == nil || errors.Is(err, context.DeadlineExceeded) {
-		disc := fmt.Sprint("discriminator ", p.Discriminator)
-		if p.ShortOnly {
-			disc = fmt.Sprint("short discriminator ", p.ShortDiscriminator())
-		}
-		err = fmt.Errorf("no device in BLE commissioning mode with %s", disc)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return dev, notFound{"controller: no device in BLE commissioning mode with " + discriminatorText(p)}
 	}
-	return dev, fmt.Errorf("controller: %w", err)
+	return dev, fmt.Errorf("controller: BLE: %w", err)
 }
 
-// openBLE finds the device over BLE, connects, and opens a BTP session
-// that the controller's exchanges reach at the link's address.
-func (c *Controller) openBLE(ctx context.Context, p *onboarding.Payload) (*bleLink, error) {
+// openBLE finds the device over BLE (unless dev is given), connects, and
+// opens a BTP session that the controller's exchanges reach at the link's
+// address.
+func (c *Controller) openBLE(ctx context.Context, p *onboarding.Payload, dev *BLEDevice) (*bleLink, error) {
 	bt, err := c.bluetooth(ctx)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := c.findBLE(ctx, bt, p)
-	if err != nil {
-		return nil, err
+	if dev == nil {
+		d, err := c.findBLE(ctx, bt, p)
+		if err != nil {
+			return nil, err
+		}
+		dev = &d
 	}
 	cctx, cancel := context.WithTimeout(ctx, bleConnectWait)
-	gatt, err := bt.Connect(cctx, dev)
+	gatt, err := bt.Connect(cctx, *dev)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("controller: connecting over BLE: %w", err)
@@ -322,6 +322,16 @@ func (l *bleLink) fail(err error) {
 	if l.err == nil {
 		l.err = err
 		l.c.logf("BLE link: %v", err)
+	}
+}
+
+// gone reports whether the link is down.
+func (l *bleLink) gone() bool {
+	select {
+	case <-l.done:
+		return true
+	default:
+		return false
 	}
 }
 

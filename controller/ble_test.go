@@ -3,6 +3,7 @@ package controller_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"net/netip"
 	"strings"
@@ -22,21 +23,27 @@ import (
 // blePeer is the device's address for its BLE peer, as in the firmware.
 var blePeer = netip.AddrPortFrom(netip.IPv6Unspecified(), 0)
 
-// blePeripheral is the device's end of a BLE link: a BTP peripheral whose
-// C2 indications reach the controller through toCen. Its BTP state belongs
-// to the device goroutine.
+// blePeripheral is the device's end of a BLE connection: a BTP peripheral
+// whose C2 indications reach the controller through toCen. Its fields
+// belong to the device goroutine; reset starts a new connection.
 type blePeripheral struct {
 	srv   *btp.Conn
 	toCen chan []byte
 	gone  chan struct{}
-	once  sync.Once
+	once  *sync.Once
 	// leave drops the link once all the device sent has been acknowledged,
-	// as a device does that cannot keep BLE up while joining Wi-Fi.
+	// as a device does that cannot keep BLE up while joining its network.
 	leave bool
 }
 
 func newBLEPeripheral() *blePeripheral {
-	return &blePeripheral{srv: btp.NewConn(247), toCen: make(chan []byte, 1024), gone: make(chan struct{})}
+	p := &blePeripheral{}
+	p.reset()
+	return p
+}
+
+func (p *blePeripheral) reset() {
+	p.srv, p.toCen, p.gone, p.once, p.leave = btp.NewConn(247), make(chan []byte, 1024), make(chan struct{}), new(sync.Once), false
 }
 
 // poll sends what BTP has for the central (device goroutine).
@@ -62,19 +69,25 @@ func (p *blePeripheral) poll(t *testing.T, now time.Time) time.Time {
 	}
 }
 
-func (p *blePeripheral) drop() { p.once.Do(func() { close(p.gone) }) }
+func (p *blePeripheral) drop() {
+	gone := p.gone
+	p.once.Do(func() { close(gone) })
+}
 
-// fakeGATT is the controller's end of the link.
+// fakeGATT is the controller's end of one connection.
 type fakeGATT struct {
-	d *testDevice
-	p *blePeripheral
+	d     *testDevice
+	srv   *btp.Conn
+	toCen chan []byte
+	gone  chan struct{}
+	drop  func()
 }
 
 func (g *fakeGATT) MTU() int { return 247 }
 
 func (g *fakeGATT) Write(ctx context.Context, b []byte) error {
 	select {
-	case <-g.p.gone:
+	case <-g.gone:
 		return errors.New("disconnected")
 	default:
 	}
@@ -83,7 +96,7 @@ func (g *fakeGATT) Write(ctx context.Context, b []byte) error {
 	g.d.do(func() {
 		now := time.Now()
 		var msg []byte
-		if msg, err = g.p.srv.HandleWrite(now, b); err == nil && msg != nil {
+		if msg, err = g.srv.HandleWrite(now, b); err == nil && msg != nil {
 			g.d.dev.HandlePacket(now, blePeer, msg)
 		}
 	})
@@ -91,13 +104,13 @@ func (g *fakeGATT) Write(ctx context.Context, b []byte) error {
 }
 
 func (g *fakeGATT) Subscribe(ctx context.Context) error {
-	g.d.do(func() { g.p.srv.Subscribed(time.Now()) })
+	g.d.do(func() { g.srv.Subscribed(time.Now()) })
 	return nil
 }
 
-func (g *fakeGATT) Values() <-chan []byte { return g.p.toCen }
-func (g *fakeGATT) Done() <-chan struct{} { return g.p.gone }
-func (g *fakeGATT) Close() error          { g.p.drop(); return nil }
+func (g *fakeGATT) Values() <-chan []byte { return g.toCen }
+func (g *fakeGATT) Done() <-chan struct{} { return g.gone }
+func (g *fakeGATT) Close() error          { g.drop(); return nil }
 
 // fakeBluetooth sees one device advertising a discriminator.
 type fakeBluetooth struct {
@@ -115,7 +128,16 @@ func (b *fakeBluetooth) Scan(ctx context.Context, found func(controller.BLEDevic
 
 func (b *fakeBluetooth) Connect(ctx context.Context, dev controller.BLEDevice) (controller.GATT, error) {
 	b.connects++
-	return &fakeGATT{b.d, b.p}, nil
+	var g *fakeGATT
+	b.d.do(func() {
+		p := b.p
+		if b.connects > 1 {
+			p.reset()
+		}
+		once, gone := p.once, p.gone
+		g = &fakeGATT{d: b.d, srv: p.srv, toCen: p.toCen, gone: gone, drop: func() { once.Do(func() { close(gone) }) }}
+	})
+	return g, nil
 }
 
 func openBLEController(t *testing.T, bt controller.Bluetooth) *controller.Controller {
@@ -129,19 +151,30 @@ func openBLEController(t *testing.T, bt controller.Bluetooth) *controller.Contro
 	return c
 }
 
-func TestCommissionOverBLE(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	p := newBLEPeripheral()
-	d := startDeviceWith(t, true, p)
-	var joined []byte
+// joinOnConnect makes the device "join" the network ConnectNetwork names,
+// leaving BLE as the firmware does. The function it returns reports the
+// network joined.
+func joinOnConnect(d *testDevice, p *blePeripheral) func() clusters.WiFiNetwork {
+	var joined clusters.WiFiNetwork
 	d.do(func() {
 		d.dev.Net.Connect = func(now time.Time, n clusters.WiFiNetwork) {
-			joined = bytes.Clone(n.SSID)
+			joined = n
 			d.dev.Net.SetConnected(d.dev.Node, n.SSID)
 			p.leave = true
 		}
 	})
+	return func() (n clusters.WiFiNetwork) {
+		d.do(func() { n = joined })
+		return n
+	}
+}
+
+func TestCommissionOverBLE(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, wifiNetwork, p)
+	joined := joinOnConnect(d, p)
 	c := openBLEController(t, &fakeBluetooth{d: d, p: p, discriminator: 3840})
 
 	// The device is told to join the network, leaves BLE, and is reached
@@ -159,9 +192,9 @@ func TestCommissionOverBLE(t *testing.T) {
 	}
 	var nets []clusters.WiFiNetwork
 	d.do(func() { nets = d.dev.Net.Committed() })
-	if string(joined) != "test-net" || len(nets) != 1 || string(nets[0].SSID) != "test-net" ||
+	if string(joined().SSID) != "test-net" || len(nets) != 1 || string(nets[0].SSID) != "test-net" ||
 		string(nets[0].Credentials) != "secret123" {
-		t.Fatalf("joined %q, committed %+v", joined, nets)
+		t.Fatalf("joined %q, committed %+v", joined().SSID, nets)
 	}
 	if got := d.fabrics(); got != 1 {
 		t.Fatalf("device has %d fabrics", got)
@@ -183,13 +216,61 @@ func TestCommissionOverBLE(t *testing.T) {
 	}
 }
 
+// testDataset is a Thread operational dataset: channel 15, PAN ID 0x1234,
+// extended PAN ID DEAD00BEEF00CAFE, network "OpenThread-1234".
+var testDataset, _ = hex.DecodeString("0e080000000000010000" + "000300000f" + "0208dead00beef00cafe" +
+	"051000112233445566778899aabbccddeeff" + "030f4f70656e5468726561642d31323334" + "01021234")
+
+func TestCommissionOverBLEThread(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, threadNetwork, p)
+	joined := joinOnConnect(d, p)
+	c := openBLEController(t, &fakeBluetooth{d: d, p: p, discriminator: 3840})
+	n, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{BLE: true, Addr: d.addr(), Thread: testDataset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xpan, _ := hex.DecodeString("dead00beef00cafe")
+	var nets []clusters.WiFiNetwork
+	d.do(func() { nets = d.dev.Net.Committed() })
+	if j := joined(); !bytes.Equal(j.SSID, xpan) || !bytes.Equal(j.Credentials, testDataset) ||
+		len(nets) != 1 || !bytes.Equal(nets[0].SSID, xpan) || !bytes.Equal(nets[0].Credentials, testDataset) {
+		t.Fatalf("joined %x, committed %+v", j.SSID, nets)
+	}
+	if !readOnOffOK(ctx, c, n.ID) {
+		t.Fatal("not operational")
+	}
+
+	// A dataset a device could not join with is refused before anything
+	// happens, and a Wi-Fi device is not given a Thread network.
+	if _, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{BLE: true, Thread: testDataset[:len(testDataset)-4]}); err == nil ||
+		!strings.Contains(err.Error(), "Thread dataset") {
+		t.Errorf("incomplete dataset: err = %v", err)
+	}
+	wp := newBLEPeripheral()
+	wd := startDeviceWith(t, wifiNetwork, wp)
+	wc := openBLEController(t, &fakeBluetooth{d: wd, p: wp, discriminator: 3840})
+	_, err = wc.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{BLE: true, Addr: wd.addr(), Thread: testDataset})
+	if err == nil || !strings.Contains(err.Error(), "no Thread interface") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := wd.fabrics(); got != 0 {
+		t.Errorf("Wi-Fi device kept %d fabrics", got)
+	}
+}
+
 // TestCommissionOverBLENoNetwork: a device on a network already is
 // commissioned over BLE without being given one.
 func TestCommissionOverBLENoNetwork(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	p := newBLEPeripheral()
-	d := startDeviceWith(t, false, p)
+	d := startDeviceWith(t, noNetwork, p)
 	c := openBLEController(t, &fakeBluetooth{d: d, p: p, discriminator: 3840})
 	n, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
 		controller.CommissionOptions{BLE: true, Addr: d.addr()})
@@ -202,7 +283,7 @@ func TestCommissionOverBLENoNetwork(t *testing.T) {
 	// Asking it to join Wi-Fi without the cluster fails before it joins
 	// the fabric.
 	d2p := newBLEPeripheral()
-	d2 := startDeviceWith(t, false, d2p)
+	d2 := startDeviceWith(t, noNetwork, d2p)
 	c2 := openBLEController(t, &fakeBluetooth{d: d2, p: d2p, discriminator: 3840})
 	_, err = c2.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840}, controller.CommissionOptions{
 		BLE: true, Addr: d2.addr(), WiFi: &controller.WiFiNetwork{SSID: []byte("x"), Password: []byte("password1")}})
@@ -218,7 +299,7 @@ func TestBLEWrongDiscriminator(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	p := newBLEPeripheral()
-	d := startDeviceWith(t, true, p)
+	d := startDeviceWith(t, wifiNetwork, p)
 	bt := &fakeBluetooth{d: d, p: p, discriminator: 1234}
 	c := openBLEController(t, bt)
 	_, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
@@ -235,6 +316,45 @@ func TestBLEWrongDiscriminator(t *testing.T) {
 		controller.CommissionOptions{BLE: true, Addr: d.addr()})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestAutoBLE: without BLE or an address, a device found only over BLE is
+// commissioned there only if it is given a network.
+func TestAutoBLE(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, wifiNetwork, p)
+	bt := &fakeBluetooth{d: d, p: p, discriminator: 3840}
+	c := openBLEController(t, bt)
+	code := &onboarding.Payload{Passcode: passcode, Discriminator: 3840, ShortOnly: true}
+	_, err := c.Commission(ctx, code, controller.CommissionOptions{})
+	if err == nil || !strings.Contains(err.Error(), "needs a network") {
+		t.Fatalf("err = %v", err)
+	}
+	if bt.connects != 0 {
+		t.Error("connected anyway")
+	}
+	// A QR code that says the device is not on BLE: not looked for there.
+	_, err = c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840,
+		Discovery: onboarding.DiscoveryOnNetwork}, controller.CommissionOptions{})
+	if err == nil || !strings.Contains(err.Error(), "discovery is off") {
+		t.Fatalf("on-network QR code: err = %v", err)
+	}
+	// Given a network, it would be commissioned over BLE, but with
+	// discovery off it could not be found on its network afterwards.
+	wifi := &controller.WiFiNetwork{SSID: []byte("test-net"), Password: []byte("secret123")}
+	_, err = c.Commission(ctx, code, controller.CommissionOptions{WiFi: wifi})
+	if err == nil || !strings.Contains(err.Error(), "give the address the device will have") {
+		t.Fatalf("err = %v", err)
+	}
+	_, err = c.Commission(ctx, code, controller.CommissionOptions{BLE: true, WiFi: wifi})
+	if err == nil || !strings.Contains(err.Error(), "give the address the device will have") {
+		t.Fatalf("explicit BLE: err = %v", err)
+	}
+	if bt.connects != 0 || d.fabrics() != 0 {
+		t.Errorf("%d connections, %d fabrics", bt.connects, d.fabrics())
 	}
 }
 
