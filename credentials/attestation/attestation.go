@@ -463,11 +463,22 @@ func (v *Verifier) Verify(info *Info) (*Result, error) {
 	if now.Before(dac.NotBefore) || now.After(dac.NotAfter) {
 		return nil, fail("DAC not valid now")
 	}
-	// The issuers must have been valid when the DAC was issued.
+	// The issuers must have been valid when the DAC was issued, not now: a
+	// device outlives its PAI (the SDK validates the chain at the DAC's
+	// notBefore).
 	for _, c := range []*x509.Certificate{pai, paa} {
 		if dac.NotBefore.Before(c.NotBefore) || dac.NotBefore.After(c.NotAfter) {
 			return nil, fail("%s not valid when the DAC was issued", c.Subject.CommonName)
 		}
+	}
+	if !bytes.Equal(dac.RawIssuer, pai.RawSubject) {
+		return nil, fail("DAC issuer does not match PAI subject")
+	}
+	if len(dac.AuthorityKeyId) > 0 && !bytes.Equal(dac.AuthorityKeyId, pai.SubjectKeyId) {
+		return nil, fail("DAC AKI does not match PAI SKI")
+	}
+	if !bytes.Equal(pai.RawIssuer, paa.RawSubject) {
+		return nil, fail("PAI issuer does not match PAA subject")
 	}
 	if err := dac.CheckSignatureFrom(pai); err != nil {
 		return nil, fail("DAC not signed by the PAI: %v", err)
@@ -533,7 +544,7 @@ func checkFormat(c *x509.Certificate, ca bool) error {
 	if !c.BasicConstraintsValid || c.IsCA != ca {
 		return errors.New("wrong basic constraints")
 	}
-	if ca && (c.MaxPathLen != 0 || c.KeyUsage&x509.KeyUsageCertSign == 0) {
+	if ca && (!c.MaxPathLenZero || c.MaxPathLen != 0 || c.KeyUsage&x509.KeyUsageCertSign == 0) {
 		return errors.New("PAI may not issue CAs or does not sign certificates")
 	}
 	if !ca && c.KeyUsage&x509.KeyUsageDigitalSignature == 0 {

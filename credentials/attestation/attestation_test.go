@@ -2,8 +2,14 @@ package attestation
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -157,6 +163,121 @@ func TestLoadPAAs(t *testing.T) {
 		t.Fatalf("%d PAAs, %v", len(paas), err)
 	}
 	var _ []*x509.Certificate = paas
+}
+
+func TestVerifyExpiredAndBadPAI(t *testing.T) {
+	oidVID := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37244, 2, 1}
+	oidPID := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37244, 2, 2}
+	ski := func(pub *ecdsa.PublicKey) []byte {
+		raw, _ := pub.ECDH()
+		sum := sha1.Sum(raw.Bytes())
+		return sum[:]
+	}
+	issue := func(t *testing.T, tmpl, parent *x509.Certificate, pub *ecdsa.PublicKey, signer *ecdsa.PrivateKey) (*x509.Certificate, []byte) {
+		t.Helper()
+		if parent == nil {
+			parent = tmpl
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert, der
+	}
+
+	paaKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	paiKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	dacKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	t2020 := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2021 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2025 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2030 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2040 := time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	paaTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{CommonName: "Test PAA", ExtraNames: []pkix.AttributeTypeAndValue{
+			{Type: oidVID, Value: "FFF1"},
+		}},
+		NotBefore: t2020, NotAfter: t2040,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true, IsCA: true, MaxPathLen: 1,
+		SubjectKeyId: ski(&paaKey.PublicKey),
+	}
+	paa, _ := issue(t, paaTmpl, nil, &paaKey.PublicKey, paaKey)
+
+	makeChain := func(paiMaxPathZero bool, paiNotAfter time.Time) (*Info, *x509.Certificate) {
+		paiTmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(2),
+			Subject: pkix.Name{CommonName: "Test PAI", ExtraNames: []pkix.AttributeTypeAndValue{
+				{Type: oidVID, Value: "FFF1"},
+			}},
+			NotBefore: t2020, NotAfter: paiNotAfter,
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true, IsCA: true,
+			MaxPathLen: func() int {
+				if paiMaxPathZero {
+					return 0
+				}
+				return -1
+			}(),
+			MaxPathLenZero: paiMaxPathZero,
+			SubjectKeyId:   ski(&paiKey.PublicKey),
+			AuthorityKeyId: paa.SubjectKeyId,
+		}
+		pai, paiDER := issue(t, paiTmpl, paa, &paiKey.PublicKey, paaKey)
+
+		dacTmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(3),
+			Subject: pkix.Name{CommonName: "Test DAC", ExtraNames: []pkix.AttributeTypeAndValue{
+				{Type: oidVID, Value: "FFF1"}, {Type: oidPID, Value: "8000"},
+			}},
+			NotBefore: t2021, NotAfter: t2030,
+			KeyUsage:              x509.KeyUsageDigitalSignature,
+			BasicConstraintsValid: true, IsCA: false,
+			SubjectKeyId:   ski(&dacKey.PublicKey),
+			AuthorityKeyId: pai.SubjectKeyId,
+		}
+		_, dacDER := issue(t, dacTmpl, pai, &dacKey.PublicKey, paiKey)
+
+		ecdhKey, _ := dacKey.ECDH()
+		p256DAC, _ := p256.NewPrivateKey(ecdhKey.Bytes())
+		nonce := bytes.Repeat([]byte{9}, 32)
+		challenge := bytes.Repeat([]byte{7}, 32)
+		elems := credentials.AttestationElements(devcreds.CertificationDeclaration, nonce, 0, nil)
+		sig, err := credentials.SignWithChallenge(rand.Reader, p256DAC, elems, challenge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Info{
+			DAC: dacDER, PAI: paiDER,
+			Elements: elems, Signature: sig,
+			Challenge: challenge, Nonce: nonce,
+			VendorID: 0xFFF1, ProductID: 0x8000,
+		}, paa
+	}
+
+	// A PAI that has expired by verification time is accepted: it was valid at dac.NotBefore in 2021 and the DAC is still valid in 2026.
+	infoExp, root := makeChain(true, t2025)
+	v2024 := &Verifier{PAAs: []*x509.Certificate{root}, AllowTestCD: true, Now: func() time.Time { return time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC) }}
+	if _, err := v2024.Verify(infoExp); err != nil {
+		t.Fatalf("valid at 2024 failed: %v", err)
+	}
+	v2026 := &Verifier{PAAs: []*x509.Certificate{root}, AllowTestCD: true, Now: func() time.Time { return time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC) }}
+	if _, err := v2026.Verify(infoExp); err != nil {
+		t.Fatalf("PAI expired after issuing the DAC: %v", err)
+	}
+
+	// PAI missing explicit pathLenConstraint:0 must be rejected.
+	infoNoPathLen, root2 := makeChain(false, t2040)
+	if _, err := (&Verifier{PAAs: []*x509.Certificate{root2}, AllowTestCD: true, Now: func() time.Time { return time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC) }}).Verify(infoNoPathLen); err == nil {
+		t.Fatal("accepted PAI without pathLenConstraint:0")
+	}
 }
 
 func TestProductionPAAs(t *testing.T) {

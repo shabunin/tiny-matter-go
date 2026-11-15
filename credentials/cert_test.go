@@ -180,3 +180,78 @@ func TestIssuedValidity(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestValidateNOCChainRejectsBadUsageAndConstraints(t *testing.T) {
+	now := uint32(1)
+	signCert := func(t *testing.T, c *Cert, pub *p256.PublicKey, signer *p256.PrivateKey) []byte {
+		t.Helper()
+		c.SerialNumber = []byte{1}
+		c.NotBefore = now
+		c.PublicKey = pub.Bytes()
+		if err := c.Sign(rand.Reader, signer); err != nil {
+			t.Fatal(err)
+		}
+		return c.Encode()
+	}
+
+	rootKey, _ := p256.GenerateKey(rand.Reader)
+	icaKey, _ := p256.GenerateKey(rand.Reader)
+	nodeKey, _ := p256.GenerateKey(rand.Reader)
+	rootDN := DN{{Tag: DNMatterRCACID, Uint: 1}}
+	icaDN := DN{{Tag: DNMatterICACID, Uint: 2}}
+	nocDN := DN{{Tag: DNMatterFabricID, Uint: 0x1234}, {Tag: DNMatterNodeID, Uint: 0x5678}}
+
+	// Baseline valid chain with PathLen=1 root -> PathLen=0 ICAC -> NOC.
+	validRoot := signCert(t, &Cert{
+		Issuer: rootDN, Subject: rootDN, IsCA: true, PathLen: 1, KeyUsage: KeyUsageKeyCertSign | KeyUsageCRLSign,
+	}, rootKey.PublicKey(), rootKey)
+	validICA := signCert(t, &Cert{
+		Issuer: rootDN, Subject: icaDN, IsCA: true, PathLen: 0, KeyUsage: KeyUsageKeyCertSign,
+	}, icaKey.PublicKey(), rootKey)
+	validNOC := signCert(t, &Cert{
+		Issuer: rootDN, Subject: nocDN, PathLen: -1,
+		KeyUsage: KeyUsageDigitalSignature, ExtKeyUsage: []uint8{EKUClientAuth, EKUServerAuth},
+	}, nodeKey.PublicKey(), rootKey)
+	validICANNOC := signCert(t, &Cert{
+		Issuer: icaDN, Subject: nocDN, PathLen: -1,
+		KeyUsage: KeyUsageDigitalSignature, ExtKeyUsage: []uint8{EKUClientAuth, EKUServerAuth},
+	}, nodeKey.PublicKey(), icaKey)
+
+	if _, err := ValidateNOCChain(validICANNOC, validICA, validRoot); err != nil {
+		t.Fatalf("valid chain failed: %v", err)
+	}
+
+	// 1. RCAC missing KeyUsageKeyCertSign.
+	noCertSignRoot := signCert(t, &Cert{
+		Issuer: rootDN, Subject: rootDN, IsCA: true, PathLen: -1, KeyUsage: KeyUsageDigitalSignature,
+	}, rootKey.PublicKey(), rootKey)
+	if _, err := ValidateNOCChain(validNOC, nil, noCertSignRoot); err == nil {
+		t.Fatal("accepted RCAC without KeyUsageKeyCertSign")
+	}
+
+	// 2. Non-self-issued RCAC (Issuer != Subject, even if self-signed).
+	nonSelfIssuedRoot := signCert(t, &Cert{
+		Issuer: DN{{Tag: DNMatterRCACID, Uint: 99}}, Subject: rootDN,
+		IsCA: true, PathLen: -1, KeyUsage: KeyUsageKeyCertSign,
+	}, rootKey.PublicKey(), rootKey)
+	if _, err := ValidateNOCChain(validNOC, nil, nonSelfIssuedRoot); err == nil {
+		t.Fatal("accepted non-self-issued RCAC")
+	}
+
+	// 3. RCAC with PathLen=0 cannot authorize an ICAC.
+	pathLen0Root := signCert(t, &Cert{
+		Issuer: rootDN, Subject: rootDN, IsCA: true, PathLen: 0, KeyUsage: KeyUsageKeyCertSign,
+	}, rootKey.PublicKey(), rootKey)
+	if _, err := ValidateNOCChain(validICANNOC, validICA, pathLen0Root); err == nil {
+		t.Fatal("accepted ICAC under RCAC with PathLen=0")
+	}
+
+	// 4. NOC with partial ExtKeyUsage (missing EKUClientAuth).
+	partialEKUNOC := signCert(t, &Cert{
+		Issuer: rootDN, Subject: nocDN, PathLen: -1,
+		KeyUsage: KeyUsageDigitalSignature, ExtKeyUsage: []uint8{EKUServerAuth},
+	}, nodeKey.PublicKey(), rootKey)
+	if _, err := ValidateNOCChain(partialEKUNOC, nil, validRoot); err == nil {
+		t.Fatal("accepted NOC missing EKUClientAuth")
+	}
+}

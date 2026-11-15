@@ -638,6 +638,22 @@ type OperationalIdentity struct {
 // IsOperationalNodeID reports whether id is in the operational node ID range.
 func IsOperationalNodeID(id uint64) bool { return id >= 1 && id <= 0xFFFFFFEFFFFFFFFF }
 
+func validNOCEKU(eku []uint8) bool {
+	if len(eku) == 0 {
+		return true
+	}
+	var hasServer, hasClient bool
+	for _, u := range eku {
+		switch u {
+		case EKUServerAuth:
+			hasServer = true
+		case EKUClientAuth:
+			hasClient = true
+		}
+	}
+	return hasServer && hasClient
+}
+
 // ValidateNOCChain validates noc (issued by icac, if present, else by root)
 // against the trusted root certificate, all in Matter TLV form. Validity
 // periods are not checked: devices commonly lack a trusted clock.
@@ -646,7 +662,7 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := rc.Subject.Get(DNMatterRCACID); !ok || !rc.IsCA {
+	if _, ok := rc.Subject.Get(DNMatterRCACID); !ok || !rc.IsCA || rc.KeyUsage&KeyUsageKeyCertSign == 0 || !dnEqual(rc.Issuer, rc.Subject) {
 		return nil, ErrCertChain
 	}
 	if err := rc.VerifySignature(rc.PublicKey); err != nil {
@@ -654,6 +670,9 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	}
 	issuer := rc
 	if icac != nil {
+		if rc.PathLen == 0 {
+			return nil, ErrCertChain
+		}
 		ic, err := DecodeCert(icac)
 		if err != nil {
 			return nil, err
@@ -670,7 +689,7 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	if err != nil {
 		return nil, err
 	}
-	if nc.IsCA || nc.KeyUsage&KeyUsageDigitalSignature == 0 {
+	if nc.IsCA || nc.KeyUsage&KeyUsageDigitalSignature == 0 || !validNOCEKU(nc.ExtKeyUsage) {
 		return nil, ErrCertChain
 	}
 	if err := checkIssued(nc, issuer); err != nil {
