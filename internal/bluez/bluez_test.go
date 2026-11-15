@@ -6,7 +6,63 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/shabunin/tiny-matter-go/internal/dbus"
 )
+
+func TestLinkSignalActiveGate(t *testing.T) {
+	dev := dbus.ObjectPath("/org/bluez/hci0/dev_11_22_33_44_55_66")
+	l := &Link{
+		dev:      dev,
+		resolved: make(chan struct{}, 1),
+		events:   newQueue[[]byte](),
+	}
+	// Disconnect during pre-connect retry must not inject EOF (nil).
+	l.signal(&dbus.Message{
+		Member: "PropertiesChanged",
+		Path:   dev,
+		Body: []any{
+			ifaceDevice,
+			map[string]any{"Connected": dbus.Variant{Sig: "b", Value: false}},
+			[]any{},
+		},
+	})
+	if items := l.events.take(); len(items) != 0 {
+		t.Fatalf("unexpected events before active: %v", items)
+	}
+
+	// ServicesResolved=true signals resolution readiness.
+	l.signal(&dbus.Message{
+		Member: "PropertiesChanged",
+		Path:   dev,
+		Body: []any{
+			ifaceDevice,
+			map[string]any{"ServicesResolved": dbus.Variant{Sig: "b", Value: true}},
+			[]any{},
+		},
+	})
+	select {
+	case <-l.resolved:
+	default:
+		t.Fatal("expected ServicesResolved signal")
+	}
+
+	// Connected=false after connect loop succeeded injects nil EOF.
+	l.active.Store(true)
+	l.signal(&dbus.Message{
+		Member: "PropertiesChanged",
+		Path:   dev,
+		Body: []any{
+			ifaceDevice,
+			map[string]any{"Connected": dbus.Variant{Sig: "b", Value: false}},
+			[]any{},
+		},
+	})
+	items := l.events.take()
+	if len(items) != 1 || items[0] != nil {
+		t.Fatalf("events after active disconnect = %v, want [nil]", items)
+	}
+}
 
 // TestLiveScan scans the real adapter for Matter devices for a few seconds.
 // It runs only with TMG_BLE_LIVE=1.

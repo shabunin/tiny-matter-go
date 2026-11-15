@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/internal/dbus"
@@ -340,6 +341,7 @@ type Link struct {
 	values   chan []byte
 	done     chan struct{}
 	quit     chan struct{} // closed by Close
+	active   atomic.Bool   // true once connect loop succeeded
 	stop     func()
 	once     sync.Once
 }
@@ -366,14 +368,14 @@ func (l *Link) signal(m *dbus.Message) {
 	changed, _ := m.Body[1].(map[string]any)
 	switch {
 	case m.Path == l.dev && m.Body[0] == ifaceDevice:
+		if v, ok := changed["Connected"].(dbus.Variant); ok && v.Value == false && l.active.Load() {
+			l.events.push(nil)
+		}
 		if v, ok := changed["ServicesResolved"].(dbus.Variant); ok && v.Value == true {
 			select {
 			case l.resolved <- struct{}{}:
 			default:
 			}
-		}
-		if v, ok := changed["Connected"].(dbus.Variant); ok && v.Value == false {
-			l.events.push(nil)
 		}
 	case m.Body[0] == ifaceChar:
 		l.mu.Lock()
@@ -417,6 +419,10 @@ func (l *Link) pump() {
 func (l *Link) connect(ctx context.Context) error {
 	var err error
 	for range connectAttempts {
+		select {
+		case <-l.resolved:
+		default:
+		}
 		if _, err = l.c.call(ctx, l.dev, ifaceDevice, "Connect", ""); err == nil || ctx.Err() != nil {
 			break
 		}
@@ -434,11 +440,20 @@ func (l *Link) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bluez: connecting: %w", err)
 	}
-	body, err := l.c.call(ctx, l.dev, ifaceProps, "Get", "ss", ifaceDevice, "ServicesResolved")
+	l.active.Store(true)
+	body, err := l.c.call(ctx, l.dev, ifaceProps, "GetAll", "s", ifaceDevice)
 	if err != nil {
 		return fmt.Errorf("bluez: %w", err)
 	}
-	if v, _ := body[0].(dbus.Variant); v.Value != true {
+	if len(body) != 1 {
+		return errors.New("bluez: bad GetAll reply")
+	}
+	raw, _ := body[0].(map[string]any)
+	props := unwrap(raw)
+	if props["Connected"] != true {
+		return errors.New("bluez: disconnected while discovering services")
+	}
+	if props["ServicesResolved"] != true {
 		select {
 		case <-l.resolved:
 		case <-l.done:
@@ -521,6 +536,7 @@ func (l *Link) Close() error {
 		l.stop()
 		close(l.quit)
 		l.events.push(nil)
+		<-l.done
 	})
 	return nil
 }
