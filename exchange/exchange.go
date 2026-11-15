@@ -29,6 +29,7 @@ type Exchange struct {
 	rtCounter   uint32
 	rtSendCount int // retransmissions so far
 	rtNext      time.Time
+	lastActive  time.Time
 }
 
 // ID returns the exchange ID.
@@ -69,6 +70,7 @@ func (ex *Exchange) Send(now time.Time, protocolID uint16, opcode uint8, payload
 		return err
 	}
 	ex.ackPending = false
+	ex.lastActive = now
 	ex.s.lastUse = now
 	if reliable {
 		return nil
@@ -94,6 +96,7 @@ func (ex *Exchange) SendUnacked(now time.Time, protocolID uint16, opcode uint8, 
 		return err
 	}
 	ex.ackPending = false
+	ex.lastActive = now
 	ex.s.lastUse = now
 	return nil
 }

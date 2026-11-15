@@ -20,9 +20,14 @@ import (
 // Secure Channel opcode for MRP standalone acknowledgements.
 const OpcodeStandaloneAck = 0x10
 
+// DefaultExchangeTimeout is how long an idle open exchange may wait with no
+// message, retransmission, or pending acknowledgement before timing out.
+const DefaultExchangeTimeout = 90 * time.Second
+
 var (
 	ErrUnknownSession  = errors.New("exchange: unknown session")
 	ErrDeliveryFailed  = errors.New("exchange: message not acknowledged")
+	ErrExchangeTimeout = errors.New("exchange: response timeout")
 	ErrSessionClosed   = errors.New("exchange: session closed")
 	ErrExchangeClosed  = errors.New("exchange: exchange closed")
 	ErrBusy            = errors.New("exchange: previous message not yet acknowledged")
@@ -81,6 +86,9 @@ type Config struct {
 	MaxSecureSessions    int
 	MaxUnsecuredSessions int
 	MaxExchanges         int
+	// ExchangeTimeout closes idle open exchanges after inactivity (zero uses
+	// DefaultExchangeTimeout; negative disables).
+	ExchangeTimeout time.Duration
 	// Clock, if set, returns the current time. Sends use it to schedule
 	// retransmissions, so a reply computed slowly after the message it
 	// answers is not retransmitted at once. Nil uses the time passed in.
@@ -111,6 +119,9 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 	if cfg.MaxExchanges == 0 {
 		cfg.MaxExchanges = 16
+	}
+	if cfg.ExchangeTimeout == 0 {
+		cfg.ExchangeTimeout = DefaultExchangeTimeout
 	}
 	m := &Manager{cfg: cfg, factories: make(map[uint32]Factory)}
 	var err error
@@ -149,7 +160,7 @@ func (m *Manager) AllocateSessionID() (uint16, error) {
 // NewSecureSession installs a secure session established by PASE or CASE.
 func (m *Manager) NewSecureSession(now time.Time, p SecureSessionParams) (*Session, error) {
 	if m.count(true) >= m.cfg.MaxSecureSessions {
-		if !m.evict(true) {
+		if !m.evict(now, true) {
 			return nil, ErrTooManySessions
 		}
 	}
@@ -195,7 +206,7 @@ func (m *Manager) NewUnsecuredSession(now time.Time, peer Addr, peerMRP MRPConfi
 }
 
 func (m *Manager) addUnsecured(now time.Time, peer Addr, eph uint64, initiator bool, peerMRP MRPConfig) (*Session, error) {
-	if m.count(false) >= m.cfg.MaxUnsecuredSessions && !m.evict(false) {
+	if m.count(false) >= m.cfg.MaxUnsecuredSessions && !m.evict(now, false) {
 		return nil, ErrTooManySessions
 	}
 	if peerMRP == (MRPConfig{}) {
@@ -231,18 +242,38 @@ func (m *Manager) count(secure bool) int {
 	return n
 }
 
-// evict closes the least recently used session of the given kind.
-func (m *Manager) evict(secure bool) bool {
-	var lru *Session
-	for _, s := range m.sessions {
-		if s.secure == secure && (lru == nil || s.lastUse.Before(lru.lastUse)) {
-			lru = s
+func (m *Manager) hasLiveExchange(s *Session) bool {
+	for _, ex := range m.exchanges {
+		if ex.s == s && !ex.done {
+			return true
 		}
+	}
+	return false
+}
+
+// evict closes the least recently used session of the given kind, preferring
+// idle sessions that have no live exchanges.
+func (m *Manager) evict(now time.Time, secure bool) bool {
+	var idleLRU, anyLRU *Session
+	for _, s := range m.sessions {
+		if s.secure != secure || s.closed {
+			continue
+		}
+		if anyLRU == nil || s.lastUse.Before(anyLRU.lastUse) {
+			anyLRU = s
+		}
+		if !m.hasLiveExchange(s) && (idleLRU == nil || s.lastUse.Before(idleLRU.lastUse)) {
+			idleLRU = s
+		}
+	}
+	lru := idleLRU
+	if lru == nil {
+		lru = anyLRU
 	}
 	if lru == nil {
 		return false
 	}
-	m.CloseSession(lru.lastUse, lru)
+	m.CloseSession(now, lru)
 	return true
 }
 
@@ -276,7 +307,10 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 	}
 	var s *Session
 	var payload []byte
+	var ph message.ProtocolHeader
+	var pn int
 	dup := false
+	createdSession := false
 	if h.IsEncrypted() {
 		if h.SessionType != message.SessionUnicast {
 			return message.ErrUnsupported // group messaging
@@ -294,16 +328,20 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 		}
 		if !dup {
 			s.recv.CommitEncryptedUnicast(h.MessageCounter)
+			s.Peer = from
+			s.lastPeerActivity, s.lastUse = now, now
 		}
-		s.Peer = from
+		if pn, err = ph.Decode(payload); err != nil {
+			return err
+		}
 	} else {
+		payload = pkt[n:]
+		if pn, err = ph.Decode(payload); err != nil {
+			return err
+		}
 		switch {
 		case h.HasSource && h.Dest == message.DestNone: // from an initiator
-			if s = m.unsecured(h.SourceNodeID, false, from); s == nil {
-				if s, err = m.addUnsecured(now, from, h.SourceNodeID, false, MRPConfig{}); err != nil {
-					return err
-				}
-			}
+			s = m.unsecured(h.SourceNodeID, false, from)
 		case !h.HasSource && h.Dest == message.DestNode: // reply to our initiator
 			if s = m.unsecured(h.DestNodeID, true, from); s == nil {
 				return ErrUnknownSession
@@ -311,20 +349,35 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 		default:
 			return message.ErrInvalid
 		}
+		if s == nil {
+			isAck := ph.VendorID == 0 && ph.ProtocolID == message.ProtocolSecureChannel && ph.Opcode == OpcodeStandaloneAck
+			if isAck {
+				return nil
+			}
+			var f Factory
+			if ph.Initiator && m.liveExchanges() < m.cfg.MaxExchanges {
+				f = m.factories[protocolKey(ph.VendorID, ph.ProtocolID)]
+			}
+			if f == nil {
+				if ph.NeedsAck {
+					tmp := Session{m: m, Peer: from, ephemeralNodeID: h.SourceNodeID}
+					m.sendStandaloneAck(now, &tmp, ph.ExchangeID, !ph.Initiator, h.MessageCounter)
+				}
+				return ErrDropped
+			}
+			if s, err = m.addUnsecured(now, from, h.SourceNodeID, false, MRPConfig{}); err != nil {
+				return err
+			}
+			createdSession = true
+		}
 		if err := s.recv.CheckUnencrypted(h.MessageCounter); err != nil {
 			dup = true
 		} else {
 			s.recv.CommitUnencrypted(h.MessageCounter)
+			s.lastPeerActivity, s.lastUse = now, now
 		}
-		payload = pkt[n:]
 	}
-	s.lastPeerActivity, s.lastUse = now, now
 
-	var ph message.ProtocolHeader
-	pn, err := ph.Decode(payload)
-	if err != nil {
-		return err
-	}
 	app := payload[pn:]
 	if ph.HasAck {
 		m.handleAck(now, s, ph.AckCounter)
@@ -345,7 +398,7 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 		var d Delegate
 		if !isAck && ph.Initiator {
 			if f := m.factories[protocolKey(ph.VendorID, ph.ProtocolID)]; f != nil && m.liveExchanges() < m.cfg.MaxExchanges {
-				ex = m.addExchange(s, ph.ExchangeID, false)
+				ex = m.addExchange(now, s, ph.ExchangeID, false)
 				if d = f(ex); d == nil {
 					ex.done = true
 				}
@@ -355,6 +408,9 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 		if d == nil {
 			if ph.NeedsAck {
 				m.sendStandaloneAck(now, s, ph.ExchangeID, !ph.Initiator, h.MessageCounter)
+			}
+			if createdSession {
+				s.closed = true
 			}
 			return ErrDropped
 		}
@@ -368,6 +424,7 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 	if isAck || ex.closing {
 		return nil
 	}
+	ex.lastActive = now
 	ex.d.OnMessage(now, ex, Message{ProtocolID: ph.ProtocolID, VendorID: ph.VendorID, Opcode: ph.Opcode, Payload: app})
 	return nil
 }
@@ -376,6 +433,7 @@ func (m *Manager) handleAck(now time.Time, s *Session, counter uint32) {
 	for _, ex := range m.exchanges {
 		if ex.s == s && ex.rtActive && ex.rtCounter == counter {
 			ex.rtActive = false
+			ex.lastActive = now
 			if ex.closing {
 				ex.done = true
 			}
@@ -403,8 +461,8 @@ func (m *Manager) liveExchanges() int {
 	return n
 }
 
-func (m *Manager) addExchange(s *Session, id uint16, initiator bool) *Exchange {
-	ex := &Exchange{m: m, s: s, id: id, initiator: initiator}
+func (m *Manager) addExchange(now time.Time, s *Session, id uint16, initiator bool) *Exchange {
+	ex := &Exchange{m: m, s: s, id: id, initiator: initiator, lastActive: now}
 	m.exchanges = append(m.exchanges, ex)
 	return ex
 }
@@ -418,7 +476,7 @@ func (m *Manager) NewExchange(s *Session, d Delegate) (*Exchange, error) {
 		return nil, ErrTooMany
 	}
 	m.nextExchangeID++
-	ex := m.addExchange(s, m.nextExchangeID, true)
+	ex := m.addExchange(time.Time{}, s, m.nextExchangeID, true)
 	ex.d = d
 	return ex, nil
 }
@@ -501,6 +559,16 @@ func (m *Manager) Poll(now time.Time) time.Time {
 		}
 		if ex.rtActive {
 			soonest(ex.rtNext)
+		} else if !ex.ackPending && !ex.closing && m.cfg.ExchangeTimeout > 0 {
+			if ex.lastActive.IsZero() {
+				ex.lastActive = now
+			}
+			dead := ex.lastActive.Add(m.cfg.ExchangeTimeout)
+			if !now.Before(dead) {
+				ex.fail(now, ErrExchangeTimeout)
+				continue
+			}
+			soonest(dead)
 		}
 	}
 	m.compact()

@@ -512,3 +512,50 @@ func TestReliableTransportSkipsMRP(t *testing.T) {
 		t.Fatal("exchanges left over")
 	}
 }
+
+func TestReplayDoesNotHijackPeer(t *testing.T) {
+	w := newWorld(t)
+	a, b := w.node(1), w.node(2)
+	sa, sb := securePair(t, w, a, b)
+	var wire []byte
+	w.net.drop = func(p packet) bool {
+		if wire == nil {
+			wire = bytes.Clone(p.data)
+		}
+		return false
+	}
+	b.m.Register(message.ProtocolInteractionModel, func(ex *Exchange) Delegate { return &recorder{} })
+	ex, _ := a.m.NewExchange(sa, &recorder{})
+	ex.Send(w.now, message.ProtocolInteractionModel, 0x02, []byte("hi"))
+	w.deliver()
+	spoof := netip.AddrPortFrom(netip.MustParseAddr("fe80::99"), 9999)
+	if err := b.m.HandlePacket(w.now.Add(10*time.Second), spoof, bytes.Clone(wire)); err != message.ErrDuplicate {
+		t.Fatalf("replay err = %v", err)
+	}
+	if sb.Peer != a.addr {
+		t.Fatalf("replay hijacked peer address: got %v, want %v", sb.Peer, a.addr)
+	}
+}
+
+func TestIdleExchangeTimesOut(t *testing.T) {
+	w := newWorld(t)
+	var nodes [2]*node
+	for i := range nodes {
+		addr := netip.AddrPortFrom(netip.MustParseAddr("fe80::1"), uint16(i+1))
+		m, _ := NewManager(Config{Transport: reliablePort{port{w.net, addr}}, Rand: rand.Reader})
+		nodes[i] = &node{m: m, addr: addr}
+		w.nodes = append(w.nodes, nodes[i])
+	}
+	a, b := nodes[0], nodes[1]
+	sa, _ := securePair(t, w, a, b)
+	cli := &recorder{}
+	ex, _ := a.m.NewExchange(sa, cli)
+	ex.Send(w.now, message.ProtocolInteractionModel, 0x02, []byte("req"))
+	w.advance(DefaultExchangeTimeout + time.Second)
+	if len(cli.errs) != 1 || !errors.Is(cli.errs[0], ErrExchangeTimeout) {
+		t.Fatalf("idle exchange errors = %v", cli.errs)
+	}
+	if len(a.m.exchanges) != 0 {
+		t.Fatalf("leaked exchanges: %d", len(a.m.exchanges))
+	}
+}

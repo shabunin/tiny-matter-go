@@ -102,9 +102,15 @@ func (s *Session) peerActive(now time.Time) bool {
 // retransBase returns the peer's current MRP base interval.
 func (s *Session) retransBase(now time.Time) time.Duration {
 	if s.peerActive(now) {
-		return s.PeerMRP.ActiveInterval
+		if s.PeerMRP.ActiveInterval > 0 {
+			return s.PeerMRP.ActiveInterval
+		}
+		return DefaultMRPConfig.ActiveInterval
 	}
-	return s.PeerMRP.IdleInterval
+	if s.PeerMRP.IdleInterval > 0 {
+		return s.PeerMRP.IdleInterval
+	}
+	return DefaultMRPConfig.IdleInterval
 }
 
 // nextCounter returns the message counter for an outgoing message.
