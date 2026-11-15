@@ -156,6 +156,8 @@ func (p *SessionParams) Encode(w *tlv.Writer, tag tlv.Tag) {
 	w.EndContainer()
 }
 
+const maxMRPIntervalMS = 3600_000 // spec 4.12.8: max 1 hour
+
 // DecodeSessionParams decodes the session parameters structure the reader
 // is positioned on. Absent fields take the spec defaults; unknown fields are
 // ignored.
@@ -184,11 +186,17 @@ func DecodeSessionParams(r *tlv.Reader) (SessionParams, error) {
 			if err != nil {
 				return p, err
 			}
+			if v == 0 || v > maxMRPIntervalMS {
+				return p, errors.New("securechannel: invalid idle interval")
+			}
 			p.MRP.IdleInterval = time.Duration(v) * time.Millisecond
 		case tagSessionActiveInterval:
 			v, err := r.Uint32()
 			if err != nil {
 				return p, err
+			}
+			if v == 0 || v > maxMRPIntervalMS {
+				return p, errors.New("securechannel: invalid active interval")
 			}
 			p.MRP.ActiveInterval = time.Duration(v) * time.Millisecond
 		case tagSessionActiveThreshold:
@@ -212,6 +220,9 @@ func DecodeSessionParams(r *tlv.Reader) (SessionParams, error) {
 		case tagMaxPathsPerInvoke:
 			if p.MaxPathsPerInvoke, err = r.Uint16(); err != nil {
 				return p, err
+			}
+			if p.MaxPathsPerInvoke == 0 {
+				return p, errors.New("securechannel: invalid MaxPathsPerInvoke")
 			}
 		}
 	}

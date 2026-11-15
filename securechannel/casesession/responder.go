@@ -64,6 +64,7 @@ func (h *responderHandshake) OnError(now time.Time, ex *exchange.Exchange, err e
 	if h.state != 2 && h.r.cfg.OnFailed != nil {
 		h.r.cfg.OnFailed(now, err)
 	}
+	clear(h.shared)
 	h.state = 2
 }
 
@@ -76,6 +77,7 @@ func (h *responderHandshake) fail(now time.Time, ex *exchange.Exchange, err erro
 		securechannel.SendStatus(now, ex, securechannel.SecureChannelStatus(securechannel.GeneralFailure, code))
 	}
 	ex.Close(now)
+	clear(h.shared)
 	h.state = 2
 	if h.r.cfg.OnFailed != nil {
 		h.r.cfg.OnFailed(now, err)
@@ -109,11 +111,13 @@ func (h *responderHandshake) onSigma1(now time.Time, ex *exchange.Exchange, payl
 	if err != nil {
 		return err
 	}
-	for _, f := range h.r.cfg.Fabrics.Fabrics() {
-		d := DestinationID(f.OperationalIPK[:], s1.InitiatorRandom[:], f.RootPublicKey, f.FabricID, f.NodeID)
-		if d == s1.DestinationID {
-			h.fabric = f
-			break
+	if h.r.cfg.Fabrics != nil {
+		for _, f := range h.r.cfg.Fabrics.Fabrics() {
+			d := DestinationID(f.OperationalIPK[:], s1.InitiatorRandom[:], f.RootPublicKey, f.FabricID, f.NodeID)
+			if d == s1.DestinationID {
+				h.fabric = f
+				break
+			}
 		}
 	}
 	if h.fabric == nil {
@@ -193,6 +197,9 @@ func (h *responderHandshake) onSigma3(now time.Time, ex *exchange.Exchange, payl
 	t, err := decodeTBEData(pt)
 	if err != nil {
 		return err
+	}
+	if t.resumptionID != nil {
+		return ErrPeerCert
 	}
 	id, err := credentials.ValidateNOCChain(t.noc, t.icac, f.RCAC)
 	if err != nil || id.FabricID != f.FabricID {

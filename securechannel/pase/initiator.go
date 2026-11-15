@@ -58,13 +58,19 @@ func Pair(now time.Time, m *exchange.Manager, peer exchange.Addr, cfg InitiatorC
 	}
 	ex, err := m.NewExchange(s, in)
 	if err != nil {
+		m.CloseSession(now, s)
+		return err
+	}
+	failSync := func(err error) error {
+		in.done = true
+		m.CloseSession(now, s)
 		return err
 	}
 	if in.localSessionID, err = m.AllocateSessionID(); err != nil {
-		return err
+		return failSync(err)
 	}
 	if _, err := io.ReadFull(cfg.Rand, in.random[:]); err != nil {
-		return err
+		return failSync(err)
 	}
 	req := PBKDFParamRequest{
 		InitiatorRandom:    in.random,
@@ -75,7 +81,10 @@ func Pair(now time.Time, m *exchange.Manager, peer exchange.Addr, cfg InitiatorC
 	in.ctx = sha256.New()
 	in.ctx.Write([]byte(contextPrefix))
 	in.ctx.Write(b)
-	return ex.Send(now, message.ProtocolSecureChannel, securechannel.OpPBKDFParamRequest, b)
+	if err := ex.Send(now, message.ProtocolSecureChannel, securechannel.OpPBKDFParamRequest, b); err != nil {
+		return failSync(err)
+	}
+	return nil
 }
 
 func (in *initiator) finish(now time.Time, ex *exchange.Exchange, s *exchange.Session, err error) {

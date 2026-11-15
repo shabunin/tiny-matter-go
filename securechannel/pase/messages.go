@@ -143,7 +143,7 @@ func DecodePBKDFParamRequest(b []byte) (*PBKDFParamRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if seen&0b11110 != 0b11110 {
+	if seen&0b11110 != 0b11110 || m.InitiatorSessionID == 0 {
 		return nil, errMessage
 	}
 	return m, nil
@@ -204,7 +204,7 @@ func DecodePBKDFParamResponse(b []byte) (*PBKDFParamResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	if seen&0b1110 != 0b1110 {
+	if seen&0b1110 != 0b1110 || m.ResponderSessionID == 0 {
 		return nil, errMessage
 	}
 	return m, nil

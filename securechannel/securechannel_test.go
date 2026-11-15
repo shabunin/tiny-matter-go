@@ -53,6 +53,23 @@ func TestSessionParams(t *testing.T) {
 	if err != nil || got.MRP != exchange.DefaultMRPConfig || got.MaxPathsPerInvoke != 1 {
 		t.Fatalf("defaults: %+v, %v", got, err)
 	}
+
+	// Zero or out-of-range MRP intervals and zero MaxPathsPerInvoke are rejected.
+	bad := []SessionParams{
+		{MRP: exchange.MRPConfig{IdleInterval: 0, ActiveInterval: 300 * time.Millisecond}, MaxPathsPerInvoke: 1},
+		{MRP: exchange.MRPConfig{IdleInterval: 500 * time.Millisecond, ActiveInterval: 0}, MaxPathsPerInvoke: 1},
+		{MRP: exchange.MRPConfig{IdleInterval: 2 * time.Hour, ActiveInterval: 300 * time.Millisecond}, MaxPathsPerInvoke: 1},
+		{MRP: exchange.DefaultMRPConfig, MaxPathsPerInvoke: 0},
+	}
+	for i, bp := range bad {
+		w = tlv.NewWriter(nil)
+		bp.Encode(w, tlv.Anonymous)
+		r = tlv.NewReader(w.Bytes())
+		r.Next()
+		if _, err := DecodeSessionParams(r); err == nil {
+			t.Errorf("case %d: invalid SessionParams accepted", i)
+		}
+	}
 }
 
 func TestDeriveSessionKeys(t *testing.T) {

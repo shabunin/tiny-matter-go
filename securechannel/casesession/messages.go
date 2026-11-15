@@ -157,8 +157,13 @@ func DecodeSigma1(b []byte) (*Sigma1, error) {
 	if err != nil {
 		return nil, err
 	}
-	if seen&0b11110 != 0b11110 {
+	if seen&0b11110 != 0b11110 || m.InitiatorSessionID == 0 {
 		return nil, errMessage
+	}
+	if len(m.ResumptionID) > 0 || len(m.ResumeMIC) > 0 {
+		if len(m.ResumptionID) != ResumptionIDSize || len(m.ResumeMIC) != micSize {
+			return nil, errMessage
+		}
 	}
 	return m, nil
 }
@@ -193,7 +198,7 @@ func DecodeSigma2(b []byte) (*Sigma2, error) {
 	if err != nil {
 		return nil, err
 	}
-	if seen&0b11110 != 0b11110 {
+	if seen&0b11110 != 0b11110 || m.ResponderSessionID == 0 {
 		return nil, errMessage
 	}
 	return m, nil

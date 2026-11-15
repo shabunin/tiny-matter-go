@@ -177,6 +177,37 @@ func TestCASEForeignRoot(t *testing.T) {
 	}
 }
 
+func TestCASERejectsZeroSessionAndNilFabrics(t *testing.T) {
+	if _, err := DecodeSigma1((&Sigma1{InitiatorSessionID: 0}).Encode()); err == nil {
+		t.Fatal("accepted zero InitiatorSessionID in Sigma1")
+	}
+	if _, err := DecodeSigma1((&Sigma1{InitiatorSessionID: 1, ResumptionID: make([]byte, ResumptionIDSize)}).Encode()); err == nil {
+		t.Fatal("accepted ResumptionID without ResumeMIC")
+	}
+	if _, err := DecodeSigma2((&Sigma2{ResponderSessionID: 0, Encrypted2: make([]byte, 32)}).Encode()); err == nil {
+		t.Fatal("accepted zero ResponderSessionID in Sigma2")
+	}
+	w := simnet.New(t)
+	dev := w.Node(5540)
+	NewResponder(dev.M, securechannel.NewDispatcher(dev.M), ResponderConfig{Rand: rand.Reader})
+	ctl := w.Node(5550)
+	tf := newTestFabric(t)
+	ctlFab := &fabric.Table{}
+	ctlF := tf.member(t, ctlFab, 0xFAB1, 0x2222)
+	var done bool
+	var gotErr error
+	if err := Connect(w.Now, ctl.M, dev.Addr, InitiatorConfig{
+		Fabric: ctlF, PeerNodeID: 0x1111, Rand: rand.Reader,
+		Done: func(_ time.Time, _ *exchange.Session, err error) { done, gotErr = true, err },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w.Advance(time.Second)
+	if !done || gotErr == nil {
+		t.Fatalf("nil Fabrics: done=%v err=%v", done, gotErr)
+	}
+}
+
 func FuzzDecode(f *testing.F) {
 	s1 := Sigma1{SessionParams: &securechannel.DefaultSessionParams, ResumptionID: make([]byte, 16), ResumeMIC: make([]byte, 16)}
 	s2 := Sigma2{Encrypted2: make([]byte, 40), SessionParams: &securechannel.DefaultSessionParams}

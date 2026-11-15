@@ -42,6 +42,8 @@ type ResponderConfig struct {
 	OnEstablished func(now time.Time, s *exchange.Session)
 	// OnFailed, if set, is called when a handshake fails.
 	OnFailed func(now time.Time, err error)
+	// OnWindowClosed, if set, is called when failed attempts close the window.
+	OnWindowClosed func()
 }
 
 // Responder is the device side of PASE. It accepts handshakes only while
@@ -106,6 +108,15 @@ func (r *Responder) CloseWindow() { r.open = false }
 // WindowOpen reports whether PASE is accepted.
 func (r *Responder) WindowOpen() bool { return r.open }
 
+func (r *Responder) recordFailure() {
+	if r.failed++; r.failed >= MaxFailedAttempts && r.open {
+		r.CloseWindow()
+		if r.cfg.OnWindowClosed != nil {
+			r.cfg.OnWindowClosed()
+		}
+	}
+}
+
 func (r *Responder) factory(ex *exchange.Exchange) exchange.Delegate {
 	if ex.Session().IsSecure() {
 		return nil // PASE runs over unsecured sessions only
@@ -124,6 +135,7 @@ const (
 
 type responderHandshake struct {
 	r       *Responder
+	ex      *exchange.Exchange
 	state   responderState
 	started time.Time
 	ctx     hash.Hash
@@ -166,7 +178,11 @@ func (h *responderHandshake) OnMessage(now time.Time, ex *exchange.Exchange, msg
 }
 
 func (h *responderHandshake) OnError(now time.Time, ex *exchange.Exchange, err error) {
+	wasWaitPake3 := h.state == waitPake3
 	h.release()
+	if wasWaitPake3 {
+		h.r.recordFailure()
+	}
 	if h.r.cfg.OnFailed != nil {
 		h.r.cfg.OnFailed(now, err)
 	}
@@ -184,16 +200,15 @@ func (h *responderHandshake) fail(now time.Time, ex *exchange.Exchange, err erro
 	if h.state == finished {
 		return
 	}
+	wasWaitPake3 := h.state == waitPake3
 	if report {
 		securechannel.SendStatus(now, ex, securechannel.SecureChannelStatus(
 			securechannel.GeneralFailure, securechannel.CodeInvalidParameter))
 	}
 	ex.Close(now)
 	h.release()
-	if errors.Is(err, ErrConfirm) {
-		if h.r.failed++; h.r.failed >= MaxFailedAttempts {
-			h.r.CloseWindow()
-		}
+	if wasWaitPake3 || errors.Is(err, ErrConfirm) {
+		h.r.recordFailure()
 	}
 	if h.r.cfg.OnFailed != nil {
 		h.r.cfg.OnFailed(now, err)
@@ -205,14 +220,27 @@ func (h *responderHandshake) onPBKDFParamRequest(now time.Time, ex *exchange.Exc
 	if !r.open {
 		return ErrWindowClosed
 	}
-	if c := r.current; c != nil && c != h && now.Sub(c.started) < handshakeTimeout {
-		// Another commissioner is mid-handshake: ask this one to retry.
-		sr := securechannel.SecureChannelStatus(securechannel.GeneralBusy, securechannel.CodeBusy)
-		sr.Data = binary.LittleEndian.AppendUint16(nil, busyWait)
-		securechannel.SendStatus(now, ex, sr)
-		ex.Close(now)
-		h.state = finished
-		return nil
+	if c := r.current; c != nil && c != h {
+		if now.Sub(c.started) < handshakeTimeout {
+			// Another commissioner is mid-handshake: ask this one to retry.
+			sr := securechannel.SecureChannelStatus(securechannel.GeneralBusy, securechannel.CodeBusy)
+			sr.Data = binary.LittleEndian.AppendUint16(nil, busyWait)
+			securechannel.SendStatus(now, ex, sr)
+			ex.Close(now)
+			h.state = finished
+			return nil
+		}
+		prev := c.state
+		c.release()
+		if c.ex != nil {
+			c.ex.Close(now)
+		}
+		if prev == waitPake3 {
+			r.recordFailure()
+			if !r.open {
+				return ErrWindowClosed
+			}
+		}
 	}
 	req, err := DecodePBKDFParamRequest(payload)
 	if err != nil {
@@ -253,9 +281,16 @@ func (h *responderHandshake) onPBKDFParamRequest(now time.Time, ex *exchange.Exc
 		return err
 	}
 	if c := r.current; c != nil && c != h {
+		prev := c.state
 		c.state = finished // stale handshake replaced
+		if c.ex != nil {
+			c.ex.Close(now)
+		}
+		if prev == waitPake3 {
+			r.recordFailure()
+		}
 	}
-	r.current, h.started, h.state = h, now, waitPake1
+	r.current, h.ex, h.started, h.state = h, ex, now, waitPake1
 	return nil
 }
 

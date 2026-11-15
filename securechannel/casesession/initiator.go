@@ -56,18 +56,25 @@ func Connect(now time.Time, m *exchange.Manager, peer exchange.Addr, cfg Initiat
 	}
 	ex, err := m.NewExchange(s, in)
 	if err != nil {
+		m.CloseSession(now, s)
+		return err
+	}
+	failSync := func(err error) error {
+		in.state = 2
+		clear(in.shared)
+		m.CloseSession(now, s)
 		return err
 	}
 	if in.eph, err = p256.GenerateKey(cfg.Rand); err != nil {
-		return err
+		return failSync(err)
 	}
 	in.ephPub = in.eph.PublicKey().Bytes()
 	if in.localSessionID, err = m.AllocateSessionID(); err != nil {
-		return err
+		return failSync(err)
 	}
 	s1 := Sigma1{InitiatorSessionID: in.localSessionID, SessionParams: &cfg.SessionParams}
 	if _, err := io.ReadFull(cfg.Rand, s1.InitiatorRandom[:]); err != nil {
-		return err
+		return failSync(err)
 	}
 	f := cfg.Fabric
 	s1.DestinationID = DestinationID(f.OperationalIPK[:], s1.InitiatorRandom[:], f.RootPublicKey, f.FabricID, cfg.PeerNodeID)
@@ -75,7 +82,10 @@ func Connect(now time.Time, m *exchange.Manager, peer exchange.Addr, cfg Initiat
 	b := s1.Encode()
 	in.tr = newTranscript()
 	in.tr.add(b)
-	return ex.Send(now, message.ProtocolSecureChannel, securechannel.OpCASESigma1, b)
+	if err := ex.Send(now, message.ProtocolSecureChannel, securechannel.OpCASESigma1, b); err != nil {
+		return failSync(err)
+	}
+	return nil
 }
 
 func (in *initiator) finish(now time.Time, ex *exchange.Exchange, s *exchange.Session, err error) {
@@ -83,6 +93,7 @@ func (in *initiator) finish(now time.Time, ex *exchange.Exchange, s *exchange.Se
 		return
 	}
 	in.state = 2
+	clear(in.shared)
 	ex.Close(now)
 	in.cfg.Done(now, s, err)
 }

@@ -72,6 +72,12 @@ func TestMessageRoundTrip(t *testing.T) {
 	if _, err := DecodePBKDFParamRequest(EncodePake1(pA)); err == nil {
 		t.Fatal("garbage request accepted")
 	}
+	if _, err := DecodePBKDFParamRequest((&PBKDFParamRequest{InitiatorSessionID: 0}).Encode()); err == nil {
+		t.Fatal("accepted zero InitiatorSessionID")
+	}
+	if _, err := DecodePBKDFParamResponse((&PBKDFParamResponse{ResponderSessionID: 0, Iterations: 1000, Salt: testSalt}).Encode()); err == nil {
+		t.Fatal("accepted zero ResponderSessionID")
+	}
 }
 
 func FuzzDecode(f *testing.F) {
@@ -216,6 +222,35 @@ func TestWrongPasscode(t *testing.T) {
 	w.Advance(time.Second)
 	if res.err != nil || len(dev.established) != 1 {
 		t.Fatalf("retry: err=%v established=%d", res.err, len(dev.established))
+	}
+}
+
+func TestFailedAttemptsLockWindow(t *testing.T) {
+	w := simnet.New(t)
+	v, err := spake2p.NewVerifier(testPasscode, testSalt, testIterations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := w.Node(5540)
+	closed := false
+	r, err := NewResponder(dev.M, securechannel.NewDispatcher(dev.M), ResponderConfig{
+		Verifier: v, Salt: testSalt, Iterations: testIterations, Rand: rand.Reader,
+		OnWindowClosed: func() { closed = true },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.OpenWindow()
+	ctl := w.Node(5550)
+	for i := 0; i < MaxFailedAttempts; i++ {
+		res := pair(t, w, ctl, dev.Addr, 12345679)
+		w.Advance(time.Second)
+		if !res.done || !errors.Is(res.err, ErrConfirm) {
+			t.Fatalf("attempt %d: done=%v err=%v", i, res.done, res.err)
+		}
+	}
+	if r.WindowOpen() || !closed {
+		t.Fatalf("window open=%v closedcb=%v after %d wrong-passcode attempts", r.WindowOpen(), closed, MaxFailedAttempts)
 	}
 }
 
