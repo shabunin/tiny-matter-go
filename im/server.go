@@ -14,9 +14,9 @@ const (
 	MaxPathsPerInvoke = 1
 	// maxReadPaths bounds the attribute paths, and separately the event
 	// paths, accepted in one read or subscription.
-	maxReadPaths = 9
+	maxReadPaths = 32
 	// maxVersionFilters bounds the data version filters kept from a read.
-	maxVersionFilters = 9
+	maxVersionFilters = 32
 	// reportReserve is the room kept for closing a ReportData message.
 	reportReserve = 12
 )
@@ -85,11 +85,17 @@ type readState struct {
 	done  bool           // last chunk sent, awaiting its StatusResponse
 }
 
+type writeState struct {
+	timed bool
+	auth  []ConcretePath // list-replace paths authorized in earlier chunks
+}
+
 // handler serves one exchange.
 type handler struct {
 	s     *Server
-	read  *readState // read in progress, awaiting a StatusResponse
-	timed time.Time  // deadline of a preceding TimedRequest
+	read  *readState  // read in progress, awaiting a StatusResponse
+	write *writeState // chunked write in progress
+	timed time.Time   // deadline of a preceding TimedRequest
 }
 
 func (h *handler) ctx(now time.Time, ex *exchange.Exchange) *Context {
@@ -98,13 +104,15 @@ func (h *handler) ctx(now time.Time, ex *exchange.Exchange) *Context {
 
 func (h *handler) OnError(now time.Time, ex *exchange.Exchange, err error) { h.abort() }
 
-// abort ends the read or report in progress; a failed subscription report
-// ends the subscription.
+// abort ends the read, report, timed state, or chunked write in progress;
+// a failed subscription report ends the subscription.
 func (h *handler) abort() {
 	if h.read != nil && h.read.sub != nil {
 		h.s.removeSub(h.read.sub)
 	}
 	h.read = nil
+	h.write = nil
+	h.timed = time.Time{}
 }
 
 func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
@@ -115,13 +123,13 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 	var st Status
 	switch msg.Opcode {
 	case OpReadRequest:
-		if h.read != nil {
+		if h.read != nil || h.write != nil {
 			st = InvalidAction
 			break
 		}
 		st = h.onRead(now, ex, msg.Payload)
 	case OpSubscribeRequest:
-		if h.read != nil {
+		if h.read != nil || h.write != nil {
 			st = InvalidAction
 			break
 		}
@@ -143,14 +151,26 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 		h.sendReport(now, ex)
 		return
 	case OpTimedRequest:
+		if h.read != nil || h.write != nil {
+			st = InvalidAction
+			break
+		}
 		st = h.onTimed(now, ex, msg.Payload)
 		if st == Success {
 			h.sendStatus(now, ex, Success, false)
 			return
 		}
 	case OpInvokeRequest:
+		if h.read != nil || h.write != nil {
+			st = InvalidAction
+			break
+		}
 		st = h.onInvoke(now, ex, msg.Payload)
 	case OpWriteRequest:
+		if h.read != nil {
+			st = InvalidAction
+			break
+		}
 		st = h.onWrite(now, ex, msg.Payload)
 	default:
 		st = InvalidAction
@@ -800,6 +820,53 @@ func (h *handler) invokeOne(ctx *Context, w *tlv.Writer, q *invokeRequest) {
 
 // ---- Write ----
 
+type writeItem struct {
+	path    AttributePath
+	cpath   ConcretePath
+	version uint32
+	hasVer  bool
+	data    []byte
+	st      Status
+	ce      *clusterEntry
+}
+
+func hasConcretePath(paths []ConcretePath, p ConcretePath) bool {
+	for _, x := range paths {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeWriteItem(r *tlv.Reader) (writeItem, error) {
+	var (
+		it      writeItem
+		hasPath bool
+	)
+	err := structFields(r, func(r *tlv.Reader, tag uint8) (err error) {
+		switch tag {
+		case 0:
+			it.version, err = r.Uint32()
+			it.hasVer = true
+		case 1:
+			it.path, err = DecodeAttributePath(r)
+			hasPath = true
+		case 2:
+			it.data, err = r.RawElement()
+		}
+		return err
+	})
+	if err != nil {
+		return writeItem{}, err
+	}
+	if !hasPath || it.data == nil || it.path.IsWildcard() {
+		return writeItem{}, InvalidAction
+	}
+	it.cpath = ConcretePath{it.path.Endpoint, it.path.Cluster, it.path.Attribute}
+	return it, nil
+}
+
 func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status {
 	var timedFlag, more bool
 	// First pass: the flags, which may follow the write requests.
@@ -815,30 +882,94 @@ func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status
 	if err != nil {
 		return InvalidAction
 	}
-	if st := h.checkTimed(now, timedFlag); st != Success {
-		return st
-	}
-	if more {
-		// A chunked write stays timed across its chunks.
-		h.timed = now.Add(time.Hour)
-		if !timedFlag {
-			h.timed = time.Time{}
+	if h.write == nil {
+		if st := h.checkTimed(now, timedFlag); st != Success {
+			return st
 		}
+	} else if !h.timed.IsZero() || timedFlag != h.write.timed {
+		h.timed = time.Time{}
+		return TimedRequestMismatch
 	}
 
-	ctx := h.ctx(now, ex)
-	ctx.Timed = timedFlag
-	w := tlv.NewWriter(h.s.buf[:0])
-	w.StartStruct(tlv.Anonymous)
-	w.StartArray(tlv.ContextTag(0))
+	var buf [8]writeItem
+	items := buf[:0]
 	err = structFields(tlv.NewReader(b), func(r *tlv.Reader, tag uint8) error {
 		if tag != 2 {
 			return nil
 		}
-		return arrayItems(r, func() error { return h.writeOne(ctx, w, r) })
+		return arrayItems(r, func() error {
+			it, err := decodeWriteItem(r)
+			if err != nil {
+				return err
+			}
+			items = append(items, it)
+			return nil
+		})
 	})
 	if err != nil {
 		return InvalidAction
+	}
+
+	ctx := h.ctx(now, ex)
+	// Evaluate all path validations and ACL checks before applying any writes
+	// so a multi-item list replacement (e.g. ACL = [] followed by ListAppend)
+	// does not revoke its own access mid-batch.
+	var chunkAuth []ConcretePath
+	for i := range items {
+		it := &items[i]
+		var ce *clusterEntry
+		if e := h.s.node.Endpoint(it.path.Endpoint); e == nil {
+			it.st = UnsupportedEndpoint
+			continue
+		} else if ce = e.entry(it.path.Cluster); ce == nil {
+			it.st = UnsupportedCluster
+			continue
+		} else if !hasAttribute(ce.c, it.path.Attribute) {
+			it.st = UnsupportedAttribute
+			continue
+		} else if isGlobalAttribute(it.path.Attribute) {
+			it.st = UnsupportedWrite
+			continue
+		}
+		allowed := h.s.allowed(ctx, it.path.Endpoint, it.path.Cluster, writePrivilege(ce.c, it.path.Attribute)) ||
+			(it.path.ListAppend && h.write != nil && hasConcretePath(h.write.auth, it.cpath))
+		if !allowed {
+			it.st = UnsupportedAccess
+			continue
+		}
+		if it.path.hasListIdx && !it.path.ListAppend {
+			it.st = UnsupportedWrite
+			continue
+		}
+		if it.hasVer && it.version != ce.version {
+			it.st = DataVersionMismatch
+			continue
+		}
+		if more && !it.path.hasListIdx && !hasConcretePath(chunkAuth, it.cpath) {
+			chunkAuth = append(chunkAuth, it.cpath)
+		}
+		it.ce = ce
+	}
+
+	ctx.Timed = timedFlag
+	w := tlv.NewWriter(h.s.buf[:0])
+	w.StartStruct(tlv.Anonymous)
+	w.StartArray(tlv.ContextTag(0))
+	for i := range items {
+		it := &items[i]
+		if it.st == Success {
+			ctx.Endpoint = it.path.Endpoint
+			dr := tlv.NewReader(it.data)
+			if dr.Next() != nil {
+				it.st = InvalidDataType
+			} else if it.st = it.ce.c.WriteAttribute(ctx, it.path.Attribute, it.path.ListAppend, dr); it.st == Success {
+				h.s.node.Changed(it.path.Endpoint, it.path.Cluster, it.path.Attribute)
+			}
+		}
+		w.StartStruct(tlv.Anonymous) // AttributeStatusIB
+		encodeAttributePath(w, tlv.ContextTag(0), it.cpath, it.path.ListAppend)
+		encodeStatusIB(w, tlv.ContextTag(1), it.st, nil)
+		w.EndContainer()
 	}
 	w.EndContainer()
 	w.PutUint(tlv.ContextTag(tagIMRevision), Revision)
@@ -847,66 +978,14 @@ func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status
 		return ResourceExhausted
 	}
 	ex.Send(now, message.ProtocolInteractionModel, OpWriteResponse, w.Bytes())
-	if !more {
+	if more {
+		if h.write == nil {
+			h.write = &writeState{timed: timedFlag}
+		}
+		h.write.auth = append(h.write.auth, chunkAuth...)
+	} else {
+		h.write = nil
 		ex.Close(now)
 	}
 	return Success
-}
-
-func (h *handler) writeOne(ctx *Context, w *tlv.Writer, r *tlv.Reader) error {
-	var (
-		path            AttributePath
-		version         uint32
-		hasPath, hasVer bool
-		data            []byte
-	)
-	err := structFields(r, func(r *tlv.Reader, tag uint8) (err error) {
-		switch tag {
-		case 0:
-			version, err = r.Uint32()
-			hasVer = true
-		case 1:
-			path, err = DecodeAttributePath(r)
-			hasPath = true
-		case 2:
-			data, err = r.RawElement()
-		}
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	if !hasPath || data == nil || path.IsWildcard() {
-		return InvalidAction
-	}
-	cpath := ConcretePath{path.Endpoint, path.Cluster, path.Attribute}
-	st := Success
-	var ce *clusterEntry
-	if e := h.s.node.Endpoint(path.Endpoint); e == nil {
-		st = UnsupportedEndpoint
-	} else if ce = e.entry(path.Cluster); ce == nil {
-		st = UnsupportedCluster
-	} else if !hasAttribute(ce.c, path.Attribute) {
-		st = UnsupportedAttribute
-	} else if isGlobalAttribute(path.Attribute) {
-		st = UnsupportedWrite
-	} else if !h.s.allowed(ctx, path.Endpoint, path.Cluster, writePrivilege(ce.c, path.Attribute)) {
-		st = UnsupportedAccess
-	} else if hasVer && version != ce.version {
-		st = DataVersionMismatch
-	}
-	if st == Success {
-		ctx.Endpoint = path.Endpoint
-		dr := tlv.NewReader(data)
-		if dr.Next() != nil {
-			st = InvalidDataType
-		} else if st = ce.c.WriteAttribute(ctx, path.Attribute, path.ListAppend, dr); st == Success {
-			h.s.node.Changed(path.Endpoint, path.Cluster, path.Attribute)
-		}
-	}
-	w.StartStruct(tlv.Anonymous) // AttributeStatusIB
-	encodeAttributePath(w, tlv.ContextTag(0), cpath, path.ListAppend)
-	encodeStatusIB(w, tlv.ContextTag(1), st, nil)
-	w.EndContainer()
-	return nil
 }

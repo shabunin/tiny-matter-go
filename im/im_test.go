@@ -361,6 +361,103 @@ func TestUnknownOpcode(t *testing.T) {
 	}
 }
 
+func encodeWriteListIndex(p im.AttributePath, listIdx uint16, val string) []byte {
+	w := tlv.NewWriter(nil)
+	w.StartStruct(tlv.Anonymous)
+	w.PutBool(tlv.ContextTag(0), false)
+	w.PutBool(tlv.ContextTag(1), false)
+	w.StartArray(tlv.ContextTag(2))
+	w.StartStruct(tlv.Anonymous)
+	w.StartList(tlv.ContextTag(1))
+	w.PutUint(tlv.ContextTag(2), uint64(p.Endpoint))
+	w.PutUint(tlv.ContextTag(3), uint64(p.Cluster))
+	w.PutUint(tlv.ContextTag(4), uint64(p.Attribute))
+	w.PutUint(tlv.ContextTag(5), uint64(listIdx))
+	w.EndContainer()
+	w.PutString(tlv.ContextTag(2), val)
+	w.EndContainer()
+	w.EndContainer()
+	w.PutBool(tlv.ContextTag(3), false)
+	w.EndContainer()
+	return w.Bytes()
+}
+
+func TestWriteSpecificListIndexRejected(t *testing.T) {
+	f := newFixture(t)
+	msgs := f.request(im.OpWriteRequest, encodeWriteListIndex(path(0, clusters.IDBasicInformation, 5), 0, "hacked"))
+	if len(msgs) != 1 || msgs[0].Opcode != im.OpWriteResponse {
+		t.Fatalf("got %+v", msgs)
+	}
+	res, err := im.DecodeWriteResponse(msgs[0].Payload)
+	if err != nil || len(res) != 1 || res[0].Status != im.UnsupportedWrite {
+		t.Fatalf("write specific ListIndex: %+v err=%v", res, err)
+	}
+	if f.basic.NodeLabel != "" {
+		t.Fatalf("NodeLabel modified to %q", f.basic.NodeLabel)
+	}
+}
+
+type timedTestClient struct {
+	msgs []exchange.Message
+}
+
+func (c *timedTestClient) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+	msg.Payload = bytes.Clone(msg.Payload)
+	c.msgs = append(c.msgs, msg)
+	if len(c.msgs) >= 3 {
+		ex.Close(now)
+	}
+}
+func (*timedTestClient) OnError(time.Time, *exchange.Exchange, error) {}
+
+func TestChunkedTimedWriteCannotBypassInvoke(t *testing.T) {
+	f := newFixture(t)
+	toggle := im.CommandPath{Endpoint: 1, Cluster: clusters.IDOnOff, Command: 2}
+	emptyChunk := func(timed, more bool) []byte {
+		w := tlv.NewWriter(nil)
+		w.StartStruct(tlv.Anonymous)
+		w.PutBool(tlv.ContextTag(1), timed)
+		w.StartArray(tlv.ContextTag(2))
+		w.EndContainer()
+		w.PutBool(tlv.ContextTag(3), more)
+		w.EndContainer()
+		return w.Bytes()
+	}
+
+	c := &timedTestClient{}
+	ex, _ := f.ctl.M.NewExchange(f.cs, c)
+	ex.Send(f.w.Now, message.ProtocolInteractionModel, im.OpTimedRequest, im.EncodeTimedRequest(10))
+	f.w.Advance(time.Millisecond)
+	ex.Send(f.w.Now, message.ProtocolInteractionModel, im.OpWriteRequest, emptyChunk(true, true))
+	f.w.Advance(time.Second) // past TimedRequest 10 ms deadline
+	// Attempting to switch mid-chunked-write to InvokeRequest(timed=true) must fail.
+	ex.Send(f.w.Now, message.ProtocolInteractionModel, im.OpInvokeRequest, im.EncodeInvokeRequest(toggle, true, nil))
+	f.w.Advance(time.Second)
+
+	if len(c.msgs) != 3 {
+		t.Fatalf("msgs=%d: %+v", len(c.msgs), c.msgs)
+	}
+	st, err := im.DecodeStatusResponse(c.msgs[2].Payload)
+	if err != nil || c.msgs[2].Opcode != im.OpStatusResponse || st != im.InvalidAction {
+		t.Fatalf("got opcode %#x status %#x err=%v, want InvalidAction", c.msgs[2].Opcode, st, err)
+	}
+	if f.onoff.On {
+		t.Fatal("OnOff toggled via chunked timed write bypass")
+	}
+}
+
+func TestReadMoreThanNinePaths(t *testing.T) {
+	f := newFixture(t)
+	paths := make([]im.AttributePath, 12)
+	for i := range paths {
+		paths[i] = path(2, 0xFFF1FC01, uint32(i))
+	}
+	reps := f.read(paths...)
+	if len(reps) != 12 {
+		t.Fatalf("got %d reports, want 12", len(reps))
+	}
+}
+
 func FuzzServer(f *testing.F) {
 	f.Add(uint8(im.OpReadRequest), im.EncodeReadRequest([]im.AttributePath{{AnyEndpoint: true, AnyCluster: true, AnyAttribute: true}}, false))
 	f.Add(uint8(im.OpInvokeRequest), im.EncodeInvokeRequest(im.CommandPath{Endpoint: 1, Cluster: 6, Command: 2}, false, nil))
