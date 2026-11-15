@@ -282,13 +282,14 @@ func (c *Conn) segment(now time.Time, b []byte) ([]byte, error) {
 		return nil, ErrSegment
 	}
 	flags, p := b[0], 1
-	if flags&(flagHandshake|flagMgmt) != 0 {
+	if flags&(flagHandshake|flagMgmt|0x90) != 0 ||
+		flags&(flagAck|flagStart|flagContinue|flagEnd) == 0 ||
+		flags&(flagStart|flagContinue) == flagStart|flagContinue {
 		return nil, ErrSegment
 	}
+	ackOff := 0
 	if flags&flagAck != 0 {
-		if err := c.ack(now, b[p]); err != nil {
-			return nil, err
-		}
+		ackOff = p
 		p++
 	}
 	if p >= len(b) {
@@ -299,13 +300,20 @@ func (c *Conn) segment(now time.Time, b []byte) ([]byte, error) {
 	if seq != c.rxNext {
 		return nil, ErrSequence
 	}
+	if ackOff > 0 {
+		if err := c.ack(now, b[ackOff]); err != nil {
+			return nil, err
+		}
+	}
 	c.rxNext++
 	c.rxNewest = seq
 	if !c.rxUnacked {
 		c.rxUnacked = true
 		c.sendAckAt = now.Add(SendAckDelay)
 	}
-	c.localWindow--
+	if c.localWindow > 0 {
+		c.localWindow--
+	}
 
 	if flags&(flagStart|flagContinue|flagEnd) == 0 {
 		return nil, nil // standalone acknowledgement

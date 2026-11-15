@@ -328,6 +328,21 @@ func TestImmediateAck(t *testing.T) {
 	if n, _ := drain(t, c, cen, t0); n != 1 || cen.rxNewest != 1 {
 		t.Fatal("no immediate ack")
 	}
+
+	// Exceeding the receive window without polling Poll must clamp localWindow
+	// at 0 instead of underflowing uint8 to 255.
+	c2, cen2 := connect(t, 247)
+	for i := 0; i < MaxWindow+2; i++ {
+		if _, err := c2.HandleWrite(t0, cen2.segments([]byte{byte(i)})[0]()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c2.localWindow != 0 {
+		t.Fatalf("localWindow = %d, want 0", c2.localWindow)
+	}
+	if n, _ := drain(t, c2, cen2, t0); n != 1 {
+		t.Fatalf("immediate ack after window exhausted = %d", n)
+	}
 }
 
 func TestBadSegments(t *testing.T) {
@@ -335,15 +350,18 @@ func TestBadSegments(t *testing.T) {
 		seg  func(cen *central) []byte
 		want error
 	}{
-		"seq":          {func(cen *central) []byte { return []byte{0x0D, 0, 7, 1, 0, 9} }, ErrSequence},
-		"ack-future":   {func(cen *central) []byte { return []byte{0x0D, 3, 0, 1, 0, 9} }, ErrAck},
-		"continue":     {func(cen *central) []byte { return []byte{0x0E, 0, 0, 9} }, ErrSegment},
-		"too-long":     {func(cen *central) []byte { return []byte{0x0D, 0, 0, 0xFF, 0xFF, 9} }, ErrTooLong},
-		"overflow":     {func(cen *central) []byte { return []byte{0x0D, 0, 0, 1, 0, 9, 9} }, ErrSegment},
-		"short-end":    {func(cen *central) []byte { return []byte{0x0D, 0, 0, 3, 0, 9} }, ErrSegment},
-		"management":   {func(cen *central) []byte { return []byte{0x25, 0, 0} }, ErrSegment},
-		"truncated":    {func(cen *central) []byte { return []byte{0x08, 0} }, ErrSegment},
-		"no-start-len": {func(cen *central) []byte { return []byte{0x01, 0} }, ErrSegment},
+		"seq":            {func(cen *central) []byte { return []byte{0x0D, 0, 7, 1, 0, 9} }, ErrSequence},
+		"ack-future":     {func(cen *central) []byte { return []byte{0x0D, 3, 0, 1, 0, 9} }, ErrAck},
+		"continue":       {func(cen *central) []byte { return []byte{0x0E, 0, 0, 9} }, ErrSegment},
+		"too-long":       {func(cen *central) []byte { return []byte{0x0D, 0, 0, 0xFF, 0xFF, 9} }, ErrTooLong},
+		"overflow":       {func(cen *central) []byte { return []byte{0x0D, 0, 0, 1, 0, 9, 9} }, ErrSegment},
+		"short-end":      {func(cen *central) []byte { return []byte{0x0D, 0, 0, 3, 0, 9} }, ErrSegment},
+		"management":     {func(cen *central) []byte { return []byte{0x25, 0, 0} }, ErrSegment},
+		"truncated":      {func(cen *central) []byte { return []byte{0x08, 0} }, ErrSegment},
+		"no-start-len":   {func(cen *central) []byte { return []byte{0x01, 0} }, ErrSegment},
+		"zero-flags":     {func(cen *central) []byte { return []byte{0x00, 0} }, ErrSegment},
+		"reserved-flags": {func(cen *central) []byte { return []byte{0x18, 0, 0} }, ErrSegment},
+		"start-continue": {func(cen *central) []byte { return []byte{0x03, 0, 1, 0, 9} }, ErrSegment},
 	} {
 		c, cen := connect(t, 247)
 		if _, err := c.HandleWrite(t0, tc.seg(cen)); !errors.Is(err, tc.want) {
