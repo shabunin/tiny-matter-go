@@ -249,6 +249,31 @@ func TestEcho(t *testing.T) {
 	if p.proto != protoICMP || p.body[0] != icmpEchoReply || checksum(p.body) != 0 || !bytes.Equal(p.body[4:], e[4:]) {
 		t.Fatalf("reply %+v", p)
 	}
+
+	// An oversized Echo Request (> MTU) is dropped instead of panicking.
+	big := make([]byte, MTU-ipHeaderLen+1)
+	big[0] = icmpEchoRequest
+	binary.BigEndian.PutUint16(big[2:], checksum(big))
+	s.HandleFrame(ipFrame(peerMAC, ourMAC, peerIP, ourIP, protoICMP, big))
+	if f := w.take(); len(f) != 0 {
+		t.Fatalf("oversized echo generated %d frames", len(f))
+	}
+}
+
+func TestHostPrefix32(t *testing.T) {
+	w := &wire{}
+	s := New(ourMAC, w.send)
+	s.SetAddr(netip.MustParsePrefix("192.168.2.50/32"), gwIP)
+	w.take()
+	if s.subnetBroadcast().IsValid() {
+		t.Fatalf("expected no subnet broadcast for /32, got %v", s.subnetBroadcast())
+	}
+	if _, ok := s.lookup(ourIP); ok {
+		t.Fatal("own /32 address treated as broadcast MAC")
+	}
+	if err := s.SendUDP(1234, netip.AddrPortFrom(peerIP, 5540), []byte("hi")); err != ErrNoNeighbor {
+		t.Fatalf("got %v want ErrNoNeighbor (ARP for gateway)", err)
+	}
 }
 
 // fakeDHCP answers a client's messages like a home router.

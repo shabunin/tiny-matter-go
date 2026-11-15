@@ -135,6 +135,28 @@ func TestMulticastJoinAndEcho(t *testing.T) {
 	if icmp[0] != icmpEchoReply || string(icmp[8:]) != "ping" || checksum(p.b.Addr(), p.a.Addr(), protoICMPv6, icmp) != 0 {
 		t.Fatalf("bad echo reply % x", icmp)
 	}
+
+	// An oversized Echo Request (> MTU) is dropped instead of panicking.
+	p.queue = nil
+	bodyLen := MTU - ipHeaderLen + 1
+	big := make([]byte, ethHeaderLen+ipHeaderLen+bodyLen)
+	bMAC, aMAC := p.b.MAC(), p.a.MAC()
+	copy(big[0:6], bMAC[:])
+	copy(big[6:12], aMAC[:])
+	binary.BigEndian.PutUint16(big[12:], etherTypeIP6)
+	ip := big[ethHeaderLen:]
+	ip[0], ip[6], ip[7] = 0x60, protoICMPv6, 64
+	binary.BigEndian.PutUint16(ip[4:], uint16(bodyLen))
+	src, dst := p.a.Addr().As16(), p.b.Addr().As16()
+	copy(ip[8:24], src[:])
+	copy(ip[24:40], dst[:])
+	icmpReq := ip[ipHeaderLen:]
+	icmpReq[0] = icmpEchoRequest
+	binary.BigEndian.PutUint16(icmpReq[2:], checksum(p.a.Addr(), p.b.Addr(), protoICMPv6, icmpReq))
+	p.b.HandleFrame(big)
+	if len(p.queue) != 0 {
+		t.Fatalf("oversized echo generated %d frames", len(p.queue))
+	}
 }
 
 func TestMLDReport(t *testing.T) {

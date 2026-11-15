@@ -186,7 +186,7 @@ func (s *Stack) HandleFrame(frame []byte) {
 		return
 	}
 	plen := int(binary.BigEndian.Uint16(p[4:]))
-	if plen > len(p)-ipHeaderLen {
+	if plen > len(p)-ipHeaderLen || plen > MTU-ipHeaderLen {
 		return
 	}
 	p = p[:ipHeaderLen+plen]

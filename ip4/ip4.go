@@ -203,7 +203,7 @@ func (s *Stack) Listen(port uint16, h UDPHandler) error {
 }
 
 func (s *Stack) subnetBroadcast() netip.Addr {
-	if !s.prefix.IsValid() {
+	if !s.prefix.IsValid() || s.prefix.Bits() >= 31 {
 		return netip.Addr{}
 	}
 	a := s.prefix.Addr().As4()
@@ -249,7 +249,7 @@ func (s *Stack) HandleFrame(frame []byte) {
 	}
 	ihl := int(p[0]&15) * 4
 	total := int(binary.BigEndian.Uint16(p[2:]))
-	if ihl < ipHeaderLen || total < ihl || total > len(p) || checksum(p[:ihl]) != 0 {
+	if ihl < ipHeaderLen || total < ihl || total > len(p) || total > MTU || checksum(p[:ihl]) != 0 {
 		return
 	}
 	if binary.BigEndian.Uint16(p[6:])&0x3fff != 0 {
@@ -287,7 +287,7 @@ func (s *Stack) HandleFrame(frame []byte) {
 			}
 		}
 	case protoICMP:
-		if len(body) >= 8 && body[0] == icmpEchoRequest && dst == s.addr && checksum(body) == 0 {
+		if len(body) >= 8 && len(body) <= MTU-ipHeaderLen && body[0] == icmpEchoRequest && dst == s.addr && checksum(body) == 0 {
 			out := s.ipPacket(src, protoICMP, len(body), defaultTTL)
 			copy(out, body)
 			out[0], out[2], out[3] = icmpEchoReply, 0, 0
@@ -404,7 +404,9 @@ func (s *Stack) lookup(ip netip.Addr) ([6]byte, bool) {
 	switch {
 	case ip.IsMulticast():
 		return groupMAC(ip), true
-	case ip == Broadcast || ip == s.subnetBroadcast():
+	case ip == Broadcast:
+		return broadcastMAC, true
+	case s.subnetBroadcast().IsValid() && ip == s.subnetBroadcast():
 		return broadcastMAC, true
 	}
 	for _, n := range s.neighbors {
