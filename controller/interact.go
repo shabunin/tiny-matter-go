@@ -109,6 +109,16 @@ func sendStatus(now time.Time, ex *exchange.Exchange, st im.Status) error {
 	return ex.Send(now, message.ProtocolInteractionModel, im.OpStatusResponse, im.EncodeStatusResponse(st))
 }
 
+func waitTimeout(ctx context.Context) time.Duration {
+	timeout := responseTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if d := time.Until(dl); d > timeout {
+			timeout = d
+		}
+	}
+	return timeout
+}
+
 // run starts r on s and waits for it to finish.
 func (c *Controller) run(ctx context.Context, s *exchange.Session, r *request) error {
 	res := make(chan error, 1)
@@ -123,7 +133,7 @@ func (c *Controller) run(ctx context.Context, s *exchange.Session, r *request) e
 	if err != nil {
 		return err
 	}
-	timer := time.NewTimer(responseTimeout)
+	timer := time.NewTimer(waitTimeout(ctx))
 	defer timer.Stop()
 	select {
 	case err := <-res:
@@ -132,7 +142,14 @@ func (c *Controller) run(ctx context.Context, s *exchange.Session, r *request) e
 	case <-timer.C:
 	}
 	// Give up: close the exchange; a late response is dropped.
-	c.do(func(now time.Time) { r.end(now, errResponseTimeout) })
+	if err := c.do(func(now time.Time) { r.end(now, errResponseTimeout) }); err != nil {
+		select {
+		case err := <-res:
+			return err
+		default:
+			return err
+		}
+	}
 	if err := <-res; err != errResponseTimeout {
 		return err
 	}
@@ -291,14 +308,15 @@ type SubscribeOptions struct {
 // Subscription is a subscription to a node that re-subscribes when it is
 // lost.
 type Subscription struct {
-	c      *Controller
-	node   uint64
-	q      im.Request
-	opts   SubscribeOptions
-	ctx    context.Context
-	cancel context.CancelFunc
-	queue  chan func()
-	done   chan struct{}
+	c           *Controller
+	node        uint64
+	q           im.Request
+	opts        SubscribeOptions
+	ctx         context.Context
+	cancel      context.CancelFunc
+	queue       chan func()
+	done        chan struct{}
+	deliverDone chan struct{}
 }
 
 // subState is an established subscription (loop goroutine).
@@ -319,13 +337,13 @@ func (c *Controller) Subscribe(ctx context.Context, node uint64, q im.Request, o
 		opts.MaxInterval = 60
 	}
 	sub := &Subscription{c: c, node: node, q: q, opts: opts,
-		queue: make(chan func(), 256), done: make(chan struct{})}
+		queue: make(chan func(), 256), done: make(chan struct{}), deliverDone: make(chan struct{})}
 	sub.ctx, sub.cancel = context.WithCancel(context.Background())
 	go sub.deliver()
 	st, err := sub.establish(ctx)
 	if err != nil {
 		sub.cancel()
-		close(sub.queue)
+		<-sub.deliverDone
 		return nil, err
 	}
 	go sub.keep(st)
@@ -336,12 +354,19 @@ func (c *Controller) Subscribe(ctx context.Context, node uint64, q im.Request, o
 func (s *Subscription) Close() {
 	s.cancel()
 	<-s.done
+	<-s.deliverDone
 }
 
 // deliver runs the callbacks in order.
 func (s *Subscription) deliver() {
-	for f := range s.queue {
-		f()
+	defer close(s.deliverDone)
+	for {
+		select {
+		case f := <-s.queue:
+			f()
+		case <-s.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -393,7 +418,7 @@ func (s *Subscription) establish(ctx context.Context) (*subState, error) {
 // backing off while that fails.
 func (s *Subscription) keep(st *subState) {
 	defer func() {
-		close(s.queue)
+		s.cancel()
 		close(s.done)
 	}()
 	for {
@@ -405,6 +430,8 @@ func (s *Subscription) keep(st *subState) {
 		case <-s.ctx.Done():
 			s.c.do(func(time.Time) { delete(s.c.subs, st.id) })
 			return
+		case <-s.c.done:
+			return
 		}
 		for backoff := time.Second; ; backoff = min(2*backoff, 30*time.Second) {
 			var err error
@@ -414,9 +441,17 @@ func (s *Subscription) keep(st *subState) {
 				}
 				break
 			}
+			if errors.Is(err, ErrClosed) {
+				return
+			}
+			t := time.NewTimer(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-t.C:
 			case <-s.ctx.Done():
+				t.Stop()
+				return
+			case <-s.c.done:
+				t.Stop()
 				return
 			}
 		}

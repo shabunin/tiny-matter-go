@@ -71,8 +71,9 @@ var ErrUnknownNode = errors.New("controller: unknown node")
 type Controller struct {
 	opts Options
 
-	mu sync.Mutex // guards st
-	st *state
+	mu        sync.Mutex // guards st and reserving
+	st        *state
+	reserving map[uint64]struct{}
 
 	rootKey *p256.PrivateKey
 	root    *credentials.Cert
@@ -519,4 +520,39 @@ func (c *Controller) CloseSessions(id uint64) {
 			}
 		}
 	})
+}
+
+func (c *Controller) reserveNodeID(requested uint64) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	inUse := func(id uint64) bool {
+		if id == 0 || c.st.node(id) != nil {
+			return true
+		}
+		_, busy := c.reserving[id]
+		return busy
+	}
+	id := requested
+	if id == 0 {
+		for inUse(c.st.NextNodeID) {
+			c.st.NextNodeID++
+		}
+		id = c.st.NextNodeID
+		c.st.NextNodeID++
+	} else if c.st.node(id) != nil {
+		return 0, fmt.Errorf("controller: node %d exists", id)
+	} else if _, busy := c.reserving[id]; busy {
+		return 0, fmt.Errorf("controller: node %d is being commissioned", id)
+	}
+	if c.reserving == nil {
+		c.reserving = make(map[uint64]struct{})
+	}
+	c.reserving[id] = struct{}{}
+	return id, nil
+}
+
+func (c *Controller) releaseNodeID(id uint64) {
+	c.mu.Lock()
+	delete(c.reserving, id)
+	c.mu.Unlock()
 }

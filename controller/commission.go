@@ -127,16 +127,11 @@ func (c *Controller) Commission(ctx context.Context, p *onboarding.Payload, opts
 	if opts.BLE && !findable {
 		return nil, errUnfindable
 	}
-	id := opts.NodeID
-	c.mu.Lock()
-	if id == 0 {
-		id = c.st.nextNodeID()
-		c.st.NextNodeID++ // reserved; saved once the node is commissioned
-	} else if c.st.node(id) != nil {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("controller: node %d exists", id)
+	id, err := c.reserveNodeID(opts.NodeID)
+	if err != nil {
+		return nil, err
 	}
-	c.mu.Unlock()
+	defer c.releaseNodeID(id)
 
 	hasNetwork := opts.WiFi != nil || opts.Thread != nil
 	ps, link, err := c.reach(ctx, p, opts, func() error {

@@ -430,3 +430,88 @@ func readOnOffOK(ctx context.Context, c *controller.Controller, node uint64) boo
 	rep, err := c.Read(ctx, node, im.Request{Attributes: []im.AttributePath{onOffPath}})
 	return err == nil && len(rep.Attributes) == 1 && rep.Attributes[0].Status == im.Success
 }
+
+type silentDropGATT struct {
+	controller.GATT
+	values chan []byte
+	done   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	writes int
+}
+
+func newSilentDropGATT(inner controller.GATT) *silentDropGATT {
+	g := &silentDropGATT{
+		GATT:   inner,
+		values: make(chan []byte),
+		done:   make(chan struct{}),
+	}
+	go func() {
+		for {
+			select {
+			case v := <-inner.Values():
+				select {
+				case g.values <- v:
+				case <-g.done:
+					return
+				}
+			case <-g.done:
+				return
+			}
+		}
+	}()
+	return g
+}
+
+func (g *silentDropGATT) Values() <-chan []byte { return g.values }
+func (g *silentDropGATT) Done() <-chan struct{} { return g.done }
+
+func (g *silentDropGATT) Close() error {
+	g.once.Do(func() { close(g.done) })
+	return g.GATT.Close()
+}
+
+func (g *silentDropGATT) Write(ctx context.Context, b []byte) error {
+	g.mu.Lock()
+	g.writes++
+	n := g.writes
+	g.mu.Unlock()
+	// After handshake + PASE + first IM request have exchanged, blackhole write #6
+	// and close Done() 20 ms later to simulate sudden radio disconnect.
+	if n == 6 {
+		time.AfterFunc(20*time.Millisecond, func() { g.once.Do(func() { close(g.done) }) })
+		return nil
+	}
+	return g.GATT.Write(ctx, b)
+}
+
+type silentDropBluetooth struct {
+	controller.Bluetooth
+}
+
+func (b silentDropBluetooth) Connect(ctx context.Context, dev controller.BLEDevice) (controller.GATT, error) {
+	g, err := b.Bluetooth.Connect(ctx, dev)
+	if err != nil {
+		return nil, err
+	}
+	return newSilentDropGATT(g), nil
+}
+
+func TestBLEDisconnectEndsRequestImmediately(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, wifiNetwork, p)
+	bt := silentDropBluetooth{&fakeBluetooth{d: d, p: p, discriminator: 3840}}
+	c := openBLEController(t, bt)
+
+	start := time.Now()
+	_, err := c.ScanNetworks(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{BLE: true})
+	if err == nil {
+		t.Fatal("ScanNetworks succeeded despite BLE drop")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("ScanNetworks took %v after BLE disconnect, want immediate abort", elapsed)
+	}
+}

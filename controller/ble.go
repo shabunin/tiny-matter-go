@@ -248,6 +248,8 @@ func (l *bleLink) send(pkt []byte) error {
 	select {
 	case <-l.done:
 		return errLinkClosed
+	case <-l.quit:
+		return errLinkClosed
 	default:
 	}
 	select {
@@ -261,8 +263,15 @@ func (l *bleLink) send(pkt []byte) error {
 func (l *bleLink) run() {
 	defer func() {
 		l.gatt.Close()
+		l.c.do(func(now time.Time) {
+			delete(l.c.links, l.addr)
+			for _, s := range l.c.m.Sessions() {
+				if s.Peer == l.addr {
+					l.c.m.CloseSession(now, s)
+				}
+			}
+		})
 		close(l.done)
-		l.c.do(func(time.Time) { delete(l.c.links, l.addr) })
 	}()
 	var pending [][]byte
 	timer := time.NewTimer(time.Hour)

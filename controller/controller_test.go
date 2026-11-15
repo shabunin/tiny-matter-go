@@ -369,3 +369,45 @@ func TestOpenWindowForSecondAdmin(t *testing.T) {
 		t.Error("toggled twice: want off")
 	}
 }
+
+func TestControllerCloseWithActiveSubscription(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	d := startDevice(t)
+	c := openController(t, t.TempDir())
+
+	n, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{Addr: d.addr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan struct{}, 1)
+	sub, err := c.Subscribe(ctx, n.ID, im.Request{Attributes: []im.AttributePath{{Endpoint: 1, Cluster: 0x0006, Attribute: 0}}},
+		controller.SubscribeOptions{MinInterval: 0, MaxInterval: 5, OnReport: func(*im.ReportData) {
+			select {
+			case got <- struct{}{}:
+			default:
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-got
+
+	// Closing the controller without closing the subscription first must cleanly
+	// terminate Subscription.keep and allow sub.Close() to return promptly.
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		sub.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscription did not exit after Controller.Close")
+	}
+}
