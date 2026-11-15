@@ -2,8 +2,8 @@
 
 A Matter device stack in Go that targets TinyGo on microcontrollers. It
 implements commissioning (PASE, attestation, operational credentials, CASE),
-the Interaction Model (read, write, invoke, subscribe, events), multi-admin, BLE commissioning (BTP) with Network Commissioning for Wi-Fi,
-and its own small IPv6/IPv4/mDNS networking over raw Ethernet frames, so it runs on
+the Interaction Model (read, write, invoke, subscribe, events), multi-admin, BLE commissioning (BTP) with Network Commissioning for Wi-Fi
+(and Thread datasets, short of a Thread radio), and its own small IPv6/IPv4/mDNS networking over raw Ethernet frames, so it runs on
 bare-metal Wi-Fi chips without an OS network stack. Everything is sans-IO,
 allocation-conscious and safe on 32-bit targets.
 
@@ -29,6 +29,7 @@ waits to be given a network:
     tinygo flash -target esp32s3-generic -port /dev/ttyACM0 ./esp32s3-light
     chip-tool pairing ble-wifi 1 YOUR_SSID YOUR_PASSWORD 20202021 3840
     # or, with this project's controller (see below):
+    tmctl scan 34970112332                  # the networks it sees
     TMCTL_WIFI_PASSWORD=YOUR_PASSWORD tmctl commission 34970112332 -ssid YOUR_SSID
 
 Or compile the credentials in and commission over the IP network:
@@ -73,7 +74,9 @@ or Bluetooth LE, and works with them:
     tmctl discover                          # devices in commissioning mode
     tmctl commission 34970112332 -label lamp
     tmctl discover -ble                     # also those advertising over BLE
+    tmctl scan 34970112332                  # networks a device in commissioning mode sees
     TMCTL_WIFI_PASSWORD=... tmctl commission 34970112332 -ssid MyWiFi -label lamp
+    TMCTL_THREAD_DATASET=$(ot-ctl dataset active -x | head -1) tmctl commission MT:... -thread
     tmctl invoke lamp 1 OnOff Toggle
     tmctl read lamp 1 OnOff onOff
     tmctl write lamp 0 BasicInformation NodeLabel "desk lamp"
@@ -89,12 +92,21 @@ BasicInformation), or by number; `tmctl clusters [cluster]` lists them.
 Lists and structs are written as JSON. Subscriptions come back by
 themselves after the device restarts.
 
-With `-ssid`, the device is found over Bluetooth LE, commissioned over
-BTP, given the Wi-Fi network (Network Commissioning) and told to join it,
-then reached on the IP network for CASE and CommissioningComplete; `-ble`
-alone commissions over BLE a device that is on the network already.
-Bluetooth goes through BlueZ over the D-Bus system bus (Linux). Thread
-networks are not supported.
+`commission` and `scan` look for the device with mDNS and over Bluetooth
+LE at once (unless its QR code says it is not on BLE). A device on the IP
+network is commissioned there and keeps its network. One found only over
+BLE is commissioned over BTP if there is a network to give it: Wi-Fi with
+`-ssid` (password from `-password` or `$TMCTL_WIFI_PASSWORD`), or Thread
+with `-thread` and the operational dataset in hex, as `ot-ctl dataset
+active -x` prints it (`-dataset` or `$TMCTL_THREAD_DATASET`). The device
+is told to join the network (Network Commissioning), then reached on the
+IP network for CASE and CommissioningComplete. `-ble` reaches the device
+over BLE only, also one that is on a network already; with an address,
+that is where it will be on the network. `scan` asks a device in
+commissioning mode which networks it sees (ScanNetworks) and leaves it
+uncommissioned. Bluetooth goes through BlueZ over the D-Bus system bus
+(Linux). A Thread device is reached through a Thread border router on the
+host's network; that has not been tried with real Thread hardware yet.
 
 Device attestation is verified against the production PAAs of the Matter
 Distributed Compliance Ledger, which are built in (see Third-party data),
@@ -107,7 +119,7 @@ there, for example `chip-tool pairing open-commissioning-window <node> 1
 600 1000 3840`, whose code goes to `tmctl commission`.
 
 Tested against the devices here (over BLE, the Cardputer is commissioned
-onto Wi-Fi in about 25 s, most of it spent joining the network), a
+onto Wi-Fi in 13 to 25 s, most of it spent joining the network), a
 [matter.js](https://github.com/matter-js/matter.js) device, and chip-tool,
 which commissions devices through windows `tmctl open-window` opens; the
 production trust store was checked against a commercial device's
@@ -127,7 +139,7 @@ attestation chain and certification declaration.
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
 | `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; events (a compact log per priority, event reads with filters, urgent and batched event reports, fabric-sensitive events); data model of endpoints and clusters with global attributes |
-| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), On/Off, Identify, Switch (momentary, with long press) |
+| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi or Thread, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), On/Off, Identify, Switch (momentary, with long press) |
 | `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
 | `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
@@ -137,13 +149,14 @@ attestation chain and certification declaration.
 | `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies; a `dnssd.Advertiser`) and querier (browse, resolve, cache) |
 | `onboarding/` | Onboarding payloads: QR codes (`MT:` base-38) and 11/21-digit manual pairing codes (Verhoeff check digit) |
 | `credentials/attestation/` | Device attestation for commissioners: DAC/PAI/PAA chain, certification declaration (CMS, CSA and SDK test signing keys), attestation and NOCSR signatures; PAA trust stores, with the production and SDK test PAAs built in |
-| `controller/` | Matter controller for hosts: own fabric (persisted), mDNS and BLE discovery, commissioning over IP or BLE (PASE, attestation, CSR, NOC, Wi-Fi network provisioning, CASE), read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal |
+| `controller/` | Matter controller for hosts: own fabric (persisted), mDNS and BLE discovery, commissioning over IP or BLE, chosen by where the device is found (PASE, attestation, CSR, NOC, Wi-Fi or Thread network provisioning, CASE), network scans, read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal |
 | `cmd/tmctl/` | Command-line controller over `controller` (see above) |
+| `thread/` | Thread operational datasets: parsing and checking the TLVs a commissioner hands a device |
 | `internal/dbus/` | Minimal D-Bus client: wire format by signature, system bus connection (EXTERNAL auth), method calls, signals |
 | `internal/bluez/` | BLE central over BlueZ's D-Bus API: LE discovery with service data, connect, GATT writes and indications for the Matter service |
 | `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, Wi-Fi networks, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
 | `cmd/hostdevice/` | An on/off light and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool and matter.js commission and control it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
