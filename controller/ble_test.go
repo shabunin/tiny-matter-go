@@ -358,6 +358,74 @@ func TestAutoBLE(t *testing.T) {
 	}
 }
 
+func TestScanNetworks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, wifiNetwork, p)
+	d.do(func() {
+		d.dev.Net.Scan = func(ctx *im.Context, ssid []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
+			return []clusters.WiFiScanResult{
+				{Security: clusters.WiFiWPA2, SSID: []byte("home"), BSSID: [6]byte{1, 2, 3, 4, 5, 6}, Channel: 6, RSSI: -40},
+				{Security: clusters.WiFiWPA2 | clusters.WiFiWPA3, SSID: []byte("upstairs"), Channel: 36,
+					Band: clusters.WiFiBand5G, RSSI: -71},
+			}, clusters.NetworkOK
+		}
+	})
+	bt := &fakeBluetooth{d: d, p: p, discriminator: 3840}
+	c := openBLEController(t, bt)
+	code := &onboarding.Payload{Passcode: passcode, Discriminator: 3840}
+	scan, err := c.ScanNetworks(ctx, code, controller.CommissionOptions{BLE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scan.Interface != "Wi-Fi" || len(scan.WiFi) != 2 || string(scan.WiFi[0].SSID) != "home" ||
+		scan.WiFi[0].BSSID != [6]byte{1, 2, 3, 4, 5, 6} || scan.WiFi[0].Channel != 6 || scan.WiFi[0].RSSI != -40 ||
+		string(scan.WiFi[1].SSID) != "upstairs" || scan.WiFi[1].Security != 0x18 || scan.WiFi[1].Band != 2 {
+		t.Fatalf("scan = %+v", scan)
+	}
+	// The device is left as it was: no fail-safe, no fabric, and it can
+	// be commissioned over a new connection.
+	var armed bool
+	d.do(func() { armed = d.dev.FailSafe.Armed(time.Now()) })
+	if armed || d.fabrics() != 0 {
+		t.Fatalf("after the scan: fail-safe armed %v, %d fabrics", armed, d.fabrics())
+	}
+	joinOnConnect(d, p)
+	if _, err := c.Commission(ctx, code, controller.CommissionOptions{BLE: true, Addr: d.addr(),
+		WiFi: &controller.WiFiNetwork{SSID: []byte("home"), Password: []byte("secret123")}}); err != nil {
+		t.Fatal(err)
+	}
+	if bt.connects != 2 {
+		t.Errorf("%d connections", bt.connects)
+	}
+}
+
+func TestScanNetworksThread(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	p := newBLEPeripheral()
+	d := startDeviceWith(t, threadNetwork, p)
+	d.do(func() {
+		d.dev.Net.ScanThread = func(ctx *im.Context) ([]clusters.ThreadScanResult, clusters.NetworkingStatus) {
+			return []clusters.ThreadScanResult{{PANID: 0x1234, ExtendedPANID: 0xDEAD00BEEF00CAFE,
+				NetworkName: "OpenThread-1234", Channel: 15, Version: 4, ExtendedAddress: [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+				RSSI: -60, LQI: 3}}, clusters.NetworkOK
+		}
+	})
+	c := openBLEController(t, &fakeBluetooth{d: d, p: p, discriminator: 3840})
+	scan, err := c.ScanNetworks(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{BLE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := controller.ThreadScanResult{PANID: 0x1234, ExtendedPANID: 0xDEAD00BEEF00CAFE, NetworkName: "OpenThread-1234",
+		Channel: 15, Version: 4, ExtendedAddress: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}, RSSI: -60, LQI: 3}
+	if scan.Interface != "Thread" || len(scan.Thread) != 1 || scan.Thread[0] != want || len(scan.WiFi) != 0 {
+		t.Fatalf("scan = %+v", scan)
+	}
+}
+
 func readOnOffOK(ctx context.Context, c *controller.Controller, node uint64) bool {
 	rep, err := c.Read(ctx, node, im.Request{Attributes: []im.AttributePath{onOffPath}})
 	return err == nil && len(rep.Attributes) == 1 && rep.Attributes[0].Status == im.Success
