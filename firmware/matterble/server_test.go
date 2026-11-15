@@ -202,6 +202,22 @@ func TestServer(t *testing.T) {
 	}
 }
 
+func TestConnectAndHandshakeInOnePoll(t *testing.T) {
+	s, f, got := setup(t)
+	s.Advertise(true)
+	f.event(0x3E, 0x01, 0, 0x40, 0, 1, 0, 1, 2, 3, 4, 5, 6, 24, 0, 0, 0, 0x48, 0, 0)
+	f.att(writeReq(hC1, []byte{0x65, 0x6C, 0x04, 0, 0, 0, 0, 0, 6}))
+	f.att(writeReq(hCCCD, []byte{1, 0}))
+	s.Poll(time.Unix(1000, 0), func(msg []byte) { *got = append(*got, append([]byte(nil), msg...)) })
+	if !s.Connected() {
+		t.Fatal("not connected")
+	}
+	a := f.takeACL()
+	if len(a) != 3 || a[2][0] != 0x1B || binary.LittleEndian.Uint16(a[2][1:]) != hC2 {
+		t.Fatalf("expected handshake notification in same Poll batch, got % x", a)
+	}
+}
+
 func TestTransportReassembly(t *testing.T) {
 	f := &fakeController{t: t, fragSize: 5}
 	tr := NewTransport(f)

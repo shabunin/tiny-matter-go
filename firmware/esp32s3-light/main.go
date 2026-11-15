@@ -46,6 +46,7 @@ import (
 	"machine"
 	"net/netip"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"firmware/matterble"
@@ -239,10 +240,10 @@ func main() {
 	var (
 		stack  *ip6.Stack
 		ipv4   netip.Addr
-		linkUp bool
+		linkUp atomic.Bool
 	)
 	d.Diagnostics.Interfaces = func() []clusters.NetworkInterface {
-		ni := clusters.NetworkInterface{Name: "wlan0", Operational: linkUp,
+		ni := clusters.NetworkInterface{Name: "wlan0", Operational: linkUp.Load(),
 			HardwareAddress: mac[:], Type: clusters.InterfaceWiFi}
 		if stack != nil {
 			ni.IPv6 = []netip.Addr{stack.Addr()}
@@ -302,20 +303,20 @@ func main() {
 	}
 	params := espradio.STAConfig{SSID: string(nw.SSID), Password: string(nw.Credentials)}
 	link := espradio.Link{Config: radioCfg}
-	reconnected := false
+	var reconnected, linkChanged atomic.Bool
 	link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
 		println("wifi link connected:", connected)
-		linkUp = connected
+		linkUp.Store(connected)
+		linkChanged.Store(true)
 		if !connected {
-			d.Net.SetConnected(d.Node, nil)
 			return 3, params
 		}
-		d.Net.SetConnected(d.Node, nw.SSID)
-		reconnected = true
+		reconnected.Store(true)
 		return 0, espradio.STAConfig{}
 	})
 	joinStart := time.Now()
 	for {
+		u.poll(time.Now())
 		err := link.LinkConnect(params)
 		if err == nil {
 			break
@@ -325,9 +326,14 @@ func main() {
 			println("cannot join the provisioned network: restarting")
 			restart()
 		}
-		time.Sleep(3 * time.Second)
+		for i := 0; i < 60; i++ {
+			u.poll(time.Now())
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
-	linkUp = true
+	linkUp.Store(true)
+	linkChanged.Store(false)
+	reconnected.Store(false)
 	d.Net.SetConnected(d.Node, nw.SSID)
 	d.Net.SetLastConnect(d.Node, nw.SSID, clusters.NetworkOK, 0, false)
 	nd := link.NetDev()
@@ -401,8 +407,14 @@ func main() {
 			stack4.HandleFrame(f)
 		}
 		now := time.Now()
-		if reconnected {
-			reconnected = false
+		if linkChanged.Swap(false) {
+			if linkUp.Load() {
+				d.Net.SetConnected(d.Node, nw.SSID)
+			} else {
+				d.Net.SetConnected(d.Node, nil)
+			}
+		}
+		if reconnected.Swap(false) {
 			stack.ReportGroups()
 			stack4.ReportGroups()
 			stack4.RenewDHCP()

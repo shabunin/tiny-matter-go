@@ -207,36 +207,11 @@ func (b *Server) Close(now time.Time) {
 // messages from the central.
 func (b *Server) Poll(now time.Time, deliver func(msg []byte)) {
 	for i := 0; i < 16; i++ {
-		if b.st.ATT.Poll() != nil {
+		err := b.st.ATT.Poll()
+		b.pollConnectionEvents(now)
+		if err != nil {
 			break
 		}
-	}
-	h := b.st.HCI
-	if h.HasConnection() {
-		cp, _ := h.Connection()
-		c := *cp // ClearConnection zeroes the event
-		h.ClearConnection()
-		if c.Status == 0 {
-			b.connected, b.handle, b.closing = true, c.Handle, false
-			b.advOn = false // the controller stops advertising on connection
-			b.cccd, b.writes, b.logged = 0, b.writes[:0], false
-			b.conn.Reset(maxATTMTU)
-			logf("ble: connected")
-			// Ask for a long supervision timeout: the link must outlive the
-			// CPU stalls of PASE and CASE computations, during which the
-			// controller may miss connection events.
-			b.paramsAt = now.Add(300 * time.Millisecond)
-		}
-	}
-	if h.HasDisconnection() {
-		dc, _ := h.Disconnection()
-		reason := int(dc.Reason)
-		h.ClearConnection()
-		if b.connected {
-			logf("ble: disconnected, reason", reason)
-		}
-		b.connected, b.closing = false, false
-		b.conn.Reset(maxATTMTU)
 	}
 	if !b.connected {
 		return
@@ -290,6 +265,37 @@ func (b *Server) Poll(now time.Time, deliver func(msg []byte)) {
 	}
 	if b.conn.Closed() || b.closing && (b.conn.Flushed() || !now.Before(b.closeBy)) {
 		b.drop()
+	}
+}
+
+func (b *Server) pollConnectionEvents(now time.Time) {
+	h := b.st.HCI
+	if h.HasConnection() {
+		cp, _ := h.Connection()
+		c := *cp // ClearConnection zeroes the event
+		h.ClearConnection()
+		if c.Status == 0 {
+			b.connected, b.handle, b.closing = true, c.Handle, false
+			b.advOn = false // the controller stops advertising on connection
+			b.cccd, b.writes, b.subscribe, b.logged = 0, b.writes[:0], false, false
+			b.conn.Reset(maxATTMTU)
+			logf("ble: connected")
+			// Ask for a long supervision timeout: the link must outlive the
+			// CPU stalls of PASE and CASE computations, during which the
+			// controller may miss connection events.
+			b.paramsAt = now.Add(300 * time.Millisecond)
+		}
+	}
+	if h.HasDisconnection() {
+		dc, _ := h.Disconnection()
+		reason := int(dc.Reason)
+		h.ClearConnection()
+		if b.connected {
+			logf("ble: disconnected, reason", reason)
+		}
+		b.connected, b.closing = false, false
+		b.cccd, b.writes, b.subscribe, b.paramsAt = 0, b.writes[:0], false, time.Time{}
+		b.conn.Reset(maxATTMTU)
 	}
 }
 
