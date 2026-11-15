@@ -9,6 +9,7 @@ import (
 // Cluster IDs.
 const (
 	IDIdentify               = 0x0003
+	IDGroups                 = 0x0004
 	IDOnOff                  = 0x0006
 	IDDescriptor             = 0x001D
 	IDAccessControl          = 0x001F

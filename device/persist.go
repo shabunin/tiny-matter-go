@@ -20,6 +20,8 @@ import (
 //	   SSIDs and passphrases, or Thread extended PAN IDs and datasets
 //	6: first event number after a restart (reserved before it)
 //	7: reboot count
+//	8: groups: key sets, the group key map and the group table (see
+//	   clusters.GroupData.Encode)
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -69,6 +71,12 @@ func (d *Device) encodeState() []byte {
 	if d.Diagnostics.RebootCount != 0 {
 		w.PutUint(tlv.ContextTag(7), uint64(d.Diagnostics.RebootCount))
 	}
+	if len(d.Groups.KeySets) > 0 || len(d.Groups.KeyMap) > 0 || len(d.Groups.Groups) > 0 {
+		d.Groups.Encode(w, tlv.ContextTag(8), func(index uint8) bool {
+			f := d.Fabrics.Get(index)
+			return f != nil && !f.Pending
+		})
+	}
 	w.EndContainer()
 	return w.Bytes()
 }
@@ -109,6 +117,8 @@ func (d *Device) decodeState(b []byte) error {
 			v, err := r.Uint16()
 			d.Diagnostics.RebootCount = v
 			return err
+		case 8:
+			return d.Groups.Decode(r)
 		}
 		return nil
 	})
@@ -213,6 +223,7 @@ func (d *Device) load() error {
 			d.Net.Restore(nil)
 		}
 		d.eventLimit, d.Diagnostics.RebootCount = 0, 0
+		*d.Groups = clusters.GroupData{Fabrics: d.Fabrics, OnChange: d.Groups.OnChange}
 		return err
 	}
 	return nil

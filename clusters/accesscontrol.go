@@ -138,6 +138,15 @@ func subjectMatches(subjects []uint64, s *exchange.Session) bool {
 	if len(subjects) == 0 { // null or empty: any subject
 		return true
 	}
+	if s.IsGroup() {
+		// Group subjects are group IDs.
+		for _, subj := range subjects {
+			if subj == uint64(s.GroupID) {
+				return true
+			}
+		}
+		return false
+	}
 	peer := s.PeerNodeID()
 	for _, subj := range subjects {
 		if subj == peer {
@@ -334,8 +343,15 @@ func decodeACLEntry(r *tlv.Reader, fabric uint8) (ACLEntry, bool) {
 		len(e.Subjects) > SubjectsPerEntry || len(e.Targets) > TargetsPerEntry {
 		ok = false
 	}
-	if e.AuthMode == exchange.AuthGroup && e.Privilege == im.Administer {
-		ok = false
+	if e.AuthMode == exchange.AuthGroup {
+		if e.Privilege == im.Administer {
+			ok = false
+		}
+		for _, subj := range e.Subjects {
+			if subj == 0 || subj > 0xFFFF { // a group ID
+				ok = false
+			}
+		}
 	}
 	return e, ok
 }

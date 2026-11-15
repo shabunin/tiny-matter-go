@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -84,6 +85,13 @@ type Device struct {
 	// Diagnostics is the General Diagnostics cluster. Set its BootReason
 	// and Interfaces before the first Poll, which records the boot events.
 	Diagnostics *clusters.GeneralDiagnostics
+	// Groups holds the group keys and memberships. Add a Groups cluster
+	// (NewGroups) to each application endpoint that groups may address.
+	Groups *clusters.GroupData
+	// OnMulticast, if set, is called with the IPv6 multicast addresses of
+	// the node's groups whenever they change; the network layer should
+	// listen on exactly those (and on MulticastAddrs at start).
+	OnMulticast func(addrs []netip.Addr)
 	// HoldSaves postpones writing the store while set, for example while a
 	// BLE link would not survive the stall of a flash erase. Pending
 	// changes are written by the first Poll after it is cleared.
@@ -150,8 +158,18 @@ func New(cfg Config) (*Device, error) {
 	d.General.FabricIndex = func(ctx *im.Context) uint8 { return ctx.Session.FabricIndex }
 	d.General.Complete = d.commissioningComplete
 	d.OpCreds = clusters.NewOperationalCredentials(cfg.Attestation, d.Fabrics, d.FailSafe, d.ACL, cfg.Rand)
+	d.Groups = &clusters.GroupData{Fabrics: d.Fabrics}
+	d.Groups.OnChange = func() {
+		d.dirty = true
+		if d.OnMulticast != nil {
+			d.OnMulticast(d.Groups.MulticastAddrs())
+		}
+	}
+	m.SetGroupKeys(d.Groups.Keys)
 	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
 		d.Node.Events.RemoveFabric(index)
+		d.Groups.RemoveFabric(index)
+		d.M.ForgetGroupPeers(index)
 		d.later(func(now time.Time) {
 			d.closeFabricSessions(now, index)
 			if d.Admin.AdminFabricIndex == index {
@@ -182,7 +200,8 @@ func New(cfg Config) (*Device, error) {
 	d.Diagnostics = &clusters.GeneralDiagnostics{}
 
 	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
-	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Admin, d.OpCreds)
+	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Admin, d.OpCreds,
+		&clusters.GroupKeyManagement{Data: d.Groups})
 	if cfg.WiFi || cfg.Thread {
 		d.Net = clusters.NewNetworkCommissioning(d.FailSafe, nil)
 		d.Net.Thread = cfg.Thread
@@ -197,6 +216,7 @@ func New(cfg Config) (*Device, error) {
 	}
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
+	d.Server.GroupEndpoints = d.Groups.Endpoints
 	serverHook := d.Node.OnChange // subscriptions
 	d.Node.OnChange = func(p im.ConcretePath) {
 		if persistent(p) {
@@ -235,6 +255,17 @@ func (d *Device) boot(t time.Time) {
 	d.Node.Events.Boot = t
 	d.Diagnostics.Boot = t
 }
+
+// NewGroups returns a Groups cluster over the device's groups, for an
+// application endpoint; identify, if not nil, is the endpoint's Identify
+// cluster (for AddGroupIfIdentifying).
+func (d *Device) NewGroups(identify *clusters.Identify) *clusters.Groups {
+	return &clusters.Groups{Data: d.Groups, Identify: identify}
+}
+
+// MulticastAddrs returns the IPv6 multicast addresses of the node's
+// groups, which the network layer should listen on.
+func (d *Device) MulticastAddrs() []netip.Addr { return d.Groups.MulticastAddrs() }
 
 // Commissioned reports whether the node belongs to at least one fabric.
 // Applications typically open the commissioning window when it does not.
