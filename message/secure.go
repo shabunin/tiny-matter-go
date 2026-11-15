@@ -69,10 +69,9 @@ func AppendUnsecured(dst []byte, h *Header, payload []byte) []byte {
 // payload is the protocol header followed by the application payload, and
 // nodeID is as for Nonce. To encode without allocating, give dst capacity for
 // h.Size()+len(payload)+MICSize; payload must not overlap dst's free space.
+// A header with the privacy flag is sealed in the clear: apply Obfuscate to
+// the result.
 func (c *Cipher) AppendSealed(dst []byte, h *Header, payload []byte, nodeID uint64) ([]byte, error) {
-	if h.Privacy {
-		return nil, ErrUnsupported
-	}
 	start := len(dst)
 	dst = h.AppendTo(dst)
 	putNonce(&c.nonce, h, nodeID)
@@ -83,11 +82,9 @@ func (c *Cipher) AppendSealed(dst []byte, h *Header, payload []byte, nodeID uint
 // header, already decoded from the start of packet with encoded size hdrLen,
 // and nodeID is the sender's node ID as for Nonce. The payload is decrypted
 // in place and returned as a sub-slice of packet; on failure the packet
-// contents are undefined.
+// contents are undefined. A header with the privacy flag must have been
+// deobfuscated (Obfuscate) and decoded again first.
 func (c *Cipher) OpenInPlace(packet []byte, h *Header, hdrLen int, nodeID uint64) ([]byte, error) {
-	if h.Privacy {
-		return nil, ErrUnsupported
-	}
 	if len(packet)-hdrLen < MICSize {
 		return nil, ErrTruncated
 	}
