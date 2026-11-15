@@ -16,7 +16,8 @@ import (
 //	3: [ { 1: index, 2: vendor ID, 3: label, 4: RCAC, 5: ICAC (optional),
 //	       6: NOC, 7: operational private key, 8: IPK epoch key } ]
 //	4: ACL entries (AccessControlEntryStruct with fabric index)
-//	5: Wi-Fi networks [ { 1: SSID, 2: credentials } ] (committed)
+//	5: networks [ { 1: network ID, 2: credentials } ] (committed): Wi-Fi
+//	   SSIDs and passphrases, or Thread extended PAN IDs and datasets
 //	6: first event number after a restart (reserved before it)
 //	7: reboot count
 const stateVersion = 1

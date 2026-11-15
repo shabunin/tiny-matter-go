@@ -58,6 +58,10 @@ type Config struct {
 	// so a commissioner can provision the network, typically over BLE.
 	// Set Net.Connect (and optionally Net.Scan) after New.
 	WiFi bool
+	// Thread adds it for a Thread interface instead: the commissioner
+	// provisions an operational dataset. Set Net.Connect (and optionally
+	// Net.ScanThread, ThreadFeatures and ThreadVersion) after New.
+	Thread bool
 }
 
 // Device is a Matter node.
@@ -74,7 +78,8 @@ type Device struct {
 	General  *clusters.GeneralCommissioning
 	OpCreds  *clusters.OperationalCredentials
 	Admin    *clusters.AdminCommissioning
-	// Net is the Network Commissioning cluster (nil unless Config.WiFi).
+	// Net is the Network Commissioning cluster (nil unless Config.WiFi or
+	// Config.Thread).
 	Net *clusters.NetworkCommissioning
 	// Diagnostics is the General Diagnostics cluster. Set its BootReason
 	// and Interfaces before the first Poll, which records the boot events.
@@ -102,6 +107,9 @@ type Device struct {
 func New(cfg Config) (*Device, error) {
 	if cfg.Transport == nil || cfg.Rand == nil || cfg.Attestation == nil || cfg.Basic == nil {
 		return nil, errors.New("device: Transport, Rand, Attestation and Basic are required")
+	}
+	if cfg.WiFi && cfg.Thread {
+		return nil, errors.New("device: one network interface: Wi-Fi or Thread")
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 5540
@@ -170,8 +178,9 @@ func New(cfg Config) (*Device, error) {
 
 	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
 	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Admin, d.OpCreds)
-	if cfg.WiFi {
+	if cfg.WiFi || cfg.Thread {
 		d.Net = clusters.NewNetworkCommissioning(d.FailSafe, nil)
+		d.Net.Thread = cfg.Thread
 		d.Net.FabricIndex = d.General.FabricIndex
 		d.General.SupportsConcurrentConnection = false
 		d.FailSafe.OnExpire = append(d.FailSafe.OnExpire, func(now time.Time) {

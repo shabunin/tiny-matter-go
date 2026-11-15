@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/thread"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
@@ -42,7 +43,9 @@ const (
 	WiFiBand5G  = 2
 )
 
-// WiFiNetwork is a configured Wi-Fi network; its network ID is the SSID.
+// WiFiNetwork is a configured network. For Wi-Fi, its network ID is the
+// SSID and Credentials the passphrase or PSK. For Thread, SSID holds the
+// network ID, the extended PAN ID, and Credentials the operational dataset.
 type WiFiNetwork struct {
 	SSID        []byte
 	Credentials []byte
@@ -58,9 +61,31 @@ type WiFiScanResult struct {
 	RSSI     int8
 }
 
+// ThreadScanResult is one Thread network found by a scan.
+type ThreadScanResult struct {
+	PANID           uint16
+	ExtendedPANID   uint64
+	NetworkName     string
+	Channel         uint16
+	Version         uint8
+	ExtendedAddress [8]byte
+	RSSI            int8
+	LQI             uint8
+}
+
+// Thread feature bits (SupportedThreadFeatures).
+const (
+	ThreadBorderRouter = 1 << 0
+	ThreadRouter       = 1 << 1
+	ThreadSleepy       = 1 << 2
+	ThreadFTD          = 1 << 3
+	ThreadSynchronized = 1 << 4
+)
+
 // NetworkCommissioning is the Network Commissioning cluster with the Wi-Fi
-// feature (spec 11.9). Changes made under the fail-safe are kept apart
-// from the committed networks until Commit, and Rollback discards them.
+// or, with Thread set, the Thread feature (spec 11.9). Changes made under
+// the fail-safe are kept apart from the committed networks until Commit,
+// and Rollback discards them.
 //
 // Only non-concurrent operation is supported: ConnectNetwork answers at
 // once, and the application joins the network afterwards (dropping the BLE
@@ -75,6 +100,15 @@ type NetworkCommissioning struct {
 	ConnectMaxTime   uint8 // seconds
 	InterfaceEnabled bool
 	Bands            []uint8 // default 2.4 GHz only
+
+	// Thread makes it a Thread interface (feature TH) rather than Wi-Fi:
+	// networks are added with operational datasets and named by their
+	// extended PAN IDs. Set it before the cluster is added to a node.
+	Thread bool
+	// ThreadFeatures (SupportedThreadFeatures) and ThreadVersion (4 for
+	// Thread 1.3) describe a Thread interface.
+	ThreadFeatures uint16
+	ThreadVersion  uint16
 
 	// Networks is the current list, including uncommitted changes.
 	Networks []WiFiNetwork
@@ -92,6 +126,8 @@ type NetworkCommissioning struct {
 	FabricIndex func(ctx *im.Context) uint8
 	// Scan scans for networks (ssid nil: all). Nil reports no results.
 	Scan func(ctx *im.Context, ssid []byte) ([]WiFiScanResult, NetworkingStatus)
+	// ScanThread scans for Thread networks. Nil reports no results.
+	ScanThread func(ctx *im.Context) ([]ThreadScanResult, NetworkingStatus)
 	// Connect is called while ConnectNetwork is being answered; it must
 	// join the network only after the response has gone out.
 	Connect func(now time.Time, n WiFiNetwork)
@@ -176,9 +212,15 @@ func (n *NetworkCommissioning) SetLastConnect(node *im.Node, ssid []byte, st Net
 	}
 }
 
-func (*NetworkCommissioning) ID() uint32         { return IDNetworkCommissioning }
-func (*NetworkCommissioning) Revision() uint16   { return 2 }
-func (*NetworkCommissioning) FeatureMap() uint32 { return 1 } // WI
+func (*NetworkCommissioning) ID() uint32       { return IDNetworkCommissioning }
+func (*NetworkCommissioning) Revision() uint16 { return 2 }
+
+func (n *NetworkCommissioning) FeatureMap() uint32 {
+	if n.Thread {
+		return 2 // TH
+	}
+	return 1 // WI
+}
 
 const (
 	ncMaxNetworks           = 0
@@ -190,28 +232,45 @@ const (
 	ncLastNetworkID         = 6
 	ncLastConnectErrorValue = 7
 	ncSupportedWiFiBands    = 8
+	ncSupportedThreadFeats  = 9
+	ncThreadVersion         = 10
 
-	ncScanNetworks           = 0
-	ncScanNetworksResponse   = 1
-	ncAddOrUpdateWiFiNetwork = 2
-	ncRemoveNetwork          = 4
-	ncNetworkConfigResponse  = 5
-	ncConnectNetwork         = 6
-	ncConnectNetworkResponse = 7
-	ncReorderNetwork         = 8
+	ncScanNetworks             = 0
+	ncScanNetworksResponse     = 1
+	ncAddOrUpdateWiFiNetwork   = 2
+	ncAddOrUpdateThreadNetwork = 3
+	ncRemoveNetwork            = 4
+	ncNetworkConfigResponse    = 5
+	ncConnectNetwork           = 6
+	ncConnectNetworkResponse   = 7
+	ncReorderNetwork           = 8
 
 	maxSSID        = 32
 	maxCredentials = 64
 )
 
 var (
-	ncAttrs     = []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8}
-	ncAccepted  = []uint32{ncScanNetworks, ncAddOrUpdateWiFiNetwork, ncRemoveNetwork, ncConnectNetwork, ncReorderNetwork}
-	ncGenerated = []uint32{ncScanNetworksResponse, ncNetworkConfigResponse, ncConnectNetworkResponse}
+	ncAttrs          = []uint32{0, 1, 2, 3, 4, 5, 6, 7, ncSupportedWiFiBands}
+	ncThreadAttrs    = []uint32{0, 1, 2, 3, 4, 5, 6, 7, ncSupportedThreadFeats, ncThreadVersion}
+	ncAccepted       = []uint32{ncScanNetworks, ncAddOrUpdateWiFiNetwork, ncRemoveNetwork, ncConnectNetwork, ncReorderNetwork}
+	ncThreadAccepted = []uint32{ncScanNetworks, ncAddOrUpdateThreadNetwork, ncRemoveNetwork, ncConnectNetwork, ncReorderNetwork}
+	ncGenerated      = []uint32{ncScanNetworksResponse, ncNetworkConfigResponse, ncConnectNetworkResponse}
 )
 
-func (*NetworkCommissioning) Attributes() []uint32        { return ncAttrs }
-func (*NetworkCommissioning) AcceptedCommands() []uint32  { return ncAccepted }
+func (n *NetworkCommissioning) Attributes() []uint32 {
+	if n.Thread {
+		return ncThreadAttrs
+	}
+	return ncAttrs
+}
+
+func (n *NetworkCommissioning) AcceptedCommands() []uint32 {
+	if n.Thread {
+		return ncThreadAccepted
+	}
+	return ncAccepted
+}
+
 func (*NetworkCommissioning) GeneratedCommands() []uint32 { return ncGenerated }
 
 func (*NetworkCommissioning) ReadPrivilege(attr uint32) im.Privilege {
@@ -262,11 +321,23 @@ func (n *NetworkCommissioning) ReadAttribute(ctx *im.Context, attr uint32, w *tl
 			w.PutInt(tag, int64(n.LastConnectError))
 		}
 	case ncSupportedWiFiBands:
+		if n.Thread {
+			return im.UnsupportedAttribute
+		}
 		w.StartArray(tag)
 		for _, b := range n.Bands {
 			w.PutUint(tlv.Anonymous, uint64(b))
 		}
 		w.EndContainer()
+	case ncSupportedThreadFeats, ncThreadVersion:
+		if !n.Thread {
+			return im.UnsupportedAttribute
+		}
+		v := n.ThreadFeatures
+		if attr == ncThreadVersion {
+			v = n.ThreadVersion
+		}
+		w.PutUint(tag, uint64(v))
 	default:
 		return im.UnsupportedAttribute
 	}
@@ -324,6 +395,39 @@ func configResponse(resp *im.Response, st NetworkingStatus, index int) im.Status
 	return im.Success
 }
 
+// scanThread answers ScanNetworks on a Thread interface.
+func (n *NetworkCommissioning) scanThread(ctx *im.Context, resp *im.Response, crumb func()) im.Status {
+	var (
+		results []ThreadScanResult
+		st      NetworkingStatus
+	)
+	if n.ScanThread != nil {
+		results, st = n.ScanThread(ctx)
+	}
+	n.LastStatus = int16(st)
+	ctx.Node.Changed(ctx.Endpoint, IDNetworkCommissioning, ncLastNetworkingStatus)
+	w := resp.Fields(ncScanNetworksResponse)
+	w.PutUint(tlv.ContextTag(0), uint64(st))
+	if st == NetworkOK {
+		w.StartArray(tlv.ContextTag(3))
+		for _, s := range results {
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(0), uint64(s.PANID))
+			w.PutUint(tlv.ContextTag(1), s.ExtendedPANID)
+			w.PutString(tlv.ContextTag(2), s.NetworkName)
+			w.PutUint(tlv.ContextTag(3), uint64(s.Channel))
+			w.PutUint(tlv.ContextTag(4), uint64(s.Version))
+			w.PutBytes(tlv.ContextTag(5), s.ExtendedAddress[:])
+			w.PutInt(tlv.ContextTag(6), int64(s.RSSI))
+			w.PutUint(tlv.ContextTag(7), uint64(s.LQI))
+			w.EndContainer()
+		}
+		w.EndContainer()
+		crumb()
+	}
+	return im.Success
+}
+
 // validCredentials checks the credential lengths spec 11.9.7.3 allows:
 // open, WEP-64, a WPA passphrase of 8 to 63 bytes, or a 64-digit hex PSK.
 func validCredentials(c []byte) bool {
@@ -367,7 +471,8 @@ func (n *NetworkCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 		case tag == 1 && cmd == ncReorderNetwork:
 			index, err = r.Uint()
 			have |= 2
-		case tag == 1 && (cmd == ncScanNetworks || cmd == ncRemoveNetwork || cmd == ncConnectNetwork),
+		case tag == 1 && (cmd == ncScanNetworks || cmd == ncRemoveNetwork || cmd == ncConnectNetwork ||
+			cmd == ncAddOrUpdateThreadNetwork),
 			tag == 2 && (cmd == ncAddOrUpdateWiFiNetwork || cmd == ncReorderNetwork):
 			breadcrumb, err = r.Uint()
 			hasCrumb = true
@@ -387,8 +492,14 @@ func (n *NetworkCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 		}
 	}
 
+	if cmd == ncAddOrUpdateWiFiNetwork && n.Thread || cmd == ncAddOrUpdateThreadNetwork && !n.Thread {
+		return im.UnsupportedCommand
+	}
 	switch cmd {
 	case ncScanNetworks:
+		if n.Thread {
+			return n.scanThread(ctx, resp, crumb)
+		}
 		if len(id) > maxSSID {
 			return im.ConstraintError
 		}
@@ -442,6 +553,35 @@ func (n *NetworkCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 			i = len(n.Networks) - 1
 		} else {
 			n.Networks[i].Credentials = creds
+		}
+		n.changed(ctx)
+		crumb()
+		return configResponse(resp, NetworkOK, i)
+
+	case ncAddOrUpdateThreadNetwork:
+		if have != 1 {
+			return im.InvalidCommand
+		}
+		if !n.armed(ctx) {
+			return im.FailsafeRequired
+		}
+		if len(id) > thread.MaxDatasetLen {
+			return im.ConstraintError
+		}
+		ds, err := thread.ParseDataset(id)
+		if err != nil {
+			return configResponse(resp, NetworkOutOfRange, -1)
+		}
+		xpan := bytes.Clone(ds.ExtendedPANID[:])
+		i := n.find(xpan)
+		if i < 0 {
+			if len(n.Networks) >= int(n.MaxNetworks) {
+				return configResponse(resp, NetworkBoundsExceeded, -1)
+			}
+			n.Networks = append(n.Networks, WiFiNetwork{SSID: xpan, Credentials: id})
+			i = len(n.Networks) - 1
+		} else {
+			n.Networks[i].Credentials = id
 		}
 		n.changed(ctx)
 		crumb()
