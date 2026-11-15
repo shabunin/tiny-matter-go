@@ -40,7 +40,7 @@ const (
 	defaultHopLimit  = 255 // all our traffic is link-local
 	neighborCacheLen = 8
 	maxUDPHandlers   = 4
-	maxGroups        = 6
+	maxGroups        = 24 // all-nodes, solicited-node, mDNS and Matter groups
 
 	// MTU is the largest IPv6 packet sent or accepted (Ethernet payload).
 	MTU = 1500
@@ -143,6 +143,17 @@ func (s *Stack) Join(g netip.Addr) error {
 	}
 	s.groups = append(s.groups, g)
 	return s.ReportGroups()
+}
+
+// Leave leaves multicast group g, telling MLD snooping switches.
+func (s *Stack) Leave(g netip.Addr) error {
+	for i, x := range s.groups {
+		if x == g && g != allNodes && g != solicitedNode(s.addr) {
+			s.groups = append(s.groups[:i], s.groups[i+1:]...)
+			return s.report(mldChangeToInclude, []netip.Addr{g})
+		}
+	}
+	return nil
 }
 
 // Listen delivers UDP datagrams for port to h, replacing any previous
@@ -406,12 +417,25 @@ func (s *Stack) sendNS(target netip.Addr) {
 // ReportGroups sends an MLDv2 report listing the joined groups. Join calls
 // it; call it again after the link (re)connects.
 func (s *Stack) ReportGroups() error {
-	var groups []netip.Addr
+	var groups [maxGroups]netip.Addr
+	n := 0
 	for _, g := range s.groups {
 		if g != allNodes { // never reported (RFC 3810 section 6)
-			groups = append(groups, g)
+			groups[n] = g
+			n++
 		}
 	}
+	return s.report(mldIsExclude, groups[:n])
+}
+
+// MLDv2 multicast address record types (RFC 3810 section 5.2.12), each
+// with no sources.
+const (
+	mldIsExclude       = 2 // listening
+	mldChangeToInclude = 3 // stopped listening
+)
+
+func (s *Stack) report(recordType byte, groups []netip.Addr) error {
 	const hbh = 8
 	n := hbh + 8 + 20*len(groups)
 	p := s.ipPacket(mldRouters, protoHopByHop, n, 1)
@@ -423,7 +447,7 @@ func (s *Stack) ReportGroups() error {
 	binary.BigEndian.PutUint16(b[6:], uint16(len(groups)))
 	for i, g := range groups {
 		r := b[8+20*i:]
-		r[0] = 2 // MODE_IS_EXCLUDE with no sources: listening
+		r[0] = recordType
 		a := g.As16()
 		copy(r[4:20], a[:])
 	}

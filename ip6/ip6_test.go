@@ -178,6 +178,24 @@ func TestMLDReport(t *testing.T) {
 	if checksum(s.Addr(), mldRouters, protoICMPv6, icmp) != 0 {
 		t.Fatal("bad checksum")
 	}
+
+	// Leaving reports a change to include mode for just that group, and
+	// stops delivery.
+	g := netip.MustParseAddr("ff35:40:fd00::100:1")
+	s.Join(g)
+	if !s.accepts(g) {
+		t.Fatal("joined group not accepted")
+	}
+	frames = nil
+	s.Leave(g)
+	s.Leave(allNodes) // never left
+	if len(frames) != 1 || s.accepts(g) || !s.accepts(allNodes) {
+		t.Fatalf("leave: %d frames", len(frames))
+	}
+	icmp = frames[0][ethHeaderLen+ipHeaderLen+8:]
+	if binary.BigEndian.Uint16(icmp[6:]) != 1 || icmp[8] != mldChangeToInclude || netip.AddrFrom16([16]byte(icmp[12:28])) != g {
+		t.Fatalf("leave report % x", icmp)
+	}
 }
 
 // TestChecksumVerifies checks that a buffer carrying its own checksum sums
