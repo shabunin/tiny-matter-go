@@ -45,6 +45,13 @@ type state struct {
 	IPK        []byte  `json:"ipk"`     // identity protection epoch key
 	NextNodeID uint64  `json:"nextNodeId"`
 	Nodes      []*Node `json:"nodes"`
+
+	Groups  []Group       `json:"groups,omitempty"`
+	KeySets []GroupKeySet `json:"groupKeySets,omitempty"`
+	// GroupNodeID is the node ID group messages are sent from, and
+	// GroupCounter the last group data message counter used.
+	GroupNodeID  uint64 `json:"groupNodeId,omitempty"`
+	GroupCounter uint32 `json:"groupCounter,omitempty"`
 }
 
 // DefaultAdminCAT is the administrator CAT of new fabrics: identifier 1,

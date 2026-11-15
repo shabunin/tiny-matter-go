@@ -94,6 +94,10 @@ type Controller struct {
 	ble   Bluetooth
 
 	// Owned by the loop goroutine.
+	// groupTo, if valid, receives group messages instead of their
+	// multicast address (for tests).
+	groupTo netip.AddrPort
+
 	sessions map[uint64]*exchange.Session
 	subs     map[uint32]*subState
 	links    map[netip.AddrPort]*bleLink
@@ -271,6 +275,13 @@ func (c *Controller) Send(to exchange.Addr, pkt []byte) error {
 			return l.send(pkt)
 		}
 		return errLinkClosed
+	}
+	if to.Addr().IsMulticast() {
+		if c.groupTo.IsValid() {
+			to = c.groupTo
+		} else {
+			return c.sendMulticast(to, pkt)
+		}
 	}
 	_, err := c.conn.WriteToUDPAddrPort(pkt, to)
 	return err

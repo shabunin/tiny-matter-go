@@ -34,18 +34,23 @@ func statusString(s im.Status) string {
 func describe(err error) error {
 	var st im.Status
 	var ce *controller.CommandError
+	var inner error
+	var msg string
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &ce):
+		inner, msg = ce, statusString(ce.Status)
 		if ce.HasClusterStatus {
-			return fmt.Errorf("%s, cluster status %d", statusString(ce.Status), ce.ClusterStatus)
+			msg = fmt.Sprintf("%s, cluster status %d", msg, ce.ClusterStatus)
 		}
-		return errors.New(statusString(ce.Status))
 	case errors.As(err, &st):
-		return errors.New(statusString(st))
+		inner, msg = st, statusString(st)
+	default:
+		return err
 	}
-	return err
+	// Keep the context wrapped around the status ("AddGroup: ...").
+	return errors.New(strings.TrimSuffix(err.Error(), inner.Error()) + msg)
 }
 
 func pathName(ep uint16, cluster, member uint32, kind string) (string, *datamodel.Cluster) {

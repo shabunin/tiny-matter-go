@@ -7,6 +7,8 @@
 //	tmctl invoke 1 1 OnOff Toggle
 //	tmctl read 1 1 OnOff
 //	tmctl subscribe 1 '*' '*' -events
+//	tmctl group-add 1 lights; tmctl group-join 1 1 lights
+//	tmctl group-invoke lights OnOff Toggle
 //
 // Clusters, attributes, commands and events are named as in the Matter
 // SDK's IDL (case does not matter) or numbered; tmctl clusters lists them.
@@ -64,6 +66,14 @@ func init() {
 		{"close-window", "<node>", "close an open commissioning window", cmdCloseWindow},
 		{"remove", "<node>", "remove the controller's fabric from a node, and forget it", cmdRemove},
 		{"forget", "<node>", "forget a node without telling it", cmdForget},
+		{"groups", "", "list the fabric's groups", cmdGroups},
+		{"group-add", "<group> [name]", "create a group (ID 1 to 0xFEFF) with a key set of its own, or rename it", cmdGroupAdd},
+		{"group-delete", "<group>", "forget a group and its key set", cmdGroupDelete},
+		{"group-join", "<node> <endpoint> <group>",
+			"add an endpoint to a group, giving the node the group's key and letting the group operate it", cmdGroupJoin},
+		{"group-leave", "<node> <endpoint> <group>", "remove an endpoint from a group", cmdGroupLeave},
+		{"group-invoke", "<group> <cluster> <command> [field=value|value]...",
+			"send a command to a group over IPv6 multicast (no response)", cmdGroupInvoke},
 		{"clusters", "[cluster]", "list known clusters, or a cluster's attributes, commands and events", cmdClusters},
 		{"payload", "<code>", "decode a QR or manual pairing code", cmdPayload},
 	}
