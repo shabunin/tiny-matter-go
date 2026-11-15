@@ -81,13 +81,28 @@ func EncodeTimedRequest(timeoutMs uint16) []byte {
 // EncodeInvokeRequest encodes an InvokeRequest of one command. fields, if
 // not nil, writes the command fields (context tags) into the open structure.
 func EncodeInvokeRequest(p CommandPath, timed bool, fields func(w *tlv.Writer)) []byte {
+	return encodeInvokeRequest(timed, func(w *tlv.Writer) { EncodeCommandPath(w, tlv.ContextTag(0), p) }, fields)
+}
+
+// EncodeGroupInvokeRequest encodes an InvokeRequest of one command sent to
+// a group: its path names no endpoint, and it asks for no response.
+func EncodeGroupInvokeRequest(cluster, command uint32, fields func(w *tlv.Writer)) []byte {
+	return encodeInvokeRequest(false, func(w *tlv.Writer) {
+		w.StartList(tlv.ContextTag(0))
+		w.PutUint(tlv.ContextTag(1), uint64(cluster))
+		w.PutUint(tlv.ContextTag(2), uint64(command))
+		w.EndContainer()
+	}, fields)
+}
+
+func encodeInvokeRequest(timed bool, path func(w *tlv.Writer), fields func(w *tlv.Writer)) []byte {
 	w := tlv.NewWriter(nil)
 	w.StartStruct(tlv.Anonymous)
 	w.PutBool(tlv.ContextTag(0), false)
 	w.PutBool(tlv.ContextTag(1), timed)
 	w.StartArray(tlv.ContextTag(2))
 	w.StartStruct(tlv.Anonymous)
-	EncodeCommandPath(w, tlv.ContextTag(0), p)
+	path(w)
 	w.StartStruct(tlv.ContextTag(1))
 	if fields != nil {
 		fields(w)

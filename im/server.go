@@ -28,6 +28,10 @@ type Server struct {
 	buf  []byte // shared encode buffer; messages are sent synchronously
 	// Access, if set, enforces access control; nil allows everything.
 	Access AccessChecker
+	// GroupEndpoints, if set, returns the endpoints that are members of a
+	// group on a fabric, which commands and writes sent to the group reach.
+	// Without it, group messages are ignored.
+	GroupEndpoints func(fabricIndex uint8, groupID uint16) []uint16
 
 	subs      []*subscription
 	nextSubID uint32
@@ -116,6 +120,10 @@ func (h *handler) abort() {
 }
 
 func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+	if ex.Session().IsGroup() {
+		h.onGroup(now, ex, msg)
+		return
+	}
 	if msg.ProtocolID != message.ProtocolInteractionModel {
 		ex.Close(now)
 		return
@@ -840,6 +848,20 @@ func hasConcretePath(paths []ConcretePath, p ConcretePath) bool {
 }
 
 func decodeWriteItem(r *tlv.Reader) (writeItem, error) {
+	it, err := decodeWriteItemPath(r)
+	if err != nil {
+		return writeItem{}, err
+	}
+	if it.path.IsWildcard() {
+		return writeItem{}, InvalidAction
+	}
+	it.cpath = ConcretePath{it.path.Endpoint, it.path.Cluster, it.path.Attribute}
+	return it, nil
+}
+
+// decodeWriteItemPath decodes an AttributeDataIB of a write, whose path
+// may have wildcards (as a group write's does).
+func decodeWriteItemPath(r *tlv.Reader) (writeItem, error) {
 	var (
 		it      writeItem
 		hasPath bool
@@ -860,10 +882,9 @@ func decodeWriteItem(r *tlv.Reader) (writeItem, error) {
 	if err != nil {
 		return writeItem{}, err
 	}
-	if !hasPath || it.data == nil || it.path.IsWildcard() {
+	if !hasPath || it.data == nil {
 		return writeItem{}, InvalidAction
 	}
-	it.cpath = ConcretePath{it.path.Endpoint, it.path.Cluster, it.path.Attribute}
 	return it, nil
 }
 

@@ -131,12 +131,32 @@ func EncodeAttributePath(w *tlv.Writer, tag tlv.Tag, p AttributePath) {
 // DecodeCommandPath decodes the CommandPathIB list the reader is positioned
 // on. All fields must be present (wildcard invokes are group-only).
 func DecodeCommandPath(r *tlv.Reader) (CommandPath, error) {
+	p, seen, err := decodeCommandPath(r)
+	if err == nil && seen != 0b111 {
+		err = InvalidAction
+	}
+	return p, err
+}
+
+// decodeGroupCommandPath decodes the path of a command sent to a group,
+// which names the cluster and command, and should not name an endpoint.
+func decodeGroupCommandPath(r *tlv.Reader) (cluster, command uint32, hasEndpoint bool, err error) {
+	p, seen, err := decodeCommandPath(r)
+	if err == nil && seen&0b110 != 0b110 {
+		err = InvalidAction
+	}
+	return p.Cluster, p.Command, seen&1 != 0, err
+}
+
+// decodeCommandPath decodes a CommandPathIB, returning which of its
+// endpoint, cluster and command fields (bits 0-2) were present.
+func decodeCommandPath(r *tlv.Reader) (CommandPath, uint8, error) {
 	var p CommandPath
 	if r.Type() != tlv.TypeList {
-		return p, errMalformed
+		return p, 0, errMalformed
 	}
 	if err := r.EnterContainer(); err != nil {
-		return p, err
+		return p, 0, err
 	}
 	var seen uint8
 	for {
@@ -145,7 +165,7 @@ func DecodeCommandPath(r *tlv.Reader) (CommandPath, error) {
 			break
 		}
 		if err != nil {
-			return p, err
+			return p, seen, err
 		}
 		if r.Tag().Kind != tlv.TagContext {
 			continue
@@ -161,14 +181,11 @@ func DecodeCommandPath(r *tlv.Reader) (CommandPath, error) {
 			continue
 		}
 		if err != nil {
-			return p, err
+			return p, seen, err
 		}
 		seen |= 1 << r.Tag().Number
 	}
-	if seen != 0b111 {
-		return p, InvalidAction
-	}
-	return p, r.ExitContainer()
+	return p, seen, r.ExitContainer()
 }
 
 // EncodeCommandPath writes a CommandPathIB list.
