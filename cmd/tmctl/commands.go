@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -109,14 +112,79 @@ func cmdDiscover(args []string) error {
 	return tw.Flush()
 }
 
+// reachFlags are the flags that say how to reach a device in
+// commissioning mode, and the network to give it.
+type reachFlags struct {
+	ble              *bool
+	ssid, password   *string
+	thread           *bool
+	dataset          *string
+	withNetworkFlags bool
+}
+
+func addReachFlags(fs *flag.FlagSet, network bool) *reachFlags {
+	f := &reachFlags{ble: fs.Bool("ble", false, "reach the device over Bluetooth LE only"), withNetworkFlags: network}
+	if network {
+		f.ssid = fs.String("ssid", "", "Wi-Fi network to give a device commissioned over BLE")
+		f.password = fs.String("password", "", "the Wi-Fi password (default $TMCTL_WIFI_PASSWORD)")
+		f.thread = fs.Bool("thread", false, "give a device commissioned over BLE the Thread network of -dataset")
+		f.dataset = fs.String("dataset", "", "the Thread operational dataset, in hex as `ot-ctl dataset active -x` prints it (default $TMCTL_THREAD_DATASET)")
+	}
+	return f
+}
+
+// options turns the flags and the optional address argument into
+// commissioning options.
+func (f *reachFlags) options(pos []string) (controller.CommissionOptions, error) {
+	opts := controller.CommissionOptions{BLE: *f.ble}
+	if len(pos) > 0 {
+		var err error
+		if opts.Addr, err = addrArg(pos[0]); err != nil {
+			return opts, err
+		}
+	}
+	if !f.withNetworkFlags {
+		return opts, nil
+	}
+	switch {
+	case *f.ssid != "" && *f.thread:
+		return opts, errors.New("-ssid or -thread, not both")
+	case *f.ssid != "":
+		pw := *f.password
+		if pw == "" {
+			pw = os.Getenv("TMCTL_WIFI_PASSWORD")
+		}
+		opts.WiFi = &controller.WiFiNetwork{SSID: []byte(*f.ssid), Password: []byte(pw)}
+	case *f.password != "":
+		return opts, errors.New("-password without -ssid")
+	case *f.thread:
+		ds := *f.dataset
+		if ds == "" {
+			ds = os.Getenv("TMCTL_THREAD_DATASET")
+		}
+		if ds == "" {
+			return opts, errors.New("-thread needs -dataset or $TMCTL_THREAD_DATASET")
+		}
+		b, err := hex.DecodeString(strings.TrimSpace(ds))
+		if err != nil {
+			return opts, fmt.Errorf("Thread dataset: %v", err)
+		}
+		opts.Thread = b
+	case *f.dataset != "":
+		return opts, errors.New("-dataset without -thread")
+	}
+	if (opts.WiFi != nil || opts.Thread != nil) && opts.Addr.IsValid() && !opts.BLE {
+		return opts, errors.New("a network is given to a device commissioned over BLE: drop the address, or add -ble to reach the device there once it has joined")
+	}
+	return opts, nil
+}
+
 func cmdCommission(args []string) error {
 	fs := flagSet("commission")
 	id := fs.Uint64("id", 0, "node ID to give the device")
 	label := fs.String("label", "", "label for the node")
 	skip := fs.Bool("skip-attestation", false, "commission even if device attestation fails")
-	ble := fs.Bool("ble", false, "commission over Bluetooth LE")
-	ssid := fs.String("ssid", "", "Wi-Fi network to give the device (implies -ble without an address)")
-	password := fs.String("password", "", "the Wi-Fi password (default $TMCTL_WIFI_PASSWORD)")
+	rf := addReachFlags(fs, true)
 	pos, err := parseArgs(fs, args)
 	if err != nil || len(pos) < 1 || len(pos) > 2 {
 		return usageError{}
@@ -125,22 +193,11 @@ func cmdCommission(args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := controller.CommissionOptions{NodeID: *id, Label: *label, SkipAttestation: *skip, BLE: *ble}
-	if len(pos) == 2 {
-		if opts.Addr, err = addrArg(pos[1]); err != nil {
-			return err
-		}
+	opts, err := rf.options(pos[1:])
+	if err != nil {
+		return err
 	}
-	if *ssid != "" {
-		pw := *password
-		if pw == "" {
-			pw = os.Getenv("TMCTL_WIFI_PASSWORD")
-		}
-		opts.WiFi = &controller.WiFiNetwork{SSID: []byte(*ssid), Password: []byte(pw)}
-		opts.BLE = opts.BLE || len(pos) == 1
-	} else if *password != "" {
-		return errors.New("-password without -ssid")
-	}
+	opts.NodeID, opts.Label, opts.SkipAttestation = *id, *label, *skip
 	c, err := open(true)
 	if err != nil {
 		return err
@@ -155,6 +212,77 @@ func cmdCommission(args []string) error {
 	fmt.Printf("commissioned node %d (%s)\n", n.ID, n.Label)
 	return nil
 }
+
+func cmdScan(args []string) error {
+	fs := flagSet("scan")
+	rf := addReachFlags(fs, false)
+	pos, err := parseArgs(fs, args)
+	if err != nil || len(pos) < 1 || len(pos) > 2 {
+		return usageError{}
+	}
+	p, err := onboarding.Parse(pos[0])
+	if err != nil {
+		return err
+	}
+	opts, err := rf.options(pos[1:])
+	if err != nil {
+		return err
+	}
+	c, err := open(false)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	ctx, cancel := withTimeout(max(*timeout, 2*time.Minute))
+	defer cancel()
+	scan, err := c.ScanNetworks(ctx, p, opts)
+	if err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	defer tw.Flush()
+	switch {
+	case scan.Interface == "Thread" && len(scan.Thread) > 0:
+		fmt.Fprintln(tw, "NETWORK\tEXTENDED PAN ID\tPAN ID\tCHANNEL\tRSSI\tLQI")
+		for _, n := range scan.Thread {
+			fmt.Fprintf(tw, "%s\t%016X\t0x%04X\t%d\t%d\t%d\n", n.NetworkName, n.ExtendedPANID, n.PANID, n.Channel, n.RSSI, n.LQI)
+		}
+	case len(scan.WiFi) > 0:
+		fmt.Fprintln(tw, "SSID\tSECURITY\tCHANNEL\tBAND\tRSSI")
+		for _, n := range scan.WiFi {
+			ch := "?"
+			if n.Channel != 0 {
+				ch = fmt.Sprint(n.Channel)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\n", n.SSID, wifiSecurity(n.Security), ch, wifiBand(n.Band), n.RSSI)
+		}
+	default:
+		fmt.Printf("the device sees no %s networks\n", scan.Interface)
+	}
+	return nil
+}
+
+func wifiSecurity(s uint8) string {
+	var names []string
+	for i, n := range []string{"open", "WEP", "WPA", "WPA2", "WPA3"} {
+		if s&(1<<i) != 0 {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return "?"
+	}
+	return strings.Join(names, "/")
+}
+
+func wifiBand(b uint8) string {
+	if int(b) < len(wifiBands) {
+		return wifiBands[b]
+	}
+	return fmt.Sprint(b)
+}
+
+var wifiBands = []string{"2.4 GHz", "3.65 GHz", "5 GHz", "6 GHz", "60 GHz", "1 GHz"}
 
 // addrArg parses host:port, or an address with the default port 5540.
 func addrArg(s string) (netip.AddrPort, error) {
