@@ -67,6 +67,10 @@ func NewOperationalCredentials(att *Attestation, ft *fabric.Table, fs *FailSafe,
 	return o
 }
 
+func (o *OperationalCredentials) armed(ctx *im.Context) bool {
+	return o.FailSafe != nil && o.FailSafe.Armed(ctx.Now) && o.FailSafe.FabricIndex() == accessingFabric(ctx)
+}
+
 func (o *OperationalCredentials) revert(now time.Time) {
 	for _, idx := range o.Fabrics.RevertPending() {
 		o.ACL.RemoveFabric(idx)
@@ -280,7 +284,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if len(nonce) != 32 {
 			return im.InvalidCommand
 		}
-		if !o.FailSafe.Armed(ctx.Now) {
+		if !o.armed(ctx) {
 			return im.FailsafeRequired
 		}
 		if f.uints[1] != 0 { // IsForUpdateNOC: UpdateNOC is not supported yet
@@ -309,14 +313,14 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		return im.Success
 
 	case ocAddTrustedRootCert:
-		if !o.FailSafe.Armed(ctx.Now) {
+		if !o.armed(ctx) {
 			return im.FailsafeRequired
 		}
 		if o.pendingRoot != nil || o.addedNOC {
 			return im.ConstraintError
 		}
 		c, err := credentials.DecodeCert(f.bytes[0])
-		if err != nil || !c.IsCA || c.VerifySignature(c.PublicKey) != nil {
+		if err != nil || !c.IsCA || c.KeyUsage&credentials.KeyUsageKeyCertSign == 0 || c.VerifySignature(c.PublicKey) != nil {
 			return im.InvalidCommand
 		}
 		if _, ok := c.Subject.Get(credentials.DNMatterRCACID); !ok {
@@ -329,7 +333,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if !f.has(0, 2, 3, 4) {
 			return im.InvalidCommand
 		}
-		if !o.FailSafe.Armed(ctx.Now) {
+		if !o.armed(ctx) {
 			return im.FailsafeRequired
 		}
 		if o.addedNOC {

@@ -135,7 +135,7 @@ func (a *AccessControl) Allowed(ctx *im.Context, endpoint uint16, cluster uint32
 }
 
 func subjectMatches(subjects []uint64, s *exchange.Session) bool {
-	if len(subjects) == 0 {
+	if len(subjects) == 0 { // null or empty: any subject
 		return true
 	}
 	peer := s.PeerNodeID()
@@ -156,7 +156,7 @@ func subjectMatches(subjects []uint64, s *exchange.Session) bool {
 }
 
 func targetMatches(ctx *im.Context, targets []ACLTarget, endpoint uint16, cluster uint32) bool {
-	if len(targets) == 0 {
+	if len(targets) == 0 { // null or empty: everything
 		return true
 	}
 	for _, t := range targets {

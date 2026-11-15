@@ -440,3 +440,371 @@ func liveSecure(m *exchange.Manager) (n int) {
 	}
 	return n
 }
+
+func (h *harness) pairPASE(code uint32) (*exchange.Session, error) {
+	var (
+		done bool
+		s    *exchange.Session
+		perr error
+	)
+	err := pase.Pair(h.w.Now, h.ctl.M, h.devN.Addr, pase.InitiatorConfig{
+		Passcode: code, Rand: rand.Reader,
+		Done: func(now time.Time, got *exchange.Session, e error) {
+			done, s, perr = true, got, e
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	h.w.Advance(2 * time.Second)
+	if !done {
+		h.t.Fatal("PASE did not finish")
+	}
+	return s, perr
+}
+
+func (h *harness) addPendingFabric(paseS *exchange.Session, fabricID, nodeID uint64) {
+	h.t.Helper()
+	gc := func(cmd uint32) im.CommandPath {
+		return im.CommandPath{Endpoint: 0, Cluster: clusters.IDGeneralCommissioning, Command: cmd}
+	}
+	oc := func(cmd uint32) im.CommandPath {
+		return im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: cmd}
+	}
+	res := h.invoke(paseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) })
+	if code, _ := field(h.t, res.Fields, 0).Uint(); code != 0 {
+		h.t.Fatalf("ArmFailSafe: %d", code)
+	}
+	nonce := make([]byte, 32)
+	rand.Read(nonce)
+	res = h.invoke(paseS, oc(4), func(w *tlv.Writer) { w.PutBytes(tlv.ContextTag(0), nonce) })
+	nocsr, _ := field(h.t, res.Fields, 0).Bytes()
+	csrDER, _ := field(h.t, nocsr, 1).Bytes()
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil || csr.CheckSignature() != nil {
+		h.t.Fatalf("CSR: %v", err)
+	}
+	ecdhPub, _ := csr.PublicKey.(*ecdsa.PublicKey).ECDH()
+	rootKey, _ := p256.GenerateKey(rand.Reader)
+	root, _ := credentials.IssueRoot(rootKey, 1)
+	devNOC, _ := credentials.IssueNOC(root, rootKey, ecdhPub.Bytes(), fabricID, nodeID)
+	ipk := []byte("temporary ipk 01")
+	if res := h.invoke(paseS, oc(0x0B), func(w *tlv.Writer) { w.PutBytes(tlv.ContextTag(0), root.Encode()) }); res.Status != im.Success {
+		h.t.Fatalf("AddTrustedRootCertificate: %#x", res.Status)
+	}
+	res = h.invoke(paseS, oc(6), func(w *tlv.Writer) {
+		w.PutBytes(tlv.ContextTag(0), devNOC.Encode())
+		w.PutBytes(tlv.ContextTag(2), ipk)
+		w.PutUint(tlv.ContextTag(3), 0x1B669)
+		w.PutUint(tlv.ContextTag(4), 0xFFF1)
+	})
+	if code, _ := field(h.t, res.Fields, 0).Uint(); code != 0 {
+		h.t.Fatalf("AddNOC: %d", code)
+	}
+}
+
+func TestACLEmptyListIsWildcard(t *testing.T) {
+	h := newHarness(t)
+	_, caseS := h.commission()
+
+	var got []byte
+	ex, err := h.ctl.M.NewExchange(caseS, delegate(func(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+		got = bytes.Clone(msg.Payload)
+		ex.Close(now)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpWriteRequest, im.EncodeWriteRequest(
+		im.AttributePath{Endpoint: 0, Cluster: clusters.IDAccessControl, Attribute: 0}, false,
+		func(w *tlv.Writer, tag tlv.Tag) {
+			w.StartArray(tag)
+			// Entry 0: keep CASE admin access to AccessControl on EP0 only.
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(1), uint64(im.Administer))
+			w.PutUint(tlv.ContextTag(2), uint64(exchange.AuthCASE))
+			w.StartArray(tlv.ContextTag(3))
+			w.PutUint(tlv.Anonymous, 0x1B669)
+			w.EndContainer()
+			w.StartArray(tlv.ContextTag(4))
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(0), clusters.IDAccessControl)
+			w.PutUint(tlv.ContextTag(1), 0)
+			w.EndContainer()
+			w.EndContainer()
+			w.EndContainer()
+			// Entry 1: an empty Subjects array matches any subject, like null.
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(1), uint64(im.View))
+			w.PutUint(tlv.ContextTag(2), uint64(exchange.AuthCASE))
+			w.StartArray(tlv.ContextTag(3))
+			w.EndContainer()
+			w.PutNull(tlv.ContextTag(4))
+			w.EndContainer()
+			// Entry 2: an empty Targets array matches every target, like null.
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(1), uint64(im.View))
+			w.PutUint(tlv.ContextTag(2), uint64(exchange.AuthCASE))
+			w.StartArray(tlv.ContextTag(3))
+			w.PutUint(tlv.Anonymous, 0x1B669)
+			w.EndContainer()
+			w.StartArray(tlv.ContextTag(4))
+			w.EndContainer()
+			w.EndContainer()
+			w.EndContainer()
+		}))
+	h.w.Advance(time.Second)
+	res, err := im.DecodeWriteResponse(got)
+	if err != nil || len(res) != 1 || res[0].Status != im.Success {
+		t.Fatalf("ACL write: %+v %v", res, err)
+	}
+
+	rds := h.readQ(caseS, im.Request{Attributes: []im.AttributePath{{Endpoint: 1, Cluster: clusters.IDOnOff, Attribute: 0}}})
+	if len(rds) != 1 || len(rds[0].Reports) != 1 || rds[0].Reports[0].Status != im.Success {
+		t.Fatalf("OnOff read with empty ACL lists: %+v", rds)
+	}
+}
+
+func TestCrossFabricFailSafeRejected(t *testing.T) {
+	h := newHarness(t)
+	_, caseS := h.commission()
+	res := h.invokeTimed(caseS, ac(1), basicWindow(180))
+	if res.Status != im.Success {
+		t.Fatalf("OpenBasicCommissioningWindow: %+v", res)
+	}
+
+	paseS, err := h.pairPASE(passcode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc := func(cmd uint32) im.CommandPath {
+		return im.CommandPath{Endpoint: 0, Cluster: clusters.IDGeneralCommissioning, Command: cmd}
+	}
+	oc := func(cmd uint32) im.CommandPath {
+		return im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: cmd}
+	}
+
+	// PASE arms fail-safe; CASE must not be allowed to use it.
+	if res := h.invoke(paseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) }); res.Status != im.Success {
+		t.Fatalf("ArmFailSafe over PASE: %#x", res.Status)
+	}
+	nonce := make([]byte, 32)
+	if res := h.invoke(caseS, oc(4), func(w *tlv.Writer) { w.PutBytes(tlv.ContextTag(0), nonce) }); res.Status != im.FailsafeRequired {
+		t.Fatalf("CSRRequest over CASE during PASE fail-safe: got %#x, want %#x", res.Status, im.FailsafeRequired)
+	}
+
+	// Disarm (which ends the PASE session), then CASE arms fail-safe; a new
+	// PASE session must not be allowed to use it.
+	h.invoke(paseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 0); w.PutUint(tlv.ContextTag(1), 1) })
+	if paseS, err = h.pairPASE(passcode); err != nil {
+		t.Fatal(err)
+	}
+	if res := h.invoke(caseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) }); res.Status != im.Success {
+		t.Fatalf("ArmFailSafe over CASE: %#x", res.Status)
+	}
+	if res := h.invoke(paseS, oc(4), func(w *tlv.Writer) { w.PutBytes(tlv.ContextTag(0), nonce) }); res.Status != im.FailsafeRequired {
+		t.Fatalf("CSRRequest over PASE during CASE fail-safe: got %#x, want %#x", res.Status, im.FailsafeRequired)
+	}
+}
+
+// livePASE counts the device's open PASE sessions.
+func (h *harness) livePASE() int {
+	n := 0
+	for _, s := range h.dev.M.Sessions() {
+		if s.AuthMode == exchange.AuthPASE && !s.Closed() {
+			n++
+		}
+	}
+	return n
+}
+
+func TestFailSafeExpiryClosesPASE(t *testing.T) {
+	armFailSafe := func(seconds uint64) func(w *tlv.Writer) {
+		return func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), seconds); w.PutUint(tlv.ContextTag(1), 1) }
+	}
+	arm := im.CommandPath{Endpoint: 0, Cluster: clusters.IDGeneralCommissioning, Command: 0}
+
+	t.Run("after AddNOC", func(t *testing.T) {
+		h := newHarness(t)
+		paseS, err := h.pairPASE(passcode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.addPendingFabric(paseS, 0xFAB, 1)
+		h.w.Advance(61 * time.Second)
+		if len(h.dev.Fabrics.Fabrics()) != 0 || len(h.dev.ACL.Entries) != 0 {
+			t.Fatalf("pending fabric/ACL survived rollback: fabrics=%d acl=%d", len(h.dev.Fabrics.Fabrics()), len(h.dev.ACL.Entries))
+		}
+		if n := h.livePASE(); n != 0 {
+			t.Fatalf("%d PASE sessions survived the fail-safe expiry", n)
+		}
+		// The window is still open: a commissioner starts over with PASE.
+		paseS, err = h.pairPASE(passcode)
+		if err != nil {
+			t.Fatalf("PASE after rollback: %v", err)
+		}
+		if code, _ := field(t, h.invoke(paseS, arm, armFailSafe(60)).Fields, 0).Uint(); code != 0 {
+			t.Fatalf("ArmFailSafe after rollback: %d", code)
+		}
+	})
+
+	t.Run("before AddNOC", func(t *testing.T) {
+		h := newHarness(t)
+		paseS, err := h.pairPASE(passcode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := field(t, h.invoke(paseS, arm, armFailSafe(60)).Fields, 0).Uint(); code != 0 {
+			t.Fatalf("ArmFailSafe: %d", code)
+		}
+		h.w.Advance(61 * time.Second)
+		if n := h.livePASE(); n != 0 {
+			t.Fatalf("%d PASE sessions survived the fail-safe expiry", n)
+		}
+		if b := h.dev.General.Breadcrumb; b != 0 {
+			t.Fatalf("Breadcrumb %d after the fail-safe expired, want 0", b)
+		}
+	})
+
+	t.Run("ArmFailSafe(0)", func(t *testing.T) {
+		h := newHarness(t)
+		paseS, err := h.pairPASE(passcode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.invoke(paseS, arm, armFailSafe(60))
+		// The response still arrives; the session goes after it.
+		if code, _ := field(t, h.invoke(paseS, arm, armFailSafe(0)).Fields, 0).Uint(); code != 0 {
+			t.Fatalf("ArmFailSafe(0): %d", code)
+		}
+		h.w.Advance(time.Second)
+		if n := h.livePASE(); n != 0 {
+			t.Fatalf("%d PASE sessions survived ArmFailSafe(0)", n)
+		}
+		if b := h.dev.General.Breadcrumb; b != 0 {
+			t.Fatalf("Breadcrumb %d after ArmFailSafe(0), want 0", b)
+		}
+	})
+}
+
+func TestPASEFailedAttemptsClosesDeviceWindow(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < pase.MaxFailedAttempts; i++ {
+		if _, err := h.pairPASE(12345679); err == nil {
+			t.Fatalf("attempt %d succeeded unexpectedly", i)
+		}
+	}
+	if h.dev.PASE.WindowOpen() {
+		t.Fatal("PASE window still open after MaxFailedAttempts")
+	}
+	if h.dev.Admin.WindowStatus != clusters.WindowNotOpen {
+		t.Fatalf("Admin.WindowStatus = %d, want WindowNotOpen", h.dev.Admin.WindowStatus)
+	}
+}
+
+func TestWriteACLReplaceAndAppendOverCASE(t *testing.T) {
+	writeACL := func(t *testing.T, h *harness, caseS *exchange.Session, chunked bool) {
+		t.Helper()
+		entry := func(w *tlv.Writer, tag tlv.Tag, priv uint64, subj uint64) {
+			w.StartStruct(tag)
+			w.PutUint(tlv.ContextTag(1), priv)
+			w.PutUint(tlv.ContextTag(2), uint64(exchange.AuthCASE))
+			w.StartArray(tlv.ContextTag(3))
+			w.PutUint(tlv.Anonymous, subj)
+			w.EndContainer()
+			w.PutNull(tlv.ContextTag(4))
+			w.EndContainer()
+		}
+		putPath := func(w *tlv.Writer, appendItem bool) {
+			w.StartList(tlv.ContextTag(1))
+			w.PutUint(tlv.ContextTag(2), 0)
+			w.PutUint(tlv.ContextTag(3), clusters.IDAccessControl)
+			w.PutUint(tlv.ContextTag(4), 0)
+			if appendItem {
+				w.PutNull(tlv.ContextTag(5))
+			}
+			w.EndContainer()
+		}
+		encodeBatch := func(more, replace bool, appends []struct{ priv, subj uint64 }) []byte {
+			w := tlv.NewWriter(nil)
+			w.StartStruct(tlv.Anonymous)
+			w.PutBool(tlv.ContextTag(0), false)
+			w.PutBool(tlv.ContextTag(1), false)
+			w.StartArray(tlv.ContextTag(2))
+			if replace {
+				w.StartStruct(tlv.Anonymous)
+				putPath(w, false)
+				w.StartArray(tlv.ContextTag(2))
+				w.EndContainer()
+				w.EndContainer()
+			}
+			for _, a := range appends {
+				w.StartStruct(tlv.Anonymous)
+				putPath(w, true)
+				entry(w, tlv.ContextTag(2), a.priv, a.subj)
+				w.EndContainer()
+			}
+			w.EndContainer()
+			w.PutBool(tlv.ContextTag(3), more)
+			w.EndContainer()
+			return w.Bytes()
+		}
+
+		var resps [][]byte
+		ex, err := h.ctl.M.NewExchange(caseS, delegate(func(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+			resps = append(resps, bytes.Clone(msg.Payload))
+			if !chunked || len(resps) == 2 {
+				ex.Close(now)
+			}
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !chunked {
+			ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpWriteRequest,
+				encodeBatch(false, true, []struct{ priv, subj uint64 }{
+					{uint64(im.Administer), 0x1B669},
+					{uint64(im.View), 0x2B669},
+				}))
+			h.w.Advance(time.Second)
+		} else {
+			ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpWriteRequest,
+				encodeBatch(true, true, nil))
+			h.w.Advance(time.Second)
+			ex.Send(h.w.Now, message.ProtocolInteractionModel, im.OpWriteRequest,
+				encodeBatch(false, false, []struct{ priv, subj uint64 }{
+					{uint64(im.Administer), 0x1B669},
+					{uint64(im.View), 0x2B669},
+				}))
+			h.w.Advance(time.Second)
+		}
+		if len(resps) == 0 {
+			t.Fatal("no WriteResponse received")
+		}
+		for i, raw := range resps {
+			statuses, err := im.DecodeWriteResponse(raw)
+			if err != nil {
+				t.Fatalf("resp %d decode: %v", i, err)
+			}
+			for j, st := range statuses {
+				if st.Status != im.Success {
+					t.Fatalf("resp %d item %d: status=%#x, want Success", i, j, st.Status)
+				}
+			}
+		}
+		if len(h.dev.ACL.Entries) != 2 {
+			t.Fatalf("ACL entries = %d, want 2", len(h.dev.ACL.Entries))
+		}
+	}
+
+	t.Run("single-request", func(t *testing.T) {
+		h := newHarness(t)
+		_, caseS := h.commission()
+		writeACL(t, h, caseS, false)
+	})
+	t.Run("chunked-request", func(t *testing.T) {
+		h := newHarness(t)
+		_, caseS := h.commission()
+		writeACL(t, h, caseS, true)
+	})
+}

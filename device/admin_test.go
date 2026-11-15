@@ -135,3 +135,43 @@ func TestMultiAdmin(t *testing.T) {
 		t.Fatal("window did not time out")
 	}
 }
+
+func TestRevokeCommissioningAfterAddNOC(t *testing.T) {
+	h := newHarness(t)
+	_, admin1 := h.commission()
+
+	res := h.invokeTimed(admin1, ac(1), basicWindow(180))
+	if res.Status != im.Success {
+		t.Fatalf("OpenBasicCommissioningWindow: %+v", res)
+	}
+
+	paseS, err := h.pairPASE(passcode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.addPendingFabric(paseS, 0xFAB2, 2)
+	if len(h.dev.Fabrics.Fabrics()) != 2 || h.dev.Fabrics.Committed() != 1 {
+		t.Fatalf("before revoke: fabrics=%d committed=%d", len(h.dev.Fabrics.Fabrics()), h.dev.Fabrics.Committed())
+	}
+
+	res = h.invokeTimed(admin1, ac(2), nil)
+	if res.Status != im.Success {
+		t.Fatalf("RevokeCommissioning: %+v", res)
+	}
+	h.w.Advance(time.Second)
+
+	if len(h.dev.Fabrics.Fabrics()) != 1 || len(h.dev.ACL.Entries) != 1 {
+		t.Fatalf("after revoke: fabrics=%d acl=%d", len(h.dev.Fabrics.Fabrics()), len(h.dev.ACL.Entries))
+	}
+	if h.dev.FailSafe.Armed(h.w.Now) {
+		t.Fatal("fail-safe still armed after RevokeCommissioning")
+	}
+	if h.dev.PASE.WindowOpen() {
+		t.Fatal("commissioning window still open after RevokeCommissioning")
+	}
+	for _, s := range h.dev.M.Sessions() {
+		if s.AuthMode == exchange.AuthPASE && !s.Closed() {
+			t.Fatal("PASE session survived RevokeCommissioning")
+		}
+	}
+}

@@ -130,8 +130,9 @@ func New(cfg Config) (*Device, error) {
 	disp := securechannel.NewDispatcher(m)
 	d.PASE, err = pase.NewResponder(m, disp, pase.ResponderConfig{
 		Verifier: cfg.Verifier, Salt: cfg.Salt, Iterations: cfg.Iterations, Rand: cfg.Rand,
-		OnEstablished: func(now time.Time, s *exchange.Session) { d.log("PASE session established") },
-		OnFailed:      func(now time.Time, err error) { d.log("PASE failed: " + err.Error()) },
+		OnEstablished:  func(now time.Time, s *exchange.Session) { d.log("PASE session established") },
+		OnFailed:       func(now time.Time, err error) { d.log("PASE failed: " + err.Error()) },
+		OnWindowClosed: d.closeWindow,
 	})
 	if err != nil {
 		return nil, err
@@ -169,6 +170,10 @@ func New(cfg Config) (*Device, error) {
 	}
 	d.FailSafe.OnExpire = append(d.FailSafe.OnExpire, func(now time.Time) {
 		d.log("fail-safe expired: commissioning rolled back")
+		d.General.ResetBreadcrumb(d.Node)
+		// The commissioner must prove the passcode again. Deferred so the
+		// response to an ArmFailSafe(0) still goes out on the session.
+		d.later(d.closePASESessions)
 	})
 
 	d.OpCreds.OnFabricLeave = func(now time.Time, index uint8) { cfg.Basic.Leave(d.Node, now, index) }
@@ -243,6 +248,14 @@ func (d *Device) log(msg string) {
 
 func (d *Device) later(f func(now time.Time)) { d.deferred = append(d.deferred, f) }
 
+func (d *Device) runDeferred(now time.Time) {
+	for len(d.deferred) > 0 {
+		f := d.deferred[0]
+		d.deferred = d.deferred[1:]
+		f(now)
+	}
+}
+
 // HandlePacket processes a received UDP datagram.
 func (d *Device) HandlePacket(now time.Time, from exchange.Addr, pkt []byte) error {
 	return d.M.HandlePacket(now, from, pkt)
@@ -259,11 +272,7 @@ func (d *Device) Poll(now time.Time) time.Time {
 		d.cfg.Basic.StartUp(d.Node, now)
 		d.Diagnostics.BootReasonEvent(d.Node, now)
 	}
-	for len(d.deferred) > 0 {
-		f := d.deferred[0]
-		d.deferred = d.deferred[1:]
-		f(now)
-	}
+	d.runDeferred(now)
 	if d.dirty && !d.HoldSaves {
 		d.dirty = false
 		d.save()
@@ -279,6 +288,7 @@ func (d *Device) Poll(now time.Time) time.Time {
 	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
+	d.runDeferred(now)
 	if t := d.Node.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
@@ -346,8 +356,13 @@ func (d *Device) adminRevoke(ctx *im.Context) clusters.AdminStatus {
 		return clusters.AdminWindowNotOpen
 	}
 	d.closeWindow()
-	if d.FailSafe.Armed(ctx.Now) && d.FailSafe.FabricIndex() == 0 {
-		d.FailSafe.Expire(ctx.Now)
+	if d.FailSafe.Armed(ctx.Now) {
+		idx := d.FailSafe.FabricIndex()
+		if idx == 0 {
+			d.FailSafe.Expire(ctx.Now)
+		} else if f := d.Fabrics.Get(idx); f != nil && f.Pending {
+			d.FailSafe.Expire(ctx.Now)
+		}
 	}
 	d.later(d.closePASESessions)
 	d.log("commissioning window revoked")

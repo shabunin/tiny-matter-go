@@ -191,6 +191,16 @@ func (g *GeneralCommissioning) fabricIndex(ctx *im.Context) uint8 {
 	return g.FabricIndex(ctx)
 }
 
+// ResetBreadcrumb sets Breadcrumb back to 0, as a fail-safe expiry does.
+func (g *GeneralCommissioning) ResetBreadcrumb(node *im.Node) {
+	if g.Breadcrumb != 0 {
+		g.Breadcrumb = 0
+		if node != nil {
+			node.Changed(0, IDGeneralCommissioning, gcBreadcrumb)
+		}
+	}
+}
+
 func (g *GeneralCommissioning) setBreadcrumb(ctx *im.Context, v uint64, ok bool) {
 	if ok && v != g.Breadcrumb {
 		g.Breadcrumb = v
@@ -232,11 +242,12 @@ func (g *GeneralCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 			return respond(resp, gcArmFailSafeResponse, BusyWithOtherAdmin)
 		}
 		if expiry == 0 {
+			// The expiry resets the breadcrumb; the request's is not kept.
 			fs.Expire(ctx.Now)
 		} else {
 			fs.Arm(ctx.Now, time.Duration(expiry)*time.Second, g.MaxCumulativeFailsafe, fabric)
+			g.setBreadcrumb(ctx, breadcrumb, true)
 		}
-		g.setBreadcrumb(ctx, breadcrumb, true)
 		return respond(resp, gcArmFailSafeResponse, CommissioningOK)
 
 	case gcSetRegulatoryConfig:
