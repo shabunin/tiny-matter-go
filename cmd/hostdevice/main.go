@@ -1,6 +1,6 @@
 // Command hostdevice runs the stack on a host over UDP for interoperability
 // testing against a Matter controller such as chip-tool. It is an on/off
-// light (endpoint 1) and a push button (endpoint 2, Generic Switch) using
+// light (endpoint 1, a member of the groups added to it) and a push button (endpoint 2, Generic Switch) using
 // the SDK development attestation credentials (vendor 0xFFF1, product
 // 0x8000), test passcode 20202021 and discriminator 3840.
 //
@@ -97,9 +97,13 @@ func main() {
 		log.Fatal(err)
 	}
 	light := d.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
-	d.Node.AddCluster(light, clusters.Descriptor{},
-		&clusters.Identify{Type: clusters.IdentifyLightOutput, OnIdentify: func(on bool) { log.Printf("light identify=%v", on) }},
-		&clusters.OnOff{OnChange: func(on bool) { log.Printf("light on=%v", on) }})
+	lightID := &clusters.Identify{Type: clusters.IdentifyLightOutput, OnIdentify: func(on bool) { log.Printf("light identify=%v", on) }}
+	d.Node.AddCluster(light, clusters.Descriptor{}, lightID,
+		&clusters.OnOff{OnChange: func(on bool) { log.Printf("light on=%v", on) }},
+		d.NewGroups(lightID))
+	groups := &groupMemberships{c: conn, joined: map[netip.Addr]bool{}}
+	d.OnMulticast = groups.set
+	groups.set(d.MulticastAddrs())
 	button := &clusters.Switch{}
 	sw := d.Node.AddEndpoint(2, clusters.DeviceTypeGenericSwitch)
 	d.Node.AddCluster(sw, clusters.Descriptor{},

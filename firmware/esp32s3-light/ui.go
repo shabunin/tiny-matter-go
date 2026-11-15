@@ -69,7 +69,7 @@ func newUI(d *device.Device, store *storage.Flash) *ui {
 			}
 			u.light = on
 		},
-	})
+	}, d.NewGroups(&u.lightID))
 	sw := d.Node.AddEndpoint(switchEndpoint, clusters.DeviceTypeGenericSwitch)
 	d.Node.AddCluster(sw, clusters.Descriptor{}, &u.buttonID, &u.button)
 	return u

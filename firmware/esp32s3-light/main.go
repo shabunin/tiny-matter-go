@@ -46,6 +46,7 @@ import (
 	"machine"
 	"net/netip"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -360,6 +361,25 @@ func main() {
 		fatal("join mdns", err)
 	}
 	stack4.Join(mdns.Group4)
+	// Listen on the multicast addresses of the groups the light is in.
+	var groupAddrs []netip.Addr
+	setGroups := func(addrs []netip.Addr) {
+		for _, a := range groupAddrs {
+			if !slices.Contains(addrs, a) {
+				stack.Leave(a)
+			}
+		}
+		for _, a := range addrs {
+			if !slices.Contains(groupAddrs, a) {
+				if err := stack.Join(a); err != nil {
+					println("join group address", a.String(), err.Error())
+				}
+			}
+		}
+		groupAddrs = append(groupAddrs[:0], addrs...)
+	}
+	setGroups(d.MulticastAddrs())
+	d.OnMulticast = setGroups
 	stack4.StartDHCP(hexMAC(mac), func(p netip.Prefix, gw netip.Addr) {
 		addrs := []netip.Addr{stack.Addr()}
 		ipv4 = netip.Addr{}
