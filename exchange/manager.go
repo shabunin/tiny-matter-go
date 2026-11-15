@@ -105,8 +105,13 @@ type Manager struct {
 	nextExchangeID uint16
 	nextSessionID  uint16
 
-	plain [message.MaxPacketSize]byte
-	out   [message.MaxPacketSize]byte
+	groupKeys  GroupKeyFunc
+	groupPeers []groupPeer
+	groupTick  uint32
+
+	plain    [message.MaxPacketSize]byte
+	out      [message.MaxPacketSize]byte
+	groupBuf [message.MaxPacketSize]byte // a group message, decrypted per key tried
 }
 
 // NewManager returns a Manager.
@@ -311,9 +316,12 @@ func (m *Manager) HandlePacket(now time.Time, from Addr, pkt []byte) error {
 	var pn int
 	dup := false
 	createdSession := false
+	if h.SessionType == message.SessionGroup {
+		return m.handleGroup(now, from, pkt, &h)
+	}
 	if h.IsEncrypted() {
-		if h.SessionType != message.SessionUnicast {
-			return message.ErrUnsupported // group messaging
+		if h.Privacy {
+			return message.ErrUnsupported // privacy is for group messages
 		}
 		if s = m.secureByLocalID(h.SessionID); s == nil {
 			return ErrUnknownSession
@@ -484,6 +492,9 @@ func (m *Manager) NewExchange(s *Session, d Delegate) (*Exchange, error) {
 // send encodes, encrypts and transmits a message on s, returning the packet
 // (valid until the next send) and its message counter.
 func (m *Manager) send(s *Session, ph *message.ProtocolHeader, payload []byte) ([]byte, uint32, error) {
+	if s.group {
+		return nil, 0, ErrGroupSession
+	}
 	if s.closed {
 		return nil, 0, ErrSessionClosed
 	}

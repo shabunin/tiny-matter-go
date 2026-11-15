@@ -17,6 +17,7 @@ type Session struct {
 	m      *Manager
 	secure bool
 	closed bool
+	group  bool
 
 	// Peer is the peer's current address; for secure sessions it follows the
 	// source address of the latest authenticated message.
@@ -44,6 +45,9 @@ type Session struct {
 	// control. FabricIndex is 0 while a PASE session has no fabric yet.
 	AuthMode    AuthMode
 	FabricIndex uint8
+	// GroupID is the group a group message was sent to, on the session
+	// of an incoming group message (AuthMode AuthGroup).
+	GroupID uint16
 	// PeerCATs are the CASE Authenticated Tags of a CASE peer.
 	PeerCATs []uint32
 	// AttestationChallenge is derived with the session keys and used to
@@ -86,10 +90,15 @@ type SecureSessionParams struct {
 // IsSecure reports whether the session is encrypted.
 func (s *Session) IsSecure() bool { return s.secure }
 
+// IsGroup reports whether the session carries an incoming group message,
+// which is never answered.
+func (s *Session) IsGroup() bool { return s.group }
+
 // LocalSessionID returns the session ID peers use to address us.
 func (s *Session) LocalSessionID() uint16 { return s.localSessionID }
 
-// PeerNodeID returns the peer's operational node ID (0 for PASE sessions).
+// PeerNodeID returns the peer's operational node ID (0 for PASE sessions;
+// the sender's for a group message).
 func (s *Session) PeerNodeID() uint64 { return s.peerNodeID }
 
 // Closed reports whether the session was released.
