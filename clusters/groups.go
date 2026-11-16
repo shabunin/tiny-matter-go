@@ -595,6 +595,15 @@ type Groups struct {
 	// Identify, if set, is the endpoint's Identify cluster, for
 	// AddGroupIfIdentifying.
 	Identify *Identify
+	// Scenes, if set, is the endpoint's Scenes Management cluster: leaving
+	// a group deletes the group's scenes.
+	Scenes *ScenesManagement
+}
+
+func (g *Groups) removeScenes(ctx *im.Context, fabricIndex uint8, id uint16) {
+	if g.Scenes != nil {
+		g.Scenes.RemoveGroup(ctx.Node, ctx.Endpoint, fabricIndex, id)
+	}
 }
 
 var (
@@ -713,6 +722,7 @@ func (g *Groups) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader, resp *im.Res
 		case !member:
 			st = im.NotFound
 		case cmd == groupsRemoveGroup:
+			g.removeScenes(ctx, fabricIndex, id)
 			d.removeEndpoint(fabricIndex, id, ctx.Endpoint)
 			g.groupTableChanged(ctx)
 		}
@@ -769,8 +779,10 @@ func (g *Groups) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader, resp *im.Res
 
 	case groupsRemoveAllGroups:
 		removed := false
+		g.removeScenes(ctx, fabricIndex, 0)
 		for _, gi := range append([]GroupInfo(nil), d.Groups...) {
 			if gi.FabricIndex == fabricIndex && hasEndpoint(gi.Endpoints, ctx.Endpoint) {
+				g.removeScenes(ctx, fabricIndex, gi.GroupID)
 				d.removeEndpoint(fabricIndex, gi.GroupID, ctx.Endpoint)
 				removed = true
 			}

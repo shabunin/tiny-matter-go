@@ -178,6 +178,7 @@ func New(cfg Config) (*Device, error) {
 	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
 		d.Node.Events.RemoveFabric(index)
 		d.Groups.RemoveFabric(index)
+		d.removeFabricScenes(index)
 		d.M.ForgetGroupPeers(index)
 		d.later(func(now time.Time) {
 			d.closeFabricSessions(now, index)
@@ -273,6 +274,20 @@ func (d *Device) boot(t time.Time) {
 // cluster (for AddGroupIfIdentifying).
 func (d *Device) NewGroups(identify *clusters.Identify) *clusters.Groups {
 	return &clusters.Groups{Data: d.Groups, Identify: identify}
+}
+
+// NewScenes returns a Scenes Management cluster over the device's groups,
+// for an application endpoint. Pass it to the endpoint's Groups cluster
+// and On/Off cluster too (Groups.Scenes, OnOff.Scenes).
+func (d *Device) NewScenes() *clusters.ScenesManagement { return clusters.NewScenes(d.Groups) }
+
+// removeFabricScenes deletes a removed fabric's scenes on every endpoint.
+func (d *Device) removeFabricScenes(index uint8) {
+	for _, e := range d.Node.Endpoints() {
+		if s, ok := e.Cluster(clusters.IDScenesManagement).(*clusters.ScenesManagement); ok {
+			s.RemoveFabric(d.Node, e.ID, index)
+		}
+	}
 }
 
 // MulticastAddrs returns the IPv6 multicast addresses of the node's
