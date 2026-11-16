@@ -289,6 +289,7 @@ func (in *initiator) onSigma2Resume(now time.Time, ex *exchange.Exchange, payloa
 		FabricIndex:          f.Index,
 		PeerCATs:             rec.PeerCATs,
 		AttestationChallenge: keys.AttestationChallenge,
+		Resumed:              true,
 	})
 	if err == nil {
 		next := *rec

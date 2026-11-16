@@ -8,6 +8,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
@@ -27,6 +28,8 @@ import (
 //	9: application cluster state [ { 1: endpoint, 2: cluster, 3: state } ]
 //	   (see im.Persister)
 //	10: OTA requestor: default providers and an update being applied
+//	11: Basic Information { 1: NodeLabel, 2: Location }
+//	12: CASE resumption records (see casesession.ResumptionStore.Encode)
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -95,6 +98,14 @@ func (d *Device) encodeState() []byte {
 	w.PutString(tlv.ContextTag(1), d.cfg.Basic.NodeLabel)
 	w.PutString(tlv.ContextTag(2), d.cfg.Basic.Location)
 	w.EndContainer()
+	// CASE resumption records, so controllers resume sessions (no
+	// certificate exchange or signatures) after a restart.
+	if d.Resumptions.Len() > 0 {
+		d.Resumptions.Encode(w, tlv.ContextTag(12), func(index uint8) bool {
+			f := d.Fabrics.Get(index)
+			return f != nil && !f.Pending
+		})
+	}
 	w.EndContainer()
 	return w.Bytes()
 }
@@ -273,6 +284,8 @@ func (d *Device) decodeState(b []byte) error {
 			}
 		case 11:
 			return d.decodeBasic(r)
+		case 12:
+			return d.Resumptions.Decode(r)
 		}
 		return nil
 	})
@@ -379,6 +392,7 @@ func (d *Device) load() error {
 		d.eventLimit, d.Diagnostics.RebootCount = 0, 0
 		*d.Groups = clusters.GroupData{Fabrics: d.Fabrics, OnChange: d.Groups.OnChange}
 		d.appState = nil
+		*d.Resumptions = casesession.ResumptionStore{Max: d.Resumptions.Max, OnChange: d.Resumptions.OnChange}
 		if d.ota != nil {
 			d.ota.c.Providers, d.ota.pending = nil, nil
 			d.ota.c.InitState(clusters.OTAStateIdle)

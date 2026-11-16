@@ -98,8 +98,9 @@ type Device struct {
 	// Groups holds the group keys and memberships. Add a Groups cluster
 	// (NewGroups) to each application endpoint that groups may address.
 	Groups *clusters.GroupData
-	// Resumptions keeps CASE resumption records (in memory), so
-	// controllers that reconnect can skip the full handshake.
+	// Resumptions keeps CASE resumption records, so controllers that
+	// reconnect (also after a restart: they are saved) can skip the full
+	// handshake.
 	Resumptions *casesession.ResumptionStore
 	// OnMulticast, if set, is called with the IPv6 multicast addresses of
 	// the node's groups whenever they change; the network layer should
@@ -164,6 +165,9 @@ func New(cfg Config) (*Device, error) {
 
 		Resumptions: &casesession.ResumptionStore{Max: 2 * fabric.MaxFabrics},
 	}
+	// A new record is saved with the next batch of state changes: losing
+	// it costs only a full handshake.
+	d.Resumptions.OnChange = func() { d.appDirty = true }
 	disp := securechannel.NewDispatcher(m)
 	d.PASE, err = pase.NewResponder(m, disp, pase.ResponderConfig{
 		Verifier: cfg.Verifier, Salt: cfg.Salt, Iterations: cfg.Iterations, Rand: cfg.Rand,
@@ -178,7 +182,11 @@ func New(cfg Config) (*Device, error) {
 	casesession.NewResponder(m, disp, casesession.ResponderConfig{
 		Fabrics: d.Fabrics, Rand: cfg.Rand, Resumptions: d.Resumptions,
 		OnEstablished: func(now time.Time, s *exchange.Session, f *fabric.Fabric) {
-			d.log("CASE session established")
+			if s.Resumed {
+				d.log("CASE session resumed")
+			} else {
+				d.log("CASE session established")
+			}
 		},
 		OnFailed: func(now time.Time, err error) { d.log("CASE failed: " + err.Error()) },
 	})

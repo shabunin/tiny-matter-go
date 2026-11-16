@@ -832,3 +832,58 @@ func TestWriteACLReplaceAndAppendOverCASE(t *testing.T) {
 		writeACL(t, h, caseS, true)
 	})
 }
+
+// TestRestartKeepsResumption: a controller that connected before a restart
+// resumes its session afterwards, without the full handshake.
+func TestRestartKeepsResumption(t *testing.T) {
+	store := &storage.Memory{}
+	h := newHarnessStore(t, store)
+	ctlF, _ := h.commission()
+	ctlStore := &casesession.ResumptionStore{}
+	connect := func(h *harness, resumed bool) {
+		t.Helper()
+		var done bool
+		err := casesession.Connect(h.w.Now, h.ctl.M, h.devN.Addr, casesession.InitiatorConfig{
+			Fabric: ctlF, PeerNodeID: 1, Rand: rand.Reader, Resumptions: ctlStore,
+			Done: func(now time.Time, s *exchange.Session, err error) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if s.Resumed != resumed {
+					t.Fatalf("session resumed: %v, want %v", s.Resumed, resumed)
+				}
+				done = true
+			}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.w.Advance(time.Second)
+		if !done {
+			t.Fatal("CASE did not complete")
+		}
+	}
+	connect(h, false)
+	if ctlStore.Len() != 1 {
+		t.Fatal("no resumption record")
+	}
+	h.w.Advance(5 * time.Second) // records are saved with the next batch
+
+	h2 := newHarnessStore(t, store)
+	if h2.dev.Resumptions.Len() == 0 {
+		t.Fatal("resumption records not restored")
+	}
+	// With an operational key that no longer matches its NOC, the device
+	// cannot complete a full handshake: only resumption succeeds.
+	f := h2.dev.Fabrics.Fabrics()[0]
+	f.Key, _ = p256.GenerateKey(rand.Reader)
+	connect(h2, true)
+
+	// Forgotten records (as when the fabric is removed) stay forgotten.
+	h3 := newHarnessStore(t, store)
+	idx := h3.dev.Fabrics.Fabrics()[0].Index
+	h3.dev.Resumptions.ForgetFabric(idx)
+	h3.dev.Flush()
+	if h4 := newHarnessStore(t, store); h4.dev.Resumptions.Len() != 0 {
+		t.Fatal("forgotten records came back")
+	}
+}

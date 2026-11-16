@@ -109,6 +109,92 @@ func (s *ResumptionStore) ForgetFabric(fabricIndex uint8) {
 // Len returns the number of records.
 func (s *ResumptionStore) Len() int { return len(s.records) }
 
+// Encode writes the records of the fabrics keep accepts, least recently
+// used first, as a list under tag (to persist them: they hold session
+// secrets, so store them as the fabrics' keys are stored).
+func (s *ResumptionStore) Encode(w *tlv.Writer, tag tlv.Tag, keep func(fabricIndex uint8) bool) {
+	w.StartArray(tag)
+	for _, r := range s.records {
+		if keep != nil && !keep(r.FabricIndex) {
+			continue
+		}
+		w.StartStruct(tlv.Anonymous)
+		w.PutBytes(tlv.ContextTag(1), r.ID[:])
+		w.PutBytes(tlv.ContextTag(2), r.Secret)
+		w.PutUint(tlv.ContextTag(3), uint64(r.FabricIndex))
+		w.PutUint(tlv.ContextTag(4), r.LocalNodeID)
+		w.PutUint(tlv.ContextTag(5), r.PeerNodeID)
+		if len(r.PeerCATs) > 0 {
+			w.StartArray(tlv.ContextTag(6))
+			for _, c := range r.PeerCATs {
+				w.PutUint(tlv.Anonymous, uint64(c))
+			}
+			w.EndContainer()
+		}
+		w.EndContainer()
+	}
+	w.EndContainer()
+}
+
+// Decode replaces the records with those Encode wrote; r is positioned on
+// the list. Malformed records are skipped. OnChange is not called.
+func (s *ResumptionStore) Decode(r *tlv.Reader) error {
+	if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+		return errMessage
+	}
+	s.records = nil
+	for r.Next() == nil {
+		rec := &Resumption{}
+		var seen uint8
+		err := structFields(r, func(r *tlv.Reader, tag uint32) (err error) {
+			switch tag {
+			case 1:
+				err = fixed(r, rec.ID[:])
+			case 2:
+				var b []byte
+				if b, err = r.Bytes(); err == nil {
+					rec.Secret = slices.Clone(b)
+				}
+			case 3:
+				rec.FabricIndex, err = r.Uint8()
+			case 4:
+				rec.LocalNodeID, err = r.Uint()
+			case 5:
+				rec.PeerNodeID, err = r.Uint()
+			case 6:
+				if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+					return errMessage
+				}
+				for r.Next() == nil {
+					c, err := r.Uint32()
+					if err != nil {
+						return err
+					}
+					rec.PeerCATs = append(rec.PeerCATs, c)
+				}
+				return r.ExitContainer()
+			default:
+				return nil
+			}
+			seen |= 1 << tag
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if seen&0b111110 == 0b111110 && len(rec.Secret) > 0 && rec.FabricIndex != 0 {
+			s.records = append(s.records, rec)
+		}
+	}
+	if err := r.ExitContainer(); err != nil {
+		return err
+	}
+	if max := s.Max; max > 0 && len(s.records) > max {
+		s.records = s.records[len(s.records)-max:]
+	}
+	return nil
+}
+
 // Resumption key derivation (spec 4.14.2.6): S1RK and S2RK authenticate the
 // resume request and reply, as AES-CCM tags over nothing.
 var (

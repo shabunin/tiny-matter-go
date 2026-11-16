@@ -325,6 +325,7 @@ func (h *responderHandshake) onResumeStatus(now time.Time, ex *exchange.Exchange
 		FabricIndex:          f.Index,
 		PeerCATs:             rec.PeerCATs,
 		AttestationChallenge: keys.AttestationChallenge,
+		Resumed:              true,
 	})
 	if err != nil {
 		return err

@@ -11,6 +11,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/fabric"
 	"github.com/shabunin/tiny-matter-go/internal/simnet"
 	"github.com/shabunin/tiny-matter-go/securechannel"
+	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
 type resumePeers struct {
@@ -88,6 +89,19 @@ func TestCASEResumption(t *testing.T) {
 		t.Fatal("records name the wrong peers")
 	}
 
+	// The device restarts: its records come back from storage.
+	w := tlv.NewWriter(nil)
+	p.devStore.Encode(w, tlv.Anonymous, nil)
+	restored := &ResumptionStore{}
+	r := tlv.NewReader(w.Bytes())
+	if err := r.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Decode(r); err != nil {
+		t.Fatal(err)
+	}
+	*p.devStore = *restored
+
 	// With a key that no longer matches its NOC, the device cannot run a
 	// full handshake: it can only resume.
 	realKey := devF.Key
@@ -133,5 +147,63 @@ func TestResumptionStore(t *testing.T) {
 	s.ForgetFabric(1)
 	if s.Len() != 0 {
 		t.Fatal("ForgetFabric left records")
+	}
+}
+
+func TestResumptionStoreEncode(t *testing.T) {
+	s := &ResumptionStore{}
+	for i := range 4 {
+		r := &Resumption{Secret: bytes.Repeat([]byte{byte(i)}, 32), FabricIndex: uint8(1 + i%2),
+			LocalNodeID: 0x100 + uint64(i), PeerNodeID: uint64(i)}
+		if i == 3 {
+			r.PeerCATs = []uint32{0x0001_0001, 0x0002_0001}
+		}
+		r.ID[0] = byte(i)
+		s.save(r)
+	}
+	decode := func(b []byte, max int) *ResumptionStore {
+		t.Helper()
+		d := &ResumptionStore{Max: max}
+		r := tlv.NewReader(b)
+		if err := r.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Decode(r); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+
+	// Fabric 1 only: records 0 and 2, in order.
+	w := tlv.NewWriter(nil)
+	s.Encode(w, tlv.Anonymous, func(index uint8) bool { return index == 1 })
+	d := decode(w.Bytes(), 0)
+	if d.Len() != 2 || d.records[0].PeerNodeID != 0 || d.records[1].PeerNodeID != 2 {
+		t.Fatalf("filtered: %d records", d.Len())
+	}
+
+	// Everything round-trips; Max keeps the most recently used.
+	w = tlv.NewWriter(nil)
+	s.Encode(w, tlv.Anonymous, nil)
+	d = decode(w.Bytes(), 0)
+	for i, r := range d.records {
+		o := s.records[i]
+		if r.ID != o.ID || !bytes.Equal(r.Secret, o.Secret) || r.FabricIndex != o.FabricIndex ||
+			r.LocalNodeID != o.LocalNodeID || r.PeerNodeID != o.PeerNodeID || len(r.PeerCATs) != len(o.PeerCATs) {
+			t.Fatalf("record %d: %+v, want %+v", i, r, o)
+		}
+	}
+	if d.records[3].PeerCATs[1] != 0x0002_0001 {
+		t.Fatal("CATs lost")
+	}
+	if d = decode(w.Bytes(), 3); d.Len() != 3 || d.records[0].PeerNodeID != 1 {
+		t.Fatalf("Max: %d records", d.Len())
+	}
+	// A record without a secret is dropped.
+	s.records[0].Secret = nil
+	w = tlv.NewWriter(nil)
+	s.Encode(w, tlv.Anonymous, nil)
+	if d = decode(w.Bytes(), 0); d.Len() != 3 {
+		t.Fatalf("malformed record kept: %d records", d.Len())
 	}
 }

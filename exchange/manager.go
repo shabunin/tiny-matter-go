@@ -191,6 +191,7 @@ func (m *Manager) NewSecureSession(now time.Time, p SecureSessionParams) (*Sessi
 		enc: enc, dec: dec, counter: ctr, lastUse: now,
 		AuthMode: p.AuthMode, FabricIndex: p.FabricIndex, PeerCATs: p.PeerCATs,
 		AttestationChallenge: p.AttestationChallenge,
+		Resumed:              p.Resumed,
 	}
 	if s.PeerMRP == (MRPConfig{}) {
 		s.PeerMRP = DefaultMRPConfig

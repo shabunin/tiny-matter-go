@@ -95,7 +95,15 @@ func EncodeSigma3(encrypted3 []byte) []byte {
 // fields iterates over the context-tagged fields of the top-level structure.
 func fields(b []byte, f func(r *tlv.Reader, tag uint32) error) error {
 	r := tlv.NewReader(b)
-	if r.Next() != nil || r.Type() != tlv.TypeStruct || r.EnterContainer() != nil {
+	if r.Next() != nil {
+		return errMessage
+	}
+	return structFields(r, f)
+}
+
+// structFields is fields on a reader positioned on the structure.
+func structFields(r *tlv.Reader, f func(r *tlv.Reader, tag uint32) error) error {
+	if r.Type() != tlv.TypeStruct || r.EnterContainer() != nil {
 		return errMessage
 	}
 	for {

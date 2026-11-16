@@ -53,6 +53,8 @@ type Session struct {
 	// AttestationChallenge is derived with the session keys and used to
 	// bind device attestation to the session.
 	AttestationChallenge [16]byte
+	// Resumed is set on a CASE session that resumed an earlier one.
+	Resumed bool
 
 	// Attachment is free for the layer that established the session.
 	Attachment any
@@ -85,6 +87,7 @@ type SecureSessionParams struct {
 	PeerCATs       []uint32
 	// AttestationChallenge, from the session key derivation.
 	AttestationChallenge [16]byte
+	Resumed              bool // a resumed CASE session
 }
 
 // IsSecure reports whether the session is encrypted.
