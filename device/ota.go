@@ -263,7 +263,7 @@ func (u *updater) withSession(now time.Time, f func(now time.Time, s *exchange.S
 	u.step = func(time.Time) {} // waiting
 	u.at = time.Time{}
 	err := casesession.Connect(now, u.d.M, u.addr, casesession.InitiatorConfig{
-		Fabric: fab, PeerNodeID: u.provider.NodeID, Rand: u.d.cfg.Rand,
+		Fabric: fab, PeerNodeID: u.provider.NodeID, Rand: u.d.cfg.Rand, Resumptions: u.d.Resumptions,
 		Done: func(now time.Time, s *exchange.Session, err error) {
 			if err != nil {
 				u.fail(now, clusters.OTAReasonFailure, err)

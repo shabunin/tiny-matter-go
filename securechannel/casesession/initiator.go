@@ -21,6 +21,9 @@ type InitiatorConfig struct {
 	PeerNodeID    uint64
 	SessionParams securechannel.SessionParams
 	Rand          io.Reader
+	// Resumptions, if set, is where a session to the peer is resumed from
+	// and recorded for resumption.
+	Resumptions *ResumptionStore
 	// Done is called once, with the CASE session or an error.
 	Done func(now time.Time, s *exchange.Session, err error)
 }
@@ -39,6 +42,10 @@ type initiator struct {
 	peerSessionID  uint16
 	peerMRP        exchange.MRPConfig
 	peerCATs       []uint32
+
+	initiatorRandom []byte
+	resume          *Resumption // the record offered in Sigma1
+	resumptionID    []byte      // from Sigma2
 }
 
 // Connect starts CASE with the node at peer.
@@ -77,6 +84,17 @@ func Connect(now time.Time, m *exchange.Manager, peer exchange.Addr, cfg Initiat
 		return failSync(err)
 	}
 	f := cfg.Fabric
+	in.initiatorRandom = s1.InitiatorRandom[:]
+	if cfg.Resumptions != nil {
+		if rec := cfg.Resumptions.byPeer(f.Index, f.NodeID, cfg.PeerNodeID); rec != nil {
+			mic, err := resumeMIC(rec.Secret, s1.InitiatorRandom[:], rec.ID[:], infoResume1, nonceResume1)
+			if err != nil {
+				return failSync(err)
+			}
+			in.resume = rec
+			s1.ResumptionID, s1.ResumeMIC = rec.ID[:], mic
+		}
+	}
 	s1.DestinationID = DestinationID(f.OperationalIPK[:], s1.InitiatorRandom[:], f.RootPublicKey, f.FabricID, cfg.PeerNodeID)
 	copy(s1.InitiatorEphPubKey[:], in.ephPub)
 	b := s1.Encode()
@@ -115,6 +133,13 @@ func (in *initiator) OnMessage(now time.Time, ex *exchange.Exchange, msg exchang
 		return
 	case in.state == 0 && msg.Opcode == securechannel.OpCASESigma2:
 		err = in.onSigma2(now, ex, msg.Payload)
+	case in.state == 0 && msg.Opcode == securechannel.OpCASESigma2Resume && in.resume != nil:
+		err = in.onSigma2Resume(now, ex, msg.Payload)
+		if err == nil {
+			return
+		}
+		// The record is no good: the next attempt runs the full handshake.
+		in.cfg.Resumptions.Forget(in.resume.FabricIndex, in.resume.PeerNodeID)
 	default:
 		err = ErrUnexpected
 	}
@@ -152,6 +177,7 @@ func (in *initiator) onSigma2(now time.Time, ex *exchange.Exchange, payload []by
 	if err != nil || len(t.resumptionID) != ResumptionIDSize {
 		return errMessage
 	}
+	in.resumptionID = append([]byte{}, t.resumptionID...)
 	id, err := credentials.ValidateNOCChain(t.noc, t.icac, f.RCAC)
 	if err != nil || id.FabricID != f.FabricID || id.NodeID != in.cfg.PeerNodeID {
 		return ErrPeerCert
@@ -219,6 +245,56 @@ func (in *initiator) onStatus(now time.Time, ex *exchange.Exchange, payload []by
 		PeerCATs:             in.peerCATs,
 		AttestationChallenge: keys.AttestationChallenge,
 	})
+	if err == nil && in.cfg.Resumptions != nil {
+		rec := &Resumption{Secret: append([]byte{}, in.shared...), FabricIndex: f.Index, LocalNodeID: f.NodeID,
+			PeerNodeID: in.cfg.PeerNodeID, PeerCATs: in.peerCATs}
+		copy(rec.ID[:], in.resumptionID)
+		in.cfg.Resumptions.save(rec)
+	}
 	clear(in.shared)
 	in.finish(now, ex, s, err)
+}
+
+// onSigma2Resume completes a resumption: it checks the responder's MIC,
+// confirms with a status report and starts the session.
+func (in *initiator) onSigma2Resume(now time.Time, ex *exchange.Exchange, payload []byte) error {
+	m, err := DecodeSigma2Resume(payload)
+	if err != nil {
+		return err
+	}
+	rec, f := in.resume, in.cfg.Fabric
+	if !checkResumeMIC(m.MIC[:], rec.Secret, in.initiatorRandom, m.ResumptionID[:], infoResume2, nonceResume2) {
+		return ErrDecrypt
+	}
+	if m.SessionParams != nil {
+		in.peerMRP = m.SessionParams.MRP
+		ex.Session().PeerMRP = in.peerMRP
+	}
+	keys, err := securechannel.DeriveSessionKeys(rec.Secret, cat(in.initiatorRandom, rec.ID[:]), infoResumedKeys)
+	if err != nil {
+		return err
+	}
+	securechannel.SendStatus(now, ex, securechannel.SecureChannelStatus(
+		securechannel.GeneralSuccess, securechannel.CodeSessionEstablishmentSuccess))
+	s, err := in.m.NewSecureSession(now, exchange.SecureSessionParams{
+		Peer:                 ex.Session().Peer,
+		PeerMRP:              in.peerMRP,
+		LocalSessionID:       in.localSessionID,
+		PeerSessionID:        m.ResponderSessionID,
+		LocalNodeID:          f.NodeID,
+		PeerNodeID:           in.cfg.PeerNodeID,
+		EncryptKey:           keys.I2R[:],
+		DecryptKey:           keys.R2I[:],
+		AuthMode:             exchange.AuthCASE,
+		FabricIndex:          f.Index,
+		PeerCATs:             rec.PeerCATs,
+		AttestationChallenge: keys.AttestationChallenge,
+	})
+	if err == nil {
+		next := *rec
+		next.ID = m.ResumptionID
+		in.cfg.Resumptions.save(&next)
+	}
+	in.finish(now, ex, s, err)
+	return nil
 }

@@ -1,8 +1,7 @@
 // Package casesession implements Certificate Authenticated Session
 // Establishment (Matter Core Specification 4.14.2): the Sigma handshake
-// that opens operational sessions between nodes of a fabric. Session
-// resumption is not offered; resumption requests fall back to a full
-// handshake.
+// that opens operational sessions between nodes of a fabric, and its
+// resumption of earlier sessions (ResumptionStore).
 package casesession
 
 import (

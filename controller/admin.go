@@ -51,6 +51,7 @@ func (c *Controller) RemoveNode(ctx context.Context, id uint64) error {
 // the node, which keeps the fabric until it is removed there.
 func (c *Controller) ForgetNode(id uint64) error {
 	c.CloseSessions(id)
+	c.do(func(time.Time) { c.resumptions.Forget(c.fab.Index, id) })
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.removeNodeLocked(id) {

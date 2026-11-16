@@ -215,7 +215,9 @@ func FuzzDecode(f *testing.F) {
 	f.Add(s2.Encode())
 	f.Add(EncodeSigma3(make([]byte, 40)))
 	f.Add(tbeData(make([]byte, 30), nil, make([]byte, 64), make([]byte, 16)))
+	f.Add((&Sigma2Resume{ResponderSessionID: 1, SessionParams: &securechannel.DefaultSessionParams}).Encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
+		DecodeSigma2Resume(b)
 		DecodeSigma1(b)
 		DecodeSigma2(b)
 		DecodeSigma3(b)

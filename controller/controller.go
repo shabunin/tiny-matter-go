@@ -105,6 +105,9 @@ type Controller struct {
 	server   *im.Server // serves nodes' requests (the OTA provider), if set
 	links    map[netip.AddrPort]*bleLink
 	nextLink uint16
+	// resumptions lets reconnects to nodes skip the full CASE handshake;
+	// kept in memory, as each run of the controller has its own node ID.
+	resumptions *casesession.ResumptionStore
 }
 
 type packet struct {
@@ -129,6 +132,8 @@ func Open(opts Options) (*Controller, error) {
 		sessions: make(map[uint64]*exchange.Session),
 		subs:     make(map[uint32]*subState),
 		links:    make(map[netip.AddrPort]*bleLink),
+
+		resumptions: &casesession.ResumptionStore{Max: 64},
 	}
 	if c.rootKey, err = p256.NewPrivateKey(st.RootKey); err != nil {
 		return nil, err
@@ -167,7 +172,7 @@ func Open(opts Options) (*Controller, error) {
 	})
 	// Nodes may open CASE sessions to the controller, as OTA requestors
 	// do to their provider.
-	casesession.NewResponder(c.m, disp, casesession.ResponderConfig{Fabrics: c.fabrics, Rand: rand.Reader})
+	casesession.NewResponder(c.m, disp, casesession.ResponderConfig{Fabrics: c.fabrics, Rand: rand.Reader, Resumptions: c.resumptions})
 	c.m.Register(message.ProtocolInteractionModel, c.imFactory)
 	if !opts.NoDiscovery {
 		if c.disc, err = newDiscovery(); err != nil {
@@ -471,10 +476,14 @@ func (c *Controller) connect(ctx context.Context, id uint64, addr netip.AddrPort
 		err error
 	}
 	res := make(chan result, 1)
-	c.logf("CASE with node %d at %v", id, addr)
 	err := c.do(func(now time.Time) {
+		how := ""
+		if c.resumptions.Resumable(c.fab, id) {
+			how = " (resuming)"
+		}
+		c.logf("CASE with node %d at %v%s", id, addr, how)
 		err := casesession.Connect(now, c.m, addr, casesession.InitiatorConfig{
-			Fabric: c.fab, PeerNodeID: id, Rand: rand.Reader,
+			Fabric: c.fab, PeerNodeID: id, Rand: rand.Reader, Resumptions: c.resumptions,
 			Done: func(now time.Time, s *exchange.Session, err error) {
 				if err == nil {
 					if old := c.sessions[id]; old != nil && old != s {

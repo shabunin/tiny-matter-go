@@ -18,7 +18,10 @@ type ResponderConfig struct {
 	Fabrics       *fabric.Table
 	SessionParams securechannel.SessionParams
 	Rand          io.Reader
-	// OnEstablished is called with each new CASE session.
+	// Resumptions, if set, keeps resumption records of established
+	// sessions and lets initiators resume them.
+	Resumptions *ResumptionStore
+	// OnEstablished is called with each new CASE session, full or resumed.
 	OnEstablished func(now time.Time, s *exchange.Session, f *fabric.Fabric)
 	// OnFailed, if set, is called when a handshake fails.
 	OnFailed func(now time.Time, err error)
@@ -49,9 +52,13 @@ func (r *Responder) factory(ex *exchange.Exchange) exchange.Delegate {
 
 type responderHandshake struct {
 	r      *Responder
-	state  uint8 // 0 wait Sigma1, 1 wait Sigma3, 2 done
+	state  uint8 // 0 wait Sigma1, 1 wait Sigma3, 2 done, 3 wait status after Sigma2_Resume
 	fabric *fabric.Fabric
 	tr     *transcript
+
+	resumptionID    []byte      // offered in Sigma2, or the new one in Sigma2_Resume
+	resume          *Resumption // the record being resumed
+	initiatorRandom []byte
 
 	shared          []byte
 	ephPub, peerEph []byte
@@ -92,6 +99,8 @@ func (h *responderHandshake) OnMessage(now time.Time, ex *exchange.Exchange, msg
 	switch {
 	case msg.ProtocolID != message.ProtocolSecureChannel:
 		err = ErrUnexpected
+	case msg.Opcode == securechannel.OpStatusReport && h.state == 3:
+		err = h.onResumeStatus(now, ex, msg.Payload)
 	case msg.Opcode == securechannel.OpStatusReport:
 		err = errPeerStatus
 	case h.state == 0 && msg.Opcode == securechannel.OpCASESigma1:
@@ -110,6 +119,22 @@ func (h *responderHandshake) onSigma1(now time.Time, ex *exchange.Exchange, payl
 	s1, err := DecodeSigma1(payload)
 	if err != nil {
 		return err
+	}
+	h.peerSessionID = s1.InitiatorSessionID
+	h.peerMRP = exchange.DefaultMRPConfig
+	if s1.SessionParams != nil {
+		h.peerMRP = s1.SessionParams.MRP
+		ex.Session().PeerMRP = h.peerMRP
+	}
+	if rs := h.r.cfg.Resumptions; rs != nil && s1.ResumptionID != nil {
+		// Resume if the record is known and the MIC proves the initiator
+		// holds its secret; otherwise run the full handshake.
+		if rec := rs.byID(s1.ResumptionID); rec != nil && h.r.cfg.Fabrics != nil &&
+			checkResumeMIC(s1.ResumeMIC, rec.Secret, s1.InitiatorRandom[:], rec.ID[:], infoResume1, nonceResume1) {
+			if f := h.r.cfg.Fabrics.Get(rec.FabricIndex); f != nil && f.NodeID == rec.LocalNodeID {
+				return h.sendSigma2Resume(now, ex, s1, rec, f)
+			}
+		}
 	}
 	if h.r.cfg.Fabrics != nil {
 		for _, f := range h.r.cfg.Fabrics.Fabrics() {
@@ -136,12 +161,6 @@ func (h *responderHandshake) onSigma1(now time.Time, ex *exchange.Exchange, payl
 	}
 	h.ephPub = eph.PublicKey().Bytes()
 	h.peerEph = append([]byte{}, s1.InitiatorEphPubKey[:]...)
-	h.peerSessionID = s1.InitiatorSessionID
-	h.peerMRP = exchange.DefaultMRPConfig
-	if s1.SessionParams != nil {
-		h.peerMRP = s1.SessionParams.MRP
-		ex.Session().PeerMRP = h.peerMRP
-	}
 	h.tr = newTranscript()
 	h.tr.add(payload)
 
@@ -164,6 +183,7 @@ func (h *responderHandshake) onSigma1(now time.Time, ex *exchange.Exchange, payl
 	if err != nil {
 		return err
 	}
+	h.resumptionID = resumptionID
 	if s2.Encrypted2, err = seal(s2k, nonceSigma2, tbeData(f.NOC, f.ICAC, sig, resumptionID)); err != nil {
 		return err
 	}
@@ -238,7 +258,82 @@ func (h *responderHandshake) onSigma3(now time.Time, ex *exchange.Exchange, payl
 		securechannel.GeneralSuccess, securechannel.CodeSessionEstablishmentSuccess))
 	ex.Close(now)
 	h.state = 2
+	if rs := h.r.cfg.Resumptions; rs != nil {
+		rec := &Resumption{Secret: append([]byte{}, h.shared...), FabricIndex: f.Index, LocalNodeID: f.NodeID,
+			PeerNodeID: id.NodeID, PeerCATs: id.CATs}
+		copy(rec.ID[:], h.resumptionID)
+		rs.save(rec)
+	}
 	clear(h.shared)
+	if h.r.cfg.OnEstablished != nil {
+		h.r.cfg.OnEstablished(now, s, f)
+	}
+	return nil
+}
+
+// sendSigma2Resume answers a Sigma1 that resumes rec with a new resumption
+// ID; the session starts when the initiator confirms.
+func (h *responderHandshake) sendSigma2Resume(now time.Time, ex *exchange.Exchange, s1 *Sigma1, rec *Resumption, f *fabric.Fabric) error {
+	m := Sigma2Resume{SessionParams: &h.r.cfg.SessionParams}
+	if _, err := io.ReadFull(h.r.cfg.Rand, m.ResumptionID[:]); err != nil {
+		return err
+	}
+	mic, err := resumeMIC(rec.Secret, s1.InitiatorRandom[:], m.ResumptionID[:], infoResume2, nonceResume2)
+	if err != nil {
+		return err
+	}
+	copy(m.MIC[:], mic)
+	if h.localSessionID, err = h.r.m.AllocateSessionID(); err != nil {
+		return err
+	}
+	m.ResponderSessionID = h.localSessionID
+	h.fabric, h.resume = f, rec
+	h.resumptionID = append([]byte{}, m.ResumptionID[:]...)
+	h.initiatorRandom = append([]byte{}, s1.InitiatorRandom[:]...)
+	if err := ex.Send(now, message.ProtocolSecureChannel, securechannel.OpCASESigma2Resume, m.Encode()); err != nil {
+		return err
+	}
+	h.state = 3
+	return nil
+}
+
+// onResumeStatus completes a resumption when the initiator reports
+// success.
+func (h *responderHandshake) onResumeStatus(now time.Time, ex *exchange.Exchange, payload []byte) error {
+	sr, err := securechannel.ParseStatusReport(payload)
+	if err != nil {
+		return err
+	}
+	if !sr.IsSuccess() {
+		return errPeerStatus
+	}
+	rec, f := h.resume, h.fabric
+	keys, err := securechannel.DeriveSessionKeys(rec.Secret, cat(h.initiatorRandom, rec.ID[:]), infoResumedKeys)
+	if err != nil {
+		return err
+	}
+	s, err := h.r.m.NewSecureSession(now, exchange.SecureSessionParams{
+		Peer:                 ex.Session().Peer,
+		PeerMRP:              h.peerMRP,
+		LocalSessionID:       h.localSessionID,
+		PeerSessionID:        h.peerSessionID,
+		LocalNodeID:          f.NodeID,
+		PeerNodeID:           rec.PeerNodeID,
+		EncryptKey:           keys.R2I[:],
+		DecryptKey:           keys.I2R[:],
+		AuthMode:             exchange.AuthCASE,
+		FabricIndex:          f.Index,
+		PeerCATs:             rec.PeerCATs,
+		AttestationChallenge: keys.AttestationChallenge,
+	})
+	if err != nil {
+		return err
+	}
+	ex.Close(now)
+	h.state = 2
+	next := *rec
+	copy(next.ID[:], h.resumptionID)
+	h.r.cfg.Resumptions.save(&next)
 	if h.r.cfg.OnEstablished != nil {
 		h.r.cfg.OnEstablished(now, s, f)
 	}

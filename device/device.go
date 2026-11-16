@@ -93,6 +93,9 @@ type Device struct {
 	// Groups holds the group keys and memberships. Add a Groups cluster
 	// (NewGroups) to each application endpoint that groups may address.
 	Groups *clusters.GroupData
+	// Resumptions keeps CASE resumption records (in memory), so
+	// controllers that reconnect can skip the full handshake.
+	Resumptions *casesession.ResumptionStore
 	// OnMulticast, if set, is called with the IPv6 multicast addresses of
 	// the node's groups whenever they change; the network layer should
 	// listen on exactly those (and on MulticastAddrs at start).
@@ -152,6 +155,8 @@ func New(cfg Config) (*Device, error) {
 		Fabrics:  &fabric.Table{},
 		ACL:      &clusters.AccessControl{},
 		FailSafe: &clusters.FailSafe{},
+
+		Resumptions: &casesession.ResumptionStore{Max: 2 * fabric.MaxFabrics},
 	}
 	disp := securechannel.NewDispatcher(m)
 	d.PASE, err = pase.NewResponder(m, disp, pase.ResponderConfig{
@@ -165,7 +170,7 @@ func New(cfg Config) (*Device, error) {
 	}
 
 	casesession.NewResponder(m, disp, casesession.ResponderConfig{
-		Fabrics: d.Fabrics, Rand: cfg.Rand,
+		Fabrics: d.Fabrics, Rand: cfg.Rand, Resumptions: d.Resumptions,
 		OnEstablished: func(now time.Time, s *exchange.Session, f *fabric.Fabric) {
 			d.log("CASE session established")
 		},
@@ -187,6 +192,7 @@ func New(cfg Config) (*Device, error) {
 	d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
 		d.Node.Events.RemoveFabric(index)
 		d.Groups.RemoveFabric(index)
+		d.Resumptions.ForgetFabric(index)
 		d.removeFabricScenes(index)
 		if d.ota != nil {
 			d.ota.removeFabric(now, index)
