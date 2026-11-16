@@ -134,6 +134,27 @@ func TestMultiAdmin(t *testing.T) {
 	if h.dev.PASE.WindowOpen() || a.WindowStatus != clusters.WindowNotOpen {
 		t.Fatal("window did not time out")
 	}
+
+	// Removing the fabric that opened the window nulls AdminFabricIndex but
+	// keeps AdminVendorId (TestCommissioningWindow); closing nulls both.
+	if res := h.invokeTimed(case2, ac(1), basicWindow(180)); res.Status != im.Success {
+		t.Fatalf("OpenBasicCommissioningWindow: %+v", res)
+	}
+	h.invoke(caseS, im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: 0x0A},
+		func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 2) })
+	h.w.Advance(time.Second)
+	if !h.attr(caseS, 0, clusters.IDAdminCommissioning, 1).IsNull() {
+		t.Fatal("AdminFabricIndex not null after its fabric was removed")
+	}
+	if v, err := h.attr(caseS, 0, clusters.IDAdminCommissioning, 2).Uint(); err != nil || v != 0xFFF1 {
+		t.Fatalf("AdminVendorId after its fabric was removed: %d, %v", v, err)
+	}
+	if res := h.invokeTimed(caseS, ac(2), nil); res.Status != im.Success {
+		t.Fatalf("RevokeCommissioning: %+v", res)
+	}
+	if !h.attr(caseS, 0, clusters.IDAdminCommissioning, 2).IsNull() {
+		t.Fatal("AdminVendorId not null with the window closed")
+	}
 }
 
 func TestRevokeCommissioningAfterAddNOC(t *testing.T) {

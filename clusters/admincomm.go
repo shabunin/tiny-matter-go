@@ -95,7 +95,9 @@ func (a *AdminCommissioning) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.
 			w.PutUint(tag, uint64(a.AdminFabricIndex))
 		}
 	case acAdminVendorID:
-		if a.AdminFabricIndex == 0 {
+		// Null only while the window is closed: it outlives the removal
+		// of the fabric that opened the window (see ForgetFabric).
+		if a.WindowStatus == WindowNotOpen || a.AdminVendorID == 0 {
 			w.PutNull(tag)
 		} else {
 			w.PutUint(tag, uint64(a.AdminVendorID))
@@ -112,10 +114,20 @@ func (a *AdminCommissioning) SetWindow(n *im.Node, status, fabricIndex uint8, ve
 		a.WindowStatus = status
 		n.Changed(0, IDAdminCommissioning, acWindowStatus)
 	}
-	if fabricIndex != a.AdminFabricIndex || (fabricIndex != 0 && vendorID != a.AdminVendorID) {
+	if fabricIndex != a.AdminFabricIndex || vendorID != a.AdminVendorID {
 		a.AdminFabricIndex, a.AdminVendorID = fabricIndex, vendorID
 		n.Changed(0, IDAdminCommissioning, acAdminFabricIndex)
 		n.Changed(0, IDAdminCommissioning, acAdminVendorID)
+	}
+}
+
+// ForgetFabric handles the removal of a fabric: if it opened the window,
+// AdminFabricIndex becomes null, while AdminVendorId keeps its value until
+// the window closes.
+func (a *AdminCommissioning) ForgetFabric(n *im.Node, index uint8) {
+	if index != 0 && a.AdminFabricIndex == index {
+		a.AdminFabricIndex = 0
+		n.Changed(0, IDAdminCommissioning, acAdminFabricIndex)
 	}
 }
 

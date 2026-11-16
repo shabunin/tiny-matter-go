@@ -343,6 +343,14 @@ func decodeACLEntry(r *tlv.Reader, fabric uint8) (ACLEntry, bool) {
 		len(e.Subjects) > SubjectsPerEntry || len(e.Targets) > TargetsPerEntry {
 		ok = false
 	}
+	// An empty list grants as null does (any subject, everything), and
+	// reads back as null, as in the SDK.
+	if len(e.Subjects) == 0 {
+		e.Subjects = nil
+	}
+	if len(e.Targets) == 0 {
+		e.Targets = nil
+	}
 	if e.AuthMode == exchange.AuthGroup {
 		if e.Privilege == im.Administer {
 			ok = false
@@ -353,7 +361,55 @@ func decodeACLEntry(r *tlv.Reader, fabric uint8) (ACLEntry, bool) {
 			}
 		}
 	}
+	if e.AuthMode == exchange.AuthCASE {
+		for _, subj := range e.Subjects {
+			if !validCASESubject(subj) {
+				ok = false
+			}
+		}
+	}
+	for _, t := range e.Targets {
+		if !validACLTarget(t) {
+			ok = false
+		}
+	}
 	return e, ok
+}
+
+// validCASESubject reports whether a CASE subject is an operational node
+// ID or a CASE Authenticated Tag with a non-zero version (as the SDK's
+// AccessControl checks entries).
+func validCASESubject(id uint64) bool {
+	const maxOperational = 0xFFFF_FFEF_FFFF_FFFF
+	const catPrefix = 0xFFFF_FFFD_0000_0000
+	switch {
+	case id != 0 && id <= maxOperational:
+		return true
+	case id&0xFFFF_FFFF_0000_0000 == catPrefix:
+		return id&0xFFFF != 0 // the CAT version
+	}
+	return false
+}
+
+// validACLTarget reports whether a target names something: a cluster,
+// an endpoint or a device type, not both of the last two, with valid IDs.
+func validACLTarget(t ACLTarget) bool {
+	if t.Cluster == nil && t.Endpoint == nil && t.DeviceType == nil {
+		return false
+	}
+	if t.Endpoint != nil && t.DeviceType != nil {
+		return false
+	}
+	if c := t.Cluster; c != nil {
+		// Vendor prefix up to 0xFFFE; standard or manufacturer suffix.
+		if *c>>16 == 0xFFFF || (*c&0xFFFF > 0x7FFF && *c&0xFFFF < 0xFC00) || *c&0xFFFF == 0xFFFF {
+			return false
+		}
+	}
+	if d := t.DeviceType; d != nil && (*d>>16 == 0xFFFF || *d&0xFFFF > 0xBFFF) {
+		return false
+	}
+	return true
 }
 
 // WriteAttribute replaces (or appends to) the accessing fabric's entries.

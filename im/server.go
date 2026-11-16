@@ -32,9 +32,24 @@ type Server struct {
 	// group on a fabric, which commands and writes sent to the group reach.
 	// Without it, group messages are ignored.
 	GroupEndpoints func(fabricIndex uint8, groupID uint16) []uint16
+	// OnWritten, if set, is called after a client writes an attribute
+	// (after the node's OnChange for it), so configuration a client sets
+	// can be saved at once.
+	OnWritten func(p ConcretePath)
+	// OnInvoked, if set, is called after a command a client sent ran
+	// successfully (a status of Success, or a response command).
+	OnInvoked func(ctx *Context, p CommandPath)
 
 	subs      []*subscription
 	nextSubID uint32
+}
+
+// written reports a successful write of p.
+func (s *Server) written(p ConcretePath) {
+	s.node.Changed(p.Endpoint, p.Cluster, p.Attribute)
+	if s.OnWritten != nil {
+		s.OnWritten(p)
+	}
 }
 
 // NewServer returns a Server for n and registers it with m. It chains
@@ -804,6 +819,9 @@ func (h *handler) invokeOne(ctx *Context, w *tlv.Writer, q *invokeRequest) {
 			st = InvalidCommand
 		} else {
 			st = c.Invoke(ctx, q.path.Command, r, &resp)
+			if st == Success && h.s.OnInvoked != nil {
+				h.s.OnInvoked(ctx, q.path)
+			}
 		}
 	}
 	if resp.started && st == Success {
@@ -989,7 +1007,7 @@ func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status
 			if dr.Next() != nil {
 				it.st = InvalidDataType
 			} else if it.st = it.ce.c.WriteAttribute(ctx, it.path.Attribute, it.path.ListAppend, dr); it.st == Success {
-				h.s.node.Changed(it.path.Endpoint, it.path.Cluster, it.path.Attribute)
+				h.s.written(ConcretePath{Endpoint: it.path.Endpoint, Cluster: it.path.Cluster, Attribute: it.path.Attribute})
 			}
 		}
 		w.StartStruct(tlv.Anonymous) // AttributeStatusIB

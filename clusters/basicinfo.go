@@ -150,8 +150,17 @@ func (b *BasicInformation) WriteAttribute(ctx *im.Context, attr uint32, appendIt
 	return im.Success
 }
 
-func (*BasicInformation) ReadPrivilege(uint32) im.Privilege   { return im.View }
-func (*BasicInformation) WritePrivilege(uint32) im.Privilege  { return im.Manage }
+func (*BasicInformation) ReadPrivilege(uint32) im.Privilege { return im.View }
+
+// WritePrivilege: Location is written with Administer (spec 11.1.5.6, RW VA),
+// NodeLabel and LocalConfigDisabled with Manage.
+func (*BasicInformation) WritePrivilege(attr uint32) im.Privilege {
+	if attr == biLocation {
+		return im.Administer
+	}
+	return im.Manage
+}
+
 func (*BasicInformation) InvokePrivilege(uint32) im.Privilege { return im.Operate }
 
 // Basic Information events.

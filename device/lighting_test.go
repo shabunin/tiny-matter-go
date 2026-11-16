@@ -300,6 +300,46 @@ func TestScenes(t *testing.T) {
 		t.Fatalf("scene 2: on %v level %d", l.onOff.On, l.level.Level())
 	}
 
+	// FabricSceneInfo: the recalled scene is current and valid (the
+	// recall's own transition does not invalidate it), until a command
+	// changes the light.
+	sceneInfo := func() (scene, group uint64, valid bool) {
+		t.Helper()
+		// The list may come as an empty list and appended items.
+		rds := h.readQ(s, im.Request{Attributes: []im.AttributePath{{Endpoint: lightEP, Cluster: clusters.IDScenesManagement, Attribute: 0x0002}}})
+		var raw []byte
+		for _, rd := range rds {
+			for _, rep := range rd.Reports {
+				r := tlv.NewReader(rep.Data)
+				if r.Next() != nil {
+					continue
+				}
+				if r.Type() == tlv.TypeArray {
+					if r.EnterContainer() != nil || r.Next() != nil {
+						continue
+					}
+				}
+				if raw == nil && r.Type() == tlv.TypeStruct {
+					raw, _ = r.RawElement()
+				}
+			}
+		}
+		if raw == nil {
+			t.Fatal("FabricSceneInfo: no entry")
+		}
+		scene, _ = field(t, raw, 1).Uint()
+		group, _ = field(t, raw, 2).Uint()
+		valid, _ = field(t, raw, 3).Bool()
+		return
+	}
+	if sc, g, v := sceneInfo(); sc != 2 || g != 0 || !v {
+		t.Fatalf("after recall: scene %d group %d valid %v, want 2 0 true", sc, g, v)
+	}
+	h.cmdOK(s, clusters.IDOnOff, cmdOn)
+	if sc, _, v := sceneInfo(); sc != 2 || v {
+		t.Fatalf("after On: scene %d valid %v, want 2 false", sc, v)
+	}
+
 	res := h.cmd(s, clusters.IDScenesManagement, cmdSceneMembership, uint(0))
 	if st := sceneStatus(res); st != im.Success {
 		t.Fatalf("GetSceneMembership: %#x", st)
@@ -394,6 +434,12 @@ func TestOnOffLighting(t *testing.T) {
 	if res := h.cmd(s, clusters.IDIdentify, 0x40, uint(3), uint(0)); res.Status != im.ConstraintError {
 		t.Fatalf("TriggerEffect(3): %#x", res.Status)
 	}
+	// An unknown variant runs the default one (TC_I_2_3 step 3a).
+	h.cmdOK(s, clusters.IDIdentify, 0x40, uint(clusters.EffectChannelChange), uint(0x42))
+	if !l.id.Identifying() || l.id.Effect() != clusters.EffectChannelChange {
+		t.Fatal("TriggerEffect(ChannelChange, variant 0x42) not running")
+	}
+	h.cmdOK(s, clusters.IDIdentify, 0x40, uint(clusters.EffectStop), uint(0))
 
 	// Start-up behaviour: on at level 77 whatever the state was.
 	if st := h.writeLight(s, clusters.IDOnOff, attrStartUpOnOff, 1); st != im.Success {
@@ -402,7 +448,9 @@ func TestOnOffLighting(t *testing.T) {
 	if st := h.writeLight(s, clusters.IDLevelControl, attrStartUpLevel, 77); st != im.Success {
 		t.Fatalf("write StartUpCurrentLevel: %#x", st)
 	}
-	h.w.Advance(5 * time.Second)
+	// Written configuration is saved at once, not after appSaveDelay
+	// (TC_OO_2_4 restarts the device right after the write).
+	h.w.Advance(100 * time.Millisecond)
 	h2 := newHarnessStore(t, store)
 	l2 := h2.addLight()
 	if !l2.onOff.On || l2.level.Level() != 77 {
@@ -411,6 +459,23 @@ func TestOnOffLighting(t *testing.T) {
 	s2 := h2.connect(ctlF)
 	if got := h2.readUint(s2, clusters.IDLevelControl, attrStartUpLevel); got != 77 {
 		t.Fatalf("StartUpCurrentLevel %d after restart", got)
+	}
+
+	// Toggle at start-up: each restart flips the light, also when restarts
+	// follow quickly (the toggled state is saved at once; TC_OO_2_4 step 5).
+	if st := h2.writeLight(s2, clusters.IDOnOff, attrStartUpOnOff, 2); st != im.Success {
+		t.Fatalf("write StartUpOnOff: %#x", st)
+	}
+	h2.w.Advance(100 * time.Millisecond)
+	want := false
+	for i := range 3 {
+		h3 := newHarnessStore(t, store)
+		l3 := h3.addLight()
+		h3.w.Advance(100 * time.Millisecond)
+		if l3.onOff.On != want {
+			t.Fatalf("restart %d with Toggle: on %v, want %v", i+1, l3.onOff.On, want)
+		}
+		want = !want
 	}
 }
 

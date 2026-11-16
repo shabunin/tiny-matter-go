@@ -127,9 +127,10 @@ type Device struct {
 	eventLimit     uint64 // event numbers reserved in the store
 	// Application cluster state (im.Persister): stored entries not yet
 	// restored into a cluster, and when changed state is next saved.
-	appState []appState
-	appDirty bool
-	appSave  time.Time
+	appState   []appState
+	appDirty   bool
+	appWritten bool // a client wrote application state: save it now
+	appSave    time.Time
 }
 
 // appSaveDelay is how long changes to application cluster state gather
@@ -185,6 +186,13 @@ func New(cfg Config) (*Device, error) {
 	d.General = clusters.NewGeneralCommissioning(d.FailSafe)
 	d.General.FabricIndex = func(ctx *im.Context) uint8 { return ctx.Session.FabricIndex }
 	d.General.Complete = d.commissioningComplete
+	d.General.WindowOpen = d.PASE.WindowOpen
+	d.General.SetCountry = func(ctx *im.Context, code string) {
+		if cfg.Basic.Location != code {
+			cfg.Basic.Location = code
+			ctx.Node.Changed(0, clusters.IDBasicInformation, 0x0006) // Location
+		}
+	}
 	d.OpCreds = clusters.NewOperationalCredentials(cfg.Attestation, d.Fabrics, d.FailSafe, d.ACL, cfg.Rand)
 	d.Groups = &clusters.GroupData{Fabrics: d.Fabrics}
 	d.Groups.OnChange = func() {
@@ -205,9 +213,7 @@ func New(cfg Config) (*Device, error) {
 		d.M.ForgetGroupPeers(index)
 		d.later(func(now time.Time) {
 			d.closeFabricSessions(now, index)
-			if d.Admin.AdminFabricIndex == index {
-				d.Admin.SetWindow(d.Node, d.Admin.WindowStatus, 0, 0)
-			}
+			d.Admin.ForgetFabric(d.Node, index)
 			if d.Fabrics.Committed() == 0 && len(d.Fabrics.Fabrics()) == 0 && !d.PASE.WindowOpen() {
 				d.log("last fabric removed: opening the commissioning window")
 				d.OpenCommissioningWindow()
@@ -272,6 +278,30 @@ func New(cfg Config) (*Device, error) {
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
 	d.Server.GroupEndpoints = d.Groups.Endpoints
+	// Clients write configuration (StartUpOnOff, OnLevel...) rarely, and
+	// expect it kept across a restart right away: save without the delay.
+	d.Server.OnWritten = func(p im.ConcretePath) {
+		if d.persister(p.Endpoint, p.Cluster) != nil {
+			d.appWritten = true
+		}
+	}
+	d.Server.OnInvoked = func(ctx *im.Context, p im.CommandPath) {
+		switch p.Cluster {
+		case clusters.IDScenesManagement:
+			// A scene table change is saved at once, like a write.
+			if d.appDirty {
+				d.appWritten = true
+			}
+		case clusters.IDOnOff, clusters.IDLevelControl, clusters.IDColorControl:
+			// A command changing the lights makes the current scene
+			// invalid (a recall changes them through Scenes Management).
+			if e := d.Node.Endpoint(p.Endpoint); e != nil {
+				if s, ok := e.Cluster(clusters.IDScenesManagement).(*clusters.ScenesManagement); ok {
+					s.Invalidate(d.Node, p.Endpoint)
+				}
+			}
+		}
+	}
 	serverHook := d.Node.OnChange // subscriptions
 	d.Node.OnChange = func(p im.ConcretePath) {
 		if persistent(p) {
@@ -387,6 +417,10 @@ func (d *Device) Poll(now time.Time) time.Time {
 		if d.appSave.IsZero() {
 			d.appSave = now.Add(appSaveDelay)
 		}
+	}
+	if d.appWritten {
+		d.appWritten = false
+		d.appSave = now
 	}
 	if !d.appSave.IsZero() && !now.Before(d.appSave) {
 		d.appSave = time.Time{}

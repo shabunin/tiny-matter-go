@@ -95,7 +95,10 @@ func (h *handler) groupInvoke(ctx *Context, endpoints []uint16, b []byte) {
 			ctx.Endpoint = ep
 			// A response command is written and dropped.
 			w := tlv.NewWriter(h.s.buf[:0])
-			c.Invoke(ctx, q.command, r, &Response{w: w, path: CommandPath{ep, q.cluster, q.command}})
+			p := CommandPath{ep, q.cluster, q.command}
+			if c.Invoke(ctx, q.command, r, &Response{w: w, path: p}) == Success && h.s.OnInvoked != nil {
+				h.s.OnInvoked(ctx, p)
+			}
 		}
 	}
 }
@@ -156,7 +159,7 @@ func (h *handler) groupWrite(ctx *Context, endpoints []uint16, b []byte) {
 			}
 			ctx.Endpoint = ep
 			if ce.c.WriteAttribute(ctx, it.attr, it.listAppend, r) == Success {
-				h.s.node.Changed(ep, it.cluster, it.attr)
+				h.s.written(ConcretePath{Endpoint: ep, Cluster: it.cluster, Attribute: it.attr})
 			}
 		}
 	}

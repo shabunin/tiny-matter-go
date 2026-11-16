@@ -83,16 +83,68 @@ type scene struct {
 // and group, recalled with a transition. Group 0 scene 0 is the global
 // scene On/Off stores and recalls.
 //
-// Revision 2 no longer tracks the current scene: FabricSceneInfo reports
-// CurrentScene 0xFF, CurrentGroup 0 and SceneValid false.
+// FabricSceneInfo tracks each fabric's current scene: the one it last
+// stored or recalled, valid until a command changes the endpoint's lights
+// (Invalidate) or the scene is removed. It is not kept across restarts.
 type ScenesManagement struct {
 	im.ClusterBase
 	// Groups is the node's group data: scenes of a group need the
 	// endpoint to be in it.
 	Groups *GroupData
 
-	scenes []scene
+	scenes  []scene
+	current []currentScene
 }
+
+// currentScene is a fabric's CurrentScene, CurrentGroup and SceneValid.
+type currentScene struct {
+	fabric uint8
+	group  uint16
+	id     uint8
+	valid  bool
+}
+
+func (s *ScenesManagement) currentOf(fabric uint8) *currentScene {
+	for i := range s.current {
+		if s.current[i].fabric == fabric {
+			return &s.current[i]
+		}
+	}
+	return nil
+}
+
+// setCurrent makes a scene its fabric's current, valid scene.
+func (s *ScenesManagement) setCurrent(ctx *im.Context, fabric uint8, group uint16, id uint8) {
+	c := s.currentOf(fabric)
+	if c == nil {
+		s.current = append(s.current, currentScene{fabric: fabric})
+		c = &s.current[len(s.current)-1]
+	}
+	if *c != (currentScene{fabric, group, id, true}) {
+		*c = currentScene{fabric, group, id, true}
+		ctx.Node.Changed(ctx.Endpoint, IDScenesManagement, scenesFabricInfo)
+	}
+}
+
+// invalidate clears SceneValid of the current scenes match selects (all of
+// them with a nil match).
+func (s *ScenesManagement) invalidate(n *im.Node, ep uint16, match func(c *currentScene) bool) {
+	changed := false
+	for i := range s.current {
+		if c := &s.current[i]; c.valid && (match == nil || match(c)) {
+			c.valid = false
+			changed = true
+		}
+	}
+	if changed {
+		n.Changed(ep, IDScenesManagement, scenesFabricInfo)
+	}
+}
+
+// Invalidate marks every fabric's current scene invalid: call it when a
+// command (not a scene recall) changes a cluster that scenes hold on the
+// endpoint, as the SDK's On/Off, Level and Color servers do.
+func (s *ScenesManagement) Invalidate(n *im.Node, ep uint16) { s.invalidate(n, ep, nil) }
 
 // NewScenes returns Scenes Management over the node's groups.
 func NewScenes(groups *GroupData) *ScenesManagement { return &ScenesManagement{Groups: groups} }
@@ -180,9 +232,13 @@ func (s *ScenesManagement) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.Wr
 				w.StartStruct(tlv.Anonymous)
 				w.PutUint(tlv.ContextTag(0), uint64(n))
 				if f.Index == accessing { // fabric-sensitive fields
-					w.PutUint(tlv.ContextTag(1), sceneUndefined)
-					w.PutUint(tlv.ContextTag(2), 0)
-					w.PutBool(tlv.ContextTag(3), false)
+					cur := currentScene{id: sceneUndefined}
+					if c := s.currentOf(f.Index); c != nil {
+						cur = *c
+					}
+					w.PutUint(tlv.ContextTag(1), uint64(cur.id))
+					w.PutUint(tlv.ContextTag(2), uint64(cur.group))
+					w.PutBool(tlv.ContextTag(3), cur.valid)
 				}
 				w.PutUint(tlv.ContextTag(4), uint64(s.capacity(f.Index)))
 				w.PutUint(tlv.ContextTag(scenesFieldFabricIdx), uint64(f.Index))
@@ -287,6 +343,9 @@ func (s *ScenesManagement) store(ctx *im.Context, fabric uint8, group uint16, id
 		s.scenes = append(s.scenes, scene{fabric: fabric, group: group, id: id, sets: sets})
 	}
 	s.changed(ctx)
+	if group != globalSceneGroup || id != globalSceneID {
+		s.setCurrent(ctx, fabric, group, id)
+	}
 	return im.Success
 }
 
@@ -298,6 +357,7 @@ func (s *ScenesManagement) RemoveGroup(n *im.Node, ep uint16, fabric uint8, grou
 	if len(s.scenes) != before {
 		n.Changed(ep, IDScenesManagement, scenesFabricInfo)
 	}
+	s.invalidate(n, ep, func(c *currentScene) bool { return c.fabric == fabric && c.group == group })
 }
 
 // RemoveFabric deletes a fabric's scenes.
@@ -307,6 +367,7 @@ func (s *ScenesManagement) RemoveFabric(n *im.Node, ep uint16, fabric uint8) {
 	if len(s.scenes) != before {
 		n.Changed(ep, IDScenesManagement, scenesFabricInfo)
 	}
+	s.current = filter(s.current, func(c *currentScene) bool { return c.fabric != fabric })
 }
 
 // sceneStatusResponse writes a response with Status, GroupID and SceneID.
@@ -383,6 +444,9 @@ func (s *ScenesManagement) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader, re
 			} else {
 				s.scenes = filter(s.scenes, func(sc *scene) bool { return sc.fabric != fabric || sc.group != group || sc.id != id })
 				s.changed(ctx)
+				s.invalidate(ctx.Node, ctx.Endpoint, func(c *currentScene) bool {
+					return c.fabric == fabric && c.group == group && c.id == id
+				})
 			}
 		}
 		return sceneStatusResponse(resp, scenesRemove, st, group, id)
@@ -415,7 +479,11 @@ func (s *ScenesManagement) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader, re
 			}
 			ms = int64(v)
 		}
-		return apply(ctx.Node, ctx.Endpoint, ctx.Now, sc.sets, time.Duration(ms)*time.Millisecond)
+		if st := apply(ctx.Node, ctx.Endpoint, ctx.Now, sc.sets, time.Duration(ms)*time.Millisecond); st != im.Success {
+			return st
+		}
+		s.setCurrent(ctx, fabric, group, id)
+		return im.Success
 	case scenesGetMembership:
 		w := resp.Fields(scenesGetMembership)
 		w.PutUint(tlv.ContextTag(0), uint64(st))

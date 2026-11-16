@@ -425,6 +425,9 @@ func (c *ColorControl) axisValue(i int) int64 {
 	return int64(c.mireds)
 }
 
+// colorRateStep is the step of moves at a rate (Move*, the colour loop).
+const colorRateStep = 100 * time.Millisecond
+
 func (a *colorAxis) value(now time.Time) (v int64, done bool) {
 	el := time.Duration(0)
 	if !a.start.IsZero() {
@@ -432,6 +435,10 @@ func (a *colorAxis) value(now time.Time) (v int64, done bool) {
 	}
 	switch {
 	case a.forever:
+		// Moves and the colour loop step every colorRateStep, as the
+		// SDK's do: the value stays at its start for the first step
+		// (TC_CC_9_1 reads the loop's start hue right after starting it).
+		el = el.Truncate(colorRateStep)
 		v = a.from + a.num*int64(el/time.Millisecond)/(a.den*1000)
 	case el >= a.dur:
 		v, done = a.from+a.delta, true

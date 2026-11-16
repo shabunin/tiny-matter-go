@@ -28,8 +28,10 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
@@ -199,6 +201,10 @@ func main() {
 			cmds <- strings.TrimSpace(sc.Text())
 		}
 	}()
+	// A stop request (Ctrl-C, or SIGTERM from a test harness rebooting the
+	// device) saves pending state first, as a planned restart would.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	for {
 		var timer <-chan time.Time
 		deadline := d.Poll(time.Now())
@@ -233,6 +239,10 @@ func main() {
 			}
 			log.Printf("button: %s", c)
 		case <-timer:
+		case sig := <-stop:
+			d.Flush()
+			log.Printf("%v: stopping", sig)
+			return
 		}
 	}
 }

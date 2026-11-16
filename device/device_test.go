@@ -309,11 +309,19 @@ func TestRestartKeepsFabric(t *testing.T) {
 	// Label the fabric, then "reboot" into a new device on the same store.
 	h.invoke(caseS, im.CommandPath{Endpoint: 0, Cluster: clusters.IDOperationalCredentials, Command: 9},
 		func(w *tlv.Writer) { w.PutString(tlv.ContextTag(0), "home") })
+	// NodeLabel is nonvolatile too (TestBasicInformation).
+	if st := h.write(caseS, im.AttributePath{Endpoint: 0, Cluster: clusters.IDBasicInformation, Attribute: 5},
+		func(w *tlv.Writer, tag tlv.Tag) { w.PutString(tag, "My node") }); st != im.Success {
+		t.Fatalf("write NodeLabel: %#x", st)
+	}
 	h.w.Advance(time.Second)
 
 	h2 := newHarnessStore(t, store)
 	if !h2.dev.Commissioned() || h2.dev.PASE.WindowOpen() {
 		t.Fatal("restarted device is not commissioned")
+	}
+	if l := h2.dev.Node.Endpoint(0).Cluster(clusters.IDBasicInformation).(*clusters.BasicInformation).NodeLabel; l != "My node" {
+		t.Fatalf("NodeLabel after restart: %q", l)
 	}
 	f := h2.dev.Fabrics.Fabrics()[0]
 	if f.Label != "home" || f.NodeID != 1 || len(h2.dev.ACL.Entries) != 1 {
@@ -606,17 +614,20 @@ func TestCrossFabricFailSafeRejected(t *testing.T) {
 		t.Fatalf("CSRRequest over CASE during PASE fail-safe: got %#x, want %#x", res.Status, im.FailsafeRequired)
 	}
 
-	// Disarm (which ends the PASE session), then CASE arms fail-safe; a new
-	// PASE session must not be allowed to use it.
+	// Disarm (which ends the PASE session). While the window is open, CASE
+	// may not arm the fail-safe (it belongs to the commissioner to come:
+	// BusyWithOtherAdmin, as TestGeneralCommissioning checks), so a new
+	// PASE session finds none.
 	h.invoke(paseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 0); w.PutUint(tlv.ContextTag(1), 1) })
 	if paseS, err = h.pairPASE(passcode); err != nil {
 		t.Fatal(err)
 	}
-	if res := h.invoke(caseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) }); res.Status != im.Success {
-		t.Fatalf("ArmFailSafe over CASE: %#x", res.Status)
+	res = h.invoke(caseS, gc(0), func(w *tlv.Writer) { w.PutUint(tlv.ContextTag(0), 60); w.PutUint(tlv.ContextTag(1), 1) })
+	if code, _ := field(t, res.Fields, 0).Uint(); res.Status != im.Success || code != uint64(clusters.BusyWithOtherAdmin) {
+		t.Fatalf("ArmFailSafe over CASE with the window open: %#x, code %d", res.Status, code)
 	}
 	if res := h.invoke(paseS, oc(4), func(w *tlv.Writer) { w.PutBytes(tlv.ContextTag(0), nonce) }); res.Status != im.FailsafeRequired {
-		t.Fatalf("CSRRequest over PASE during CASE fail-safe: got %#x, want %#x", res.Status, im.FailsafeRequired)
+		t.Fatalf("CSRRequest over PASE: got %#x, want %#x", res.Status, im.FailsafeRequired)
 	}
 }
 

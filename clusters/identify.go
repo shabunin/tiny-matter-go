@@ -138,8 +138,10 @@ func (i *Identify) triggerEffect(ctx *im.Context, r *tlv.Reader) im.Status {
 	if !ok || !f.present(0, 1) {
 		return im.InvalidCommand
 	}
+	// A variant the device does not know runs the default one (spec 1.2.7.2.2),
+	// so only the identifier is checked.
 	effect, okE := f.u(0, 0xFF)
-	_, okV := f.u(1, 0)
+	_, okV := f.u(1, 0xFF)
 	if !okE || !okV {
 		return im.ConstraintError
 	}

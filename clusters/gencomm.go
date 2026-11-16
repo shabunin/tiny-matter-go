@@ -3,6 +3,7 @@ package clusters
 import (
 	"time"
 
+	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
@@ -109,6 +110,13 @@ type GeneralCommissioning struct {
 	// pass; it must verify the request came over CASE on the fabric that
 	// armed the fail-safe. Nil answers InvalidAuthentication.
 	Complete func(ctx *im.Context) CommissioningError
+	// WindowOpen, if set, reports whether a commissioning window is open:
+	// then ArmFailSafe over CASE, with the fail-safe not armed, answers
+	// BusyWithOtherAdmin (the window belongs to the commissioner to come).
+	WindowOpen func() bool
+	// SetCountry, if set, receives SetRegulatoryConfig's CountryCode, which
+	// becomes Basic Information's Location.
+	SetCountry func(ctx *im.Context, code string)
 }
 
 // NewGeneralCommissioning returns the cluster with default settings.
@@ -241,6 +249,10 @@ func (g *GeneralCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 		if fs.Armed(ctx.Now) && fs.FabricIndex() != fabric {
 			return respond(resp, gcArmFailSafeResponse, BusyWithOtherAdmin)
 		}
+		if !fs.Armed(ctx.Now) && g.WindowOpen != nil && g.WindowOpen() &&
+			ctx.Session != nil && ctx.Session.AuthMode == exchange.AuthCASE {
+			return respond(resp, gcArmFailSafeResponse, BusyWithOtherAdmin)
+		}
 		if expiry == 0 {
 			// The expiry resets the breadcrumb; the request's is not kept.
 			fs.Expire(ctx.Now)
@@ -271,8 +283,11 @@ func (g *GeneralCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 			}
 			return err
 		})
-		if err != nil || have != 7 || len(country) != 2 || cfg > RegulatoryIndoorOutdoor {
+		if err != nil || have != 7 {
 			return im.InvalidCommand
+		}
+		if len(country) != 2 || cfg > RegulatoryIndoorOutdoor {
+			return im.ConstraintError
 		}
 		if g.LocationCapability != RegulatoryIndoorOutdoor && cfg != g.LocationCapability {
 			return respond(resp, gcSetRegulatoryConfigResponse, ValueOutsideRange)
@@ -280,6 +295,9 @@ func (g *GeneralCommissioning) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader
 		if cfg != g.RegulatoryConfig {
 			g.RegulatoryConfig = cfg
 			ctx.Node.Changed(ctx.Endpoint, IDGeneralCommissioning, gcRegulatoryConfig)
+		}
+		if g.SetCountry != nil {
+			g.SetCountry(ctx, country)
 		}
 		g.setBreadcrumb(ctx, breadcrumb, true)
 		return respond(resp, gcSetRegulatoryConfigResponse, CommissioningOK)

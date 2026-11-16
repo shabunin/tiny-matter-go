@@ -274,6 +274,11 @@ func main() {
 	if err != nil {
 		fatal("device", err)
 	}
+	if slots != nil {
+		// Restarting into an update saves the light's state first (it
+		// is otherwise saved a few seconds after it changes).
+		slots.Restart = func() { d.Flush(); restart() }
+	}
 	u := newUI(d, store)
 	cause := resetCause()
 	d.Diagnostics.BootReason = bootReason(cause)

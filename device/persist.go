@@ -1,7 +1,9 @@
 package device
 
 import (
+	"bytes"
 	"errors"
+	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
@@ -88,8 +90,26 @@ func (d *Device) encodeState() []byte {
 			return f != nil && !f.Pending
 		})
 	}
+	// Basic Information's nonvolatile, writable attributes.
+	w.StartStruct(tlv.ContextTag(11))
+	w.PutString(tlv.ContextTag(1), d.cfg.Basic.NodeLabel)
+	w.PutString(tlv.ContextTag(2), d.cfg.Basic.Location)
+	w.EndContainer()
 	w.EndContainer()
 	return w.Bytes()
+}
+
+// decodeBasic restores Basic Information's NodeLabel and Location.
+func (d *Device) decodeBasic(r *tlv.Reader) error {
+	return im.ForEachField(r, func(r *tlv.Reader, tag uint8) (err error) {
+		switch tag {
+		case 1:
+			d.cfg.Basic.NodeLabel, err = r.String()
+		case 2:
+			d.cfg.Basic.Location, err = r.String()
+		}
+		return err
+	})
 }
 
 type appState struct {
@@ -193,6 +213,15 @@ func (d *Device) restoreCluster(endpoint uint16, c im.Cluster) {
 		r := tlv.NewReader(a.state)
 		if r.Next() != nil || p.DecodeState(r) != nil {
 			d.log("stored cluster state ignored")
+			return
+		}
+		// Start-up behaviour (StartUpOnOff Toggle, StartUpCurrentLevel...)
+		// may have changed the state: save it before another restart
+		// applies it to the old state again.
+		w := tlv.NewWriter(nil)
+		p.EncodeState(w, tlv.ContextTag(3)) // as stored, see encodeAppState
+		if !bytes.Equal(w.Bytes(), a.state) {
+			d.appWritten = true
 		}
 		return
 	}
@@ -242,6 +271,8 @@ func (d *Device) decodeState(b []byte) error {
 			if d.ota != nil {
 				return d.ota.decode(r)
 			}
+		case 11:
+			return d.decodeBasic(r)
 		}
 		return nil
 	})
@@ -357,6 +388,13 @@ func (d *Device) load() error {
 	return nil
 }
 
+// Flush saves state changes that are still waiting (application state
+// gathers for appSaveDelay): call it before a planned shutdown or restart.
+func (d *Device) Flush() {
+	d.appDirty, d.appWritten, d.appSave, d.dirty = false, false, time.Time{}, false
+	d.save()
+}
+
 // save writes the state if it changed since the last save.
 func (d *Device) save() {
 	if d.cfg.Store == nil {
@@ -376,5 +414,6 @@ func (d *Device) save() {
 
 // persistent reports whether a change to p affects stored state.
 func persistent(p im.ConcretePath) bool {
-	return p.Endpoint == 0 && (p.Cluster == clusters.IDAccessControl || p.Cluster == clusters.IDOperationalCredentials)
+	return p.Endpoint == 0 && (p.Cluster == clusters.IDAccessControl || p.Cluster == clusters.IDOperationalCredentials ||
+		p.Cluster == clusters.IDBasicInformation && (p.Attribute == 0x0005 || p.Attribute == 0x0006)) // NodeLabel, Location
 }
