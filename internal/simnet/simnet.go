@@ -89,7 +89,11 @@ func (w *World) Advance(d time.Duration) {
 				next = t
 			}
 		}
-		w.Deliver()
+		if len(w.Queue) > 0 {
+			// Handling packets may have set timers: poll again.
+			w.Deliver()
+			continue
+		}
 		if next.IsZero() || next.After(end) {
 			break
 		}

@@ -14,6 +14,8 @@ const (
 	IDDescriptor             = 0x001D
 	IDAccessControl          = 0x001F
 	IDBasicInformation       = 0x0028
+	IDOTAProvider            = 0x0029
+	IDOTARequestor           = 0x002A
 	IDGeneralCommissioning   = 0x0030
 	IDNetworkCommissioning   = 0x0031
 	IDGeneralDiagnostics     = 0x0033
@@ -28,6 +30,8 @@ var (
 	DeviceTypeRootNode      = im.DeviceType{ID: 0x0016, Revision: 3}
 	DeviceTypeOnOffLight    = im.DeviceType{ID: 0x0100, Revision: 3}
 	DeviceTypeGenericSwitch = im.DeviceType{ID: 0x000F, Revision: 3}
+	DeviceTypeOTARequestor  = im.DeviceType{ID: 0x0012, Revision: 1}
+	DeviceTypeOTAProvider   = im.DeviceType{ID: 0x0014, Revision: 1}
 )
 
 // Descriptor is the Descriptor cluster. One value serves every endpoint: it

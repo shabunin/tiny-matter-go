@@ -24,6 +24,7 @@ import (
 //	   clusters.GroupData.Encode)
 //	9: application cluster state [ { 1: endpoint, 2: cluster, 3: state } ]
 //	   (see im.Persister)
+//	10: OTA requestor: default providers and an update being applied
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -80,6 +81,12 @@ func (d *Device) encodeState() []byte {
 		})
 	}
 	d.encodeAppState(w)
+	if d.ota != nil {
+		d.ota.encode(w, tlv.ContextTag(10), func(index uint8) bool {
+			f := d.Fabrics.Get(index)
+			return f != nil && !f.Pending
+		})
+	}
 	w.EndContainer()
 	return w.Bytes()
 }
@@ -230,6 +237,10 @@ func (d *Device) decodeState(b []byte) error {
 			return d.Groups.Decode(r)
 		case 9:
 			return d.decodeAppState(r)
+		case 10:
+			if d.ota != nil {
+				return d.ota.decode(r)
+			}
 		}
 		return nil
 	})
@@ -336,6 +347,10 @@ func (d *Device) load() error {
 		d.eventLimit, d.Diagnostics.RebootCount = 0, 0
 		*d.Groups = clusters.GroupData{Fabrics: d.Fabrics, OnChange: d.Groups.OnChange}
 		d.appState = nil
+		if d.ota != nil {
+			d.ota.c.Providers, d.ota.pending = nil, nil
+			d.ota.c.InitState(clusters.OTAStateIdle)
+		}
 		return err
 	}
 	return nil

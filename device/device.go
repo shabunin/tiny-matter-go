@@ -63,6 +63,11 @@ type Config struct {
 	// provisions an operational dataset. Set Net.Connect (and optionally
 	// Net.ScanThread, ThreadFeatures and ThreadVersion) after New.
 	Thread bool
+
+	// Updates, if set, makes the node an OTA requestor: it adds the OTA
+	// Software Update Requestor cluster, and images downloaded from a
+	// provider are stored there and applied.
+	Updates ImageStore
 }
 
 // Device is a Matter node.
@@ -92,12 +97,16 @@ type Device struct {
 	// the node's groups whenever they change; the network layer should
 	// listen on exactly those (and on MulticastAddrs at start).
 	OnMulticast func(addrs []netip.Addr)
+	// OTA is the OTA Software Update Requestor cluster (nil unless
+	// Config.Updates).
+	OTA *clusters.OTARequestor
 	// HoldSaves postpones writing the store while set, for example while a
 	// BLE link would not survive the stall of a flash erase. Pending
 	// changes are written by the first Poll after it is cleared.
 	HoldSaves bool
 
 	deferred []func(now time.Time)
+	ota      *updater
 	instance uint64 // commissionable instance name
 	// The open commissioning window: its advertised discriminator and
 	// commissioning mode, and when it closes (zero: no timeout).
@@ -179,6 +188,9 @@ func New(cfg Config) (*Device, error) {
 		d.Node.Events.RemoveFabric(index)
 		d.Groups.RemoveFabric(index)
 		d.removeFabricScenes(index)
+		if d.ota != nil {
+			d.ota.removeFabric(now, index)
+		}
 		d.M.ForgetGroupPeers(index)
 		d.later(func(now time.Time) {
 			d.closeFabricSessions(now, index)
@@ -223,6 +235,9 @@ func New(cfg Config) (*Device, error) {
 			}
 		})
 		d.Node.AddCluster(d.Root, d.Net)
+	}
+	if cfg.Updates != nil {
+		d.enableOTA(cfg.Updates)
 	}
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
@@ -327,8 +342,14 @@ func (d *Device) Poll(now time.Time) time.Time {
 		if d.Diagnostics.Boot.IsZero() {
 			d.boot(now)
 		}
+		if d.ota != nil && d.ota.updated() {
+			d.Diagnostics.BootReason = clusters.BootSoftwareUpdate
+		}
 		d.cfg.Basic.StartUp(d.Node, now)
 		d.Diagnostics.BootReasonEvent(d.Node, now)
+		if d.ota != nil {
+			d.ota.boot(now)
+		}
 	}
 	d.runDeferred(now)
 	if d.appDirty {
@@ -358,6 +379,11 @@ func (d *Device) Poll(now time.Time) time.Time {
 	}
 	if t := d.appSave; !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
+	}
+	if d.ota != nil {
+		if t := d.ota.poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
 	}
 	d.runDeferred(now)
 	if t := d.Node.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {

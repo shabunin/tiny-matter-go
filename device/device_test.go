@@ -50,20 +50,29 @@ func newHarnessStore(t *testing.T, store storage.Store) *harness {
 }
 
 func newHarnessWith(t *testing.T, store storage.Store, wifi bool) *harness {
+	return newHarnessConfig(t, store, wifi, nil)
+}
+
+// newHarnessConfig creates the device after edit adjusts its config.
+func newHarnessConfig(t *testing.T, store storage.Store, wifi bool, edit func(cfg *device.Config)) *harness {
 	h := &harness{t: t, w: simnet.New(t)}
 	h.ctl = h.w.Node(5550)
 	h.devN = h.w.ExternalNode(5540)
 	v, _ := spake2p.NewVerifier(passcode, salt, 1000)
 	dacKey, _ := p256.NewPrivateKey(devcreds.DACPrivateKey)
-	var err error
-	h.dev, err = device.New(device.Config{
+	cfg := device.Config{
 		Transport: h.devN.Transport(), Rand: rand.Reader,
 		Verifier: v, Salt: salt, Iterations: 1000, Discriminator: 3840,
 		Attestation: &clusters.Attestation{DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
 			CertificationDeclaration: devcreds.CertificationDeclaration},
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: 0xFFF1, ProductName: "P", ProductID: 0x8000},
 		Store: store, WiFi: wifi,
-	})
+	}
+	if edit != nil {
+		edit(&cfg)
+	}
+	var err error
+	h.dev, err = device.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
