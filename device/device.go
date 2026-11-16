@@ -108,7 +108,16 @@ type Device struct {
 	saved          []byte // last saved state
 	started        bool   // the boot events were recorded
 	eventLimit     uint64 // event numbers reserved in the store
+	// Application cluster state (im.Persister): stored entries not yet
+	// restored into a cluster, and when changed state is next saved.
+	appState []appState
+	appDirty bool
+	appSave  time.Time
 }
+
+// appSaveDelay is how long changes to application cluster state gather
+// before they are saved, so a dimming transition costs one flash write.
+const appSaveDelay = 3 * time.Second
 
 // New creates a device. Its commissioning window starts closed; call
 // OpenCommissioningWindow (typically when no fabric is configured).
@@ -221,9 +230,12 @@ func New(cfg Config) (*Device, error) {
 	d.Node.OnChange = func(p im.ConcretePath) {
 		if persistent(p) {
 			d.dirty = true
+		} else if d.persister(p.Endpoint, p.Cluster) != nil {
+			d.appDirty = true
 		}
 		serverHook(p)
 	}
+	d.Node.OnAddCluster = d.restoreCluster
 	if cfg.Store != nil {
 		if err := d.load(); err != nil {
 			d.log("stored state ignored: " + err.Error())
@@ -304,6 +316,16 @@ func (d *Device) Poll(now time.Time) time.Time {
 		d.Diagnostics.BootReasonEvent(d.Node, now)
 	}
 	d.runDeferred(now)
+	if d.appDirty {
+		d.appDirty = false
+		if d.appSave.IsZero() {
+			d.appSave = now.Add(appSaveDelay)
+		}
+	}
+	if !d.appSave.IsZero() && !now.Before(d.appSave) {
+		d.appSave = time.Time{}
+		d.dirty = true
+	}
 	if d.dirty && !d.HoldSaves {
 		d.dirty = false
 		d.save()
@@ -317,6 +339,9 @@ func (d *Device) Poll(now time.Time) time.Time {
 		next = t
 	}
 	if t := d.FailSafe.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
+	if t := d.appSave; !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
 	d.runDeferred(now)

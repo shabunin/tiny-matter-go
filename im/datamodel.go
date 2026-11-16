@@ -108,6 +108,22 @@ type Node struct {
 	Events *EventLog
 	// OnEvent, if set, is called after an event is recorded.
 	OnEvent func(p ConcreteEventPath)
+	// OnAddCluster, if set, is called for each cluster added, so stored
+	// state can be restored into it (see Persister).
+	OnAddCluster func(endpoint uint16, c Cluster)
+}
+
+// Persister is implemented by clusters with state that survives restarts
+// (nonvolatile attributes, scene tables). A device saves the state soon
+// after the cluster reports an attribute change with Node.Changed, and
+// restores it when the cluster is added at start.
+type Persister interface {
+	// EncodeState writes the state as one element with the given tag.
+	EncodeState(w *tlv.Writer, tag tlv.Tag)
+	// DecodeState restores what EncodeState wrote; r is positioned on the
+	// element. It runs once, before the node starts, so it is where
+	// start-up behaviour (such as StartUpOnOff) applies.
+	DecodeState(r *tlv.Reader) error
 }
 
 // NewNode returns an empty node. seed randomizes initial data versions.
@@ -127,6 +143,9 @@ func (n *Node) AddCluster(e *Endpoint, cs ...Cluster) {
 	for _, c := range cs {
 		n.version++
 		e.clusters = append(e.clusters, clusterEntry{c: c, version: n.version * 0x9E3779B1})
+		if n.OnAddCluster != nil {
+			n.OnAddCluster(e.ID, c)
+		}
 	}
 }
 

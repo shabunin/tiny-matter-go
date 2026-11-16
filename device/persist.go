@@ -22,6 +22,8 @@ import (
 //	7: reboot count
 //	8: groups: key sets, the group key map and the group table (see
 //	   clusters.GroupData.Encode)
+//	9: application cluster state [ { 1: endpoint, 2: cluster, 3: state } ]
+//	   (see im.Persister)
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -77,8 +79,115 @@ func (d *Device) encodeState() []byte {
 			return f != nil && !f.Pending
 		})
 	}
+	d.encodeAppState(w)
 	w.EndContainer()
 	return w.Bytes()
+}
+
+type appState struct {
+	endpoint uint16
+	cluster  uint32
+	state    []byte // the raw element
+}
+
+// persister returns the cluster on an application endpoint whose state is
+// saved, or nil.
+func (d *Device) persister(endpoint uint16, cluster uint32) im.Persister {
+	if endpoint == 0 {
+		return nil
+	}
+	e := d.Node.Endpoint(endpoint)
+	if e == nil {
+		return nil
+	}
+	p, _ := e.Cluster(cluster).(im.Persister)
+	return p
+}
+
+// encodeAppState writes the state of the application clusters, and the
+// stored state of clusters not (yet) added, so that it is kept.
+func (d *Device) encodeAppState(w *tlv.Writer) {
+	started := false
+	start := func() {
+		if !started {
+			started = true
+			w.StartArray(tlv.ContextTag(9))
+		}
+	}
+	for _, e := range d.Node.Endpoints() {
+		if e.ID == 0 {
+			continue
+		}
+		var ids [16]uint32
+		for _, id := range e.ClusterIDs(ids[:0]) {
+			if p, ok := e.Cluster(id).(im.Persister); ok {
+				start()
+				w.StartStruct(tlv.Anonymous)
+				w.PutUint(tlv.ContextTag(1), uint64(e.ID))
+				w.PutUint(tlv.ContextTag(2), uint64(id))
+				p.EncodeState(w, tlv.ContextTag(3))
+				w.EndContainer()
+			}
+		}
+	}
+	for _, a := range d.appState {
+		start()
+		w.StartStruct(tlv.Anonymous)
+		w.PutUint(tlv.ContextTag(1), uint64(a.endpoint))
+		w.PutUint(tlv.ContextTag(2), uint64(a.cluster))
+		w.PutRaw(a.state) // tagged 3 as read
+		w.EndContainer()
+	}
+	if started {
+		w.EndContainer()
+	}
+}
+
+func (d *Device) decodeAppState(r *tlv.Reader) error {
+	if r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+		return errState
+	}
+	for r.Next() == nil {
+		var a appState
+		err := im.ForEachField(r, func(r *tlv.Reader, tag uint8) (err error) {
+			switch tag {
+			case 1:
+				a.endpoint, err = r.Uint16()
+			case 2:
+				var v uint64
+				v, err = r.Uint()
+				a.cluster = uint32(v)
+			case 3:
+				a.state, err = r.RawElement()
+				a.state = append([]byte(nil), a.state...)
+			}
+			return err
+		})
+		if err != nil || a.state == nil {
+			return errState
+		}
+		d.appState = append(d.appState, a)
+	}
+	return r.ExitContainer()
+}
+
+// restoreCluster restores the stored state of a cluster as it is added.
+func (d *Device) restoreCluster(endpoint uint16, c im.Cluster) {
+	p, ok := c.(im.Persister)
+	if !ok || endpoint == 0 {
+		return
+	}
+	for i, a := range d.appState {
+		if a.endpoint != endpoint || a.cluster != c.ID() {
+			continue
+		}
+		d.appState = append(d.appState[:i], d.appState[i+1:]...)
+		r := tlv.NewReader(a.state)
+		if r.Next() != nil || p.DecodeState(r) != nil {
+			d.log("stored cluster state ignored")
+		}
+		return
+	}
 }
 
 // decodeState restores fabrics and ACL entries into an empty device.
@@ -119,6 +228,8 @@ func (d *Device) decodeState(b []byte) error {
 			return err
 		case 8:
 			return d.Groups.Decode(r)
+		case 9:
+			return d.decodeAppState(r)
 		}
 		return nil
 	})
@@ -224,6 +335,7 @@ func (d *Device) load() error {
 		}
 		d.eventLimit, d.Diagnostics.RebootCount = 0, 0
 		*d.Groups = clusters.GroupData{Fabrics: d.Fabrics, OnChange: d.Groups.OnChange}
+		d.appState = nil
 		return err
 	}
 	return nil
