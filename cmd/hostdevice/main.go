@@ -9,6 +9,14 @@
 // (a short press) and "long" (held 1.5 s). With -test-key, the General
 // Diagnostics TestEventTrigger command does the same: trigger
 // 0x003B000000000001 clicks and 0x003B000000000002 long-presses.
+//
+// With -updates, it is an OTA requestor that updates itself: an image's
+// payload is a new hostdevice binary, which it executes in its place. The
+// software version is set at build time:
+//
+//	go build -ldflags "-X main.softwareVersion=2" -o hostdevice-2 ./cmd/hostdevice
+//	tmctl ota-image hostdevice-2 hostdevice-2.ota -vendor 0xFFF1 -product 0x8000 -version 2
+//	tmctl ota-update <node> hostdevice-2.ota
 package main
 
 import (
@@ -20,6 +28,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,8 +55,13 @@ func main() {
 	mdns := flag.Bool("mdns", true, "advertise with avahi-publish")
 	state := flag.String("state", "", "file keeping fabrics and the ACL across restarts")
 	testKey := flag.String("test-key", "", "hex enable key (16 bytes) for TestEventTrigger")
+	updates := flag.String("updates", "", "accept OTA software updates, keeping downloaded binaries in `dir`")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	version, err := strconv.ParseUint(softwareVersion, 10, 32)
+	if err != nil || version == 0 {
+		log.Fatalf("bad build version %q", softwareVersion)
+	}
 
 	salt := []byte("SPAKE2P Key Salt")
 	const iterations = 1000
@@ -80,15 +94,24 @@ func main() {
 			VendorName: "tiny-matter-go", VendorID: devcreds.VendorID,
 			ProductName: "Host Light", ProductID: devcreds.ProductID,
 			HardwareVersion: 1, HardwareVersionString: "1",
-			SoftwareVersion: 1, SoftwareVersionString: "0.1",
+			SoftwareVersion: uint32(version), SoftwareVersionString: "0." + softwareVersion,
 			SerialNumber: "TMG-0001", UniqueID: "tmg-host-0001",
 		},
 		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
 		Log:        func(msg string) { log.Print(msg) },
 		Clock:      time.Now,
 	}
+	var avahi *avahiAdvertiser
 	if *mdns {
-		cfg.Advertiser = &avahiAdvertiser{}
+		avahi = &avahiAdvertiser{}
+		cfg.Advertiser = avahi
+	}
+	if *updates != "" {
+		cfg.Updates = &binaryUpdates{dir: *updates, beforeExec: func() {
+			if avahi != nil {
+				avahi.Advertise(nil)
+			}
+		}}
 	}
 	if *state != "" {
 		cfg.Store = fileStore(*state)
