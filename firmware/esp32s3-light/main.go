@@ -32,6 +32,12 @@
 //
 //	chip-tool generaldiagnostics test-event-trigger hex:<key> 0x003B000000000001 1 0
 //
+// Started by esp32s3-loader (two flash slots), it is an OTA requestor:
+// tmctl ota-update installs a new build, and the loader rolls back to the
+// old one if the new one is reset before it reaches the network. Build an
+// update with its version set, -X main.softwareVersion=<n>, and wrap it
+// with espslot payload and tmctl ota-image (see the README).
+//
 // It speaks IPv6 (link-local) and IPv4 (DHCP), and advertises itself with
 // mDNS on both, so controllers that look over either family find it.
 //
@@ -49,9 +55,11 @@ import (
 	"net/netip"
 	"runtime"
 	"slices"
+	"strconv"
 	"sync/atomic"
 	"time"
 
+	"firmware/espota"
 	"firmware/matterble"
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/credentials/devcreds"
@@ -72,6 +80,9 @@ var (
 	ssid, password string // optional compiled-in network, set with -ldflags -X
 	stateSlot      string // "1" keeps state in a second flash area (testing)
 	testEventKey   string // hex key enabling test event triggers (testing)
+
+	// The software version, a number, set with -X main.softwareVersion=n.
+	softwareVersion = "1"
 )
 
 const (
@@ -201,6 +212,20 @@ func main() {
 	if err != nil {
 		fatal("dac key", err)
 	}
+	version, err := strconv.ParseUint(softwareVersion, 10, 32)
+	if err != nil || version == 0 {
+		version = 1
+	}
+	// Updates go to the other flash slot when the loader started us.
+	var updates device.ImageStore
+	slots := &espota.Slots{Restart: restart, Log: func(msg string) { println(msg) }}
+	if base, seq, confirmed, ok := slots.Running(); ok {
+		println("running slot", base, "record", seq, "confirmed", confirmed, "version", version)
+		updates = slots
+	} else {
+		println("not started by the loader: OTA updates disabled")
+		slots = nil
+	}
 	d, err := device.New(device.Config{
 		Transport: tr, Rand: rand.Reader, Port: matterPort,
 		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: discriminator,
@@ -212,7 +237,7 @@ func main() {
 			VendorName: "tiny-matter-go", VendorID: devcreds.VendorID,
 			ProductName: "Cardputer Light", ProductID: devcreds.ProductID,
 			HardwareVersion: 1, HardwareVersionString: "ESP32-S3",
-			SoftwareVersion: 1, SoftwareVersionString: "0.2",
+			SoftwareVersion: uint32(version), SoftwareVersionString: "0.2." + softwareVersion,
 			SerialNumber: hexMAC(mac), UniqueID: "tmg-" + hexMAC(mac),
 		},
 		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
@@ -221,6 +246,7 @@ func main() {
 		Clock:      time.Now,
 		Log:        func(msg string) { println(msg) },
 		WiFi:       true,
+		Updates:    updates,
 	})
 	if err != nil {
 		fatal("device", err)
@@ -417,6 +443,9 @@ func main() {
 
 	var frame [espradio.MaxFrameSize]byte
 	lastReport := time.Now()
+	// A new image is confirmed once it has run on the network for a while;
+	// reset before that, the loader rolls it back.
+	confirmAt := time.Now().Add(20 * time.Second)
 	for {
 		for i := 0; i < 8; i++ {
 			off, n, err := nd.EthPoll(frame[:])
@@ -446,6 +475,12 @@ func main() {
 		resp.Poll(now)
 		stack4.Poll(now)
 		u.poll(now)
+		if slots != nil && !confirmAt.IsZero() && now.After(confirmAt) && linkUp.Load() {
+			confirmAt = time.Time{}
+			if err := slots.Confirm(); err != nil {
+				println("confirming the image:", err.Error())
+			}
+		}
 		if now.Sub(lastReport) > 30*time.Second {
 			lastReport = now
 			rx, drops := espradio.NetifRxStats()
