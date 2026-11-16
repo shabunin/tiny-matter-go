@@ -8,7 +8,7 @@ bare-metal Wi-Fi chips without an OS network stack. Everything is sans-IO,
 allocation-conscious and safe on 32-bit targets.
 
 **Status: early (v0.x).** It works end to end on real hardware: an ESP32-S3
-(M5Stack Cardputer) on/off light is commissioned and controlled over Wi-Fi by
+(M5Stack Cardputer) colour light is commissioned and controlled over Wi-Fi by
 chip-tool, [matter.js](https://github.com/matter-js/matter.js) and
 [matterctl](https://github.com/cybergarage/go-matter), all at once, and
 chip-tool and this project's controller, `tmctl`, commission it over
@@ -49,7 +49,12 @@ while it is plugged into a computer (see the firmware's package comment).
 To add another controller, open a commissioning window from an existing one
 (Administrator Commissioning, cluster 0x003C).
 
-Endpoint 1 is the light. Endpoint 2 is the G0 button as a Generic Switch:
+Endpoint 1 is the light, an Extended Color Light shown on the RGB LED:
+On/Off with the Lighting feature (timed on, global scene, start-up
+state), Level Control (fades on and off), Color Control (hue and
+saturation, enhanced hue, colour loop, xy, colour temperature coupled to
+the level), Scenes Management and Groups. Its state and scenes survive
+restarts. Endpoint 2 is the G0 button as a Generic Switch:
 a press reports the InitialPress and ShortRelease events, a hold of 1 s
 or more InitialPress, LongPress and LongRelease. Watch them from a
 subscription (`subscribe 1` in the matter.js shell), or in chip-tool's
@@ -60,7 +65,7 @@ interactive mode:
 
 The device also reports Basic Information StartUp and Leave, the General
 Diagnostics BootReason, and Access Control entry changes; `identify
-identify 10 1 1` blinks the LED.
+identify 10 1 1` (or TriggerEffect) blinks the LED.
 
 ## Controller (tmctl)
 
@@ -81,6 +86,9 @@ or Bluetooth LE, and works with them:
     tmctl read lamp 1 OnOff onOff
     tmctl write lamp 0 BasicInformation NodeLabel "desk lamp"
     tmctl invoke lamp 1 LevelControl MoveToLevel level=128 transitionTime=10 optionsMask=0 optionsOverride=0
+    tmctl invoke lamp 1 ColorControl MoveToHueAndSaturation 170 254 30 0 0
+    tmctl invoke lamp 1 ScenesManagement StoreScene 0 1     # group 0, scene 1
+    tmctl invoke lamp 1 ScenesManagement RecallScene 0 1 3000
     tmctl events lamp '*' '*'
     tmctl subscribe lamp 2 Switch -events -urgent   # until Ctrl-C
     tmctl open-window lamp                  # codes for another controller
@@ -142,7 +150,7 @@ attestation chain and certification declaration.
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
 | `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; group Invoke and Write (no endpoint, no response); events (a compact log per priority, event reads with filters, urgent and batched event reports, fabric-sensitive events); data model of endpoints and clusters with global attributes |
-| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi or Thread, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), Group Key Management (trust-first key sets, key map, group table), Groups (with names), On/Off, Identify, Switch (momentary, with long press) |
+| `clusters/` | Server clusters: Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi or Thread, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), Group Key Management (trust-first key sets, key map, group table), Groups (with names), Scenes Management (per fabric and group, recalled with a transition), On/Off (with the Lighting feature), Level Control and Color Control (all modes, transitions in Poll, start-up values), Identify (with effects), Switch (momentary, with long press); RGB conversion for lights |
 | `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
 | `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
@@ -159,13 +167,13 @@ attestation chain and certification declaration.
 | `internal/bluez/` | BLE central over BlueZ's D-Bus API: LE discovery with service data, connect, GATT writes and indications for the Matter service |
 | `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers and the reboot count (reopens commissioning when the last fabric is removed) |
-| `cmd/hostdevice/` | An on/off light (in the groups added to it) and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool and matter.js commission and control it |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers, the reboot count and application cluster state (saved a few seconds after it changes) (reopens commissioning when the last fabric is removed) |
+| `cmd/hostdevice/` | An Extended Color Light (with scenes and groups; logs the colour it would show) and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS); chip-tool and matter.js commission and control it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |
 | `tools/chipvectors.py` | Converts connectedhomeip crypto test-vector headers to JSON test data |
 | `firmware/matterble/` | Matter BLE peripheral for TinyGo: the Matter GATT service over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp` |
-| `firmware/esp32s3-light/` | Matter on/off light (with Groups, listening on its groups' multicast addresses) and push button (G0 as a Generic Switch) over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `ip4` + `mdns` + `device`, BLE commissioning via `matterble`. Separate module. chip-tool, matter.js and matterctl commission it over Wi-Fi in about 3-4 s (real attestation) and control it, all at once (multi-admin) |
+| `firmware/esp32s3-light/` | Matter Extended Color Light on the RGB LED (with Scenes and Groups, listening on its groups' multicast addresses) and push button (G0 as a Generic Switch) over Wi-Fi for ESP32-S3 (M5 Cardputer): espradio frames + `ip6` + `ip4` + `mdns` + `device`, BLE commissioning via `matterble`. Separate module. chip-tool, matter.js and matterctl commission it over Wi-Fi in about 3-4 s (real attestation) and control it, all at once (multi-admin) |
 | `probe/onchip/` | Device and controller commissioning each other on the microcontroller (no radio), with timings |
 | `probe/` | Feasibility probes, TinyGo benchmarks and a large-memory QEMU Cortex-M target |
 

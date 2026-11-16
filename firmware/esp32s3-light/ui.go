@@ -26,11 +26,11 @@ const (
 )
 
 // ui is the board's user interface. The G0 button is a Generic Switch on
-// endpoint 2 and, held for 5 s, a factory reset. The RGB LED shows the
-// light (red when on) or, while the node is not commissioned, the
-// commissioning mode (dim cyan: over BLE, dim purple: over IP); it blinks
-// while an endpoint identifies itself, white for the light and green for
-// the button.
+// endpoint 2 and, held for 5 s, a factory reset. The RGB LED is the light
+// (its colour and brightness) or, while the node is not commissioned, shows
+// the commissioning mode (dim cyan: over BLE, dim purple: over IP); it
+// blinks while an endpoint identifies itself, white for the light and
+// green for the button.
 type ui struct {
 	d     *device.Device
 	store *storage.Flash
@@ -38,8 +38,12 @@ type ui struct {
 	button   clusters.Switch
 	lightID  clusters.Identify
 	buttonID clusters.Identify
-	light    bool // the light is on
-	ble      bool // waiting for BLE commissioning
+	onOff    *clusters.OnOff
+	level    *clusters.LevelControl
+	color    *clusters.ColorControl
+	rgb      [3]uint8 // the light's colour, while on
+	changed  bool     // the light changed: recompute rgb
+	ble      bool     // waiting for BLE commissioning
 
 	sample    bool      // the last button sample (true: pressed)
 	sampledAt time.Time // when the sample last changed
@@ -51,25 +55,34 @@ type ui struct {
 	drawn bool
 }
 
-// newUI adds the light (endpoint 1) and the button (endpoint 2) to the
-// node.
+// newUI adds the light (endpoint 1, an Extended Color Light) and the
+// button (endpoint 2) to the node.
 func newUI(d *device.Device, store *storage.Flash) *ui {
-	u := &ui{d: d, store: store}
-	u.lightID = clusters.Identify{Type: clusters.IdentifyLightOutput,
-		OnIdentify: func(on bool) { println("light identify:", on) }}
+	u := &ui{d: d, store: store, changed: true}
+	u.lightID = clusters.Identify{Type: clusters.IdentifyLightOutput, Effects: true,
+		OnIdentify: func(on bool) { println("light identify:", on, "effect", u.lightID.Effect()) }}
 	u.buttonID = clusters.Identify{Type: clusters.IdentifyVisibleIndicator,
 		OnIdentify: func(on bool) { println("button identify:", on) }}
-	light := d.Node.AddEndpoint(lightEndpoint, clusters.DeviceTypeOnOffLight)
-	d.Node.AddCluster(light, clusters.Descriptor{}, &u.lightID, &clusters.OnOff{
+	u.onOff = &clusters.OnOff{Lighting: true,
 		OnChange: func(on bool) {
 			if on {
 				println("LIGHT ON")
 			} else {
 				println("LIGHT OFF")
 			}
-			u.light = on
+			u.changed = true
 		},
-	}, d.NewGroups(&u.lightID))
+	}
+	u.level = clusters.NewLevelControl(u.onOff, true)
+	u.level.OnChange = func(uint8) { u.changed = true }
+	u.color = clusters.NewColorControl(clusters.ColorAllFeatures, u.onOff, u.level)
+	u.color.OnChange = func() { u.changed = true }
+	scenes := d.NewScenes()
+	u.onOff.Scenes = scenes
+	groups := d.NewGroups(&u.lightID)
+	groups.Scenes = scenes
+	light := d.Node.AddEndpoint(lightEndpoint, clusters.DeviceTypeExtendedColorLight)
+	d.Node.AddCluster(light, clusters.Descriptor{}, &u.lightID, groups, scenes, u.onOff, u.level, u.color)
 	sw := d.Node.AddEndpoint(switchEndpoint, clusters.DeviceTypeGenericSwitch)
 	d.Node.AddCluster(sw, clusters.Descriptor{}, &u.buttonID, &u.button)
 	return u
@@ -135,8 +148,14 @@ func (u *ui) updateLED(now time.Time) {
 				c = [3]uint8{0, 40, 0} // green: the button
 			}
 		}
-	case u.light:
-		c = [3]uint8{80, 0, 0} // red
+	case u.onOff.On || u.level.Brightness() > 0: // on, or fading off
+		if u.changed {
+			u.changed = false
+			r, g, b := u.color.RGB(u.level.Brightness())
+			// The LED is bright: full scale is 3/8 of its range.
+			u.rgb = [3]uint8{uint8(uint16(r) * 3 / 8), uint8(uint16(g) * 3 / 8), uint8(uint16(b) * 3 / 8)}
+		}
+		c = u.rgb
 	case u.d.Commissioned():
 	case u.ble:
 		c = [3]uint8{0, 8, 8} // dim cyan

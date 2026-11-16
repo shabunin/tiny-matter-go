@@ -1,4 +1,4 @@
-// Command esp32s3-light is a Matter on/off light over Wi-Fi for ESP32-S3
+// Command esp32s3-light is a Matter colour light over Wi-Fi for ESP32-S3
 // boards such as the M5Stack Cardputer. It uses the SDK development
 // attestation credentials (vendor 0xFFF1, product 0x8000), test passcode
 // 20202021 and discriminator 3840, so commission it with a test
@@ -16,9 +16,11 @@
 //
 // It keeps its fabrics and network in flash and restarts already
 // commissioned. Hold the G0 button for 5 s to erase them (factory reset).
-// The RGB LED shows the light state (red when on); dim cyan means it waits
-// for BLE commissioning, dim purple for commissioning over IP, yellow
-// means a factory reset. It blinks while a controller identifies an
+// The RGB LED is the light, an Extended Color Light: on/off, level, hue
+// and saturation, xy, colour temperature and the colour loop, with scenes
+// and groups. While not commissioned, dim cyan means it waits for BLE
+// commissioning and dim purple for commissioning over IP; yellow means a
+// factory reset. It blinks while a controller identifies an
 // endpoint: white for the light, green for the button.
 //
 // Endpoint 1 is the light; endpoint 2 is a Generic Switch, the G0 button,
@@ -213,7 +215,7 @@ func main() {
 			SoftwareVersion: 1, SoftwareVersionString: "0.2",
 			SerialNumber: hexMAC(mac), UniqueID: "tmg-" + hexMAC(mac),
 		},
-		DeviceType: clusters.DeviceTypeOnOffLight.ID,
+		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
 		Advertiser: adv,
 		Store:      store,
 		Clock:      time.Now,

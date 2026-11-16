@@ -1,8 +1,9 @@
 // Command hostdevice runs the stack on a host over UDP for interoperability
-// testing against a Matter controller such as chip-tool. It is an on/off
-// light (endpoint 1, a member of the groups added to it) and a push button (endpoint 2, Generic Switch) using
-// the SDK development attestation credentials (vendor 0xFFF1, product
-// 0x8000), test passcode 20202021 and discriminator 3840.
+// testing against a Matter controller such as chip-tool. It is an Extended
+// Color Light (endpoint 1: on/off, level, colour, scenes and groups; it
+// logs the colour it would show) and a push button (endpoint 2, Generic
+// Switch) using the SDK development attestation credentials (vendor
+// 0xFFF1, product 0x8000), test passcode 20202021 and discriminator 3840.
 //
 // Lines on standard input work the button: "press", "release", "click"
 // (a short press) and "long" (held 1.5 s). With -test-key, the General
@@ -82,7 +83,7 @@ func main() {
 			SoftwareVersion: 1, SoftwareVersionString: "0.1",
 			SerialNumber: "TMG-0001", UniqueID: "tmg-host-0001",
 		},
-		DeviceType: clusters.DeviceTypeOnOffLight.ID,
+		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
 		Log:        func(msg string) { log.Print(msg) },
 		Clock:      time.Now,
 	}
@@ -96,11 +97,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	light := d.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
-	lightID := &clusters.Identify{Type: clusters.IdentifyLightOutput, OnIdentify: func(on bool) { log.Printf("light identify=%v", on) }}
-	d.Node.AddCluster(light, clusters.Descriptor{}, lightID,
-		&clusters.OnOff{OnChange: func(on bool) { log.Printf("light on=%v", on) }},
-		d.NewGroups(lightID))
+	light := d.Node.AddEndpoint(1, clusters.DeviceTypeExtendedColorLight)
+	lightID := &clusters.Identify{Type: clusters.IdentifyLightOutput, Effects: true}
+	lightID.OnIdentify = func(on bool) { log.Printf("light identify=%v effect=%#x", on, lightID.Effect()) }
+	lightChanged := false
+	onOff := &clusters.OnOff{Lighting: true, OnChange: func(on bool) { lightChanged = true }}
+	level := clusters.NewLevelControl(onOff, true)
+	level.OnChange = func(uint8) { lightChanged = true }
+	color := clusters.NewColorControl(clusters.ColorAllFeatures, onOff, level)
+	color.OnChange = func() { lightChanged = true }
+	scenes := d.NewScenes()
+	onOff.Scenes = scenes
+	lightGroups := d.NewGroups(lightID)
+	lightGroups.Scenes = scenes
+	d.Node.AddCluster(light, clusters.Descriptor{}, lightID, lightGroups, scenes, onOff, level, color)
+	// The light's output, logged at most every 250 ms.
+	var lastLog time.Time
+	logLight := func(now time.Time) {
+		if !lightChanged || now.Sub(lastLog) < 250*time.Millisecond {
+			return
+		}
+		lightChanged, lastLog = false, now
+		r, g, b := color.RGB(level.Brightness())
+		log.Printf("light on=%v level=%d mode=%d rgb=#%02x%02x%02x", onOff.On, level.Level(), color.Mode(), r, g, b)
+	}
 	groups := &groupMemberships{c: conn, joined: map[netip.Addr]bool{}}
 	d.OnMulticast = groups.set
 	groups.set(d.MulticastAddrs())
@@ -158,7 +178,12 @@ func main() {
 	}()
 	for {
 		var timer <-chan time.Time
-		if deadline := d.Poll(time.Now()); !deadline.IsZero() {
+		deadline := d.Poll(time.Now())
+		logLight(time.Now())
+		if lightChanged {
+			deadline = earliest(deadline, lastLog.Add(250*time.Millisecond))
+		}
+		if !deadline.IsZero() {
 			timer = time.After(time.Until(deadline))
 		}
 		select {
@@ -187,6 +212,13 @@ func main() {
 		case <-timer:
 		}
 	}
+}
+
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // hostInterfaces lists the host's up, non-loopback interfaces.
