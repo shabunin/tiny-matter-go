@@ -23,6 +23,9 @@ const (
 const (
 	triggerClick = 0x003B000000000001 // press the button for 150 ms
 	triggerLong  = 0x003B000000000002 // hold it for 1.5 s
+
+	// The SDK's OTA requestor trigger: query the default providers now.
+	triggerOTAQuery = 0x002A000000000100
 )
 
 // ui is the board's user interface. The G0 button is a Generic Switch on
@@ -127,6 +130,12 @@ func (u *ui) trigger(ctx *im.Context, trigger uint64) im.Status {
 		hold = 150 * time.Millisecond
 	case triggerLong:
 		hold = 1500 * time.Millisecond
+	case triggerOTAQuery:
+		if !u.d.CheckForUpdate(ctx.Now) {
+			return im.InvalidInState
+		}
+		println("test event trigger: querying the default OTA providers")
+		return im.Success
 	default:
 		return im.InvalidCommand
 	}

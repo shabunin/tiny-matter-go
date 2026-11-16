@@ -236,8 +236,13 @@ func (u *updater) fabric() *fabric.Fabric {
 	return f
 }
 
+// otaResolveTime is how long the provider's address is looked up before
+// the last known one is used.
+const otaResolveTime = 10 * time.Second
+
 // withSession runs f with a CASE session to the provider: an open one, or
-// one established with the provider's last known address.
+// one established with the address DNS-SD finds for it (Config.Resolve),
+// or else with its last known address.
 func (u *updater) withSession(now time.Time, f func(now time.Time, s *exchange.Session)) {
 	fab := u.fabric()
 	if fab == nil {
@@ -256,6 +261,36 @@ func (u *updater) withSession(now time.Time, f func(now time.Time, s *exchange.S
 		f(now, best)
 		return
 	}
+	if resolve := u.d.cfg.Resolve; resolve != nil {
+		until := now.Add(otaResolveTime)
+		var look func(now time.Time)
+		look = func(now time.Time) {
+			fab := u.fabric()
+			if fab == nil {
+				u.fail(now, clusters.OTAReasonFailure, errors.New("provider fabric gone"))
+				return
+			}
+			if addr, ok := resolve(now, fab.CompressedFabricID, u.provider.NodeID); ok {
+				u.addr = addr
+				u.connect(now, fab, f)
+				return
+			}
+			if now.Before(until) {
+				u.schedule(now.Add(500*time.Millisecond), look)
+				return
+			}
+			u.log("provider not found with DNS-SD")
+			u.connect(now, fab, f)
+		}
+		look(now)
+		return
+	}
+	u.connect(now, fab, f)
+}
+
+// connect establishes a CASE session to the provider at its last known
+// address and runs f with it.
+func (u *updater) connect(now time.Time, fab *fabric.Fabric, f func(now time.Time, s *exchange.Session)) {
 	if !u.addr.IsValid() {
 		u.fail(now, clusters.OTAReasonFailure, errors.New("no session to the provider and no address for it"))
 		return

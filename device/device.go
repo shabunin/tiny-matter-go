@@ -68,6 +68,11 @@ type Config struct {
 	// Software Update Requestor cluster, and images downloaded from a
 	// provider are stored there and applied.
 	Updates ImageStore
+	// Resolve, if set, finds the address of another node on a fabric with
+	// DNS-SD (mdns.NodeResolver does), for sessions the node opens itself,
+	// such as to an OTA provider it has no session with. It is called
+	// repeatedly until it reports the address.
+	Resolve func(now time.Time, compressedFabricID [8]byte, nodeID uint64) (exchange.Addr, bool)
 }
 
 // Device is a Matter node.

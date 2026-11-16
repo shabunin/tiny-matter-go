@@ -103,7 +103,7 @@ func main() {
 	}
 	var avahi *avahiAdvertiser
 	if *mdns {
-		avahi = &avahiAdvertiser{}
+		avahi = newAvahiAdvertiser()
 		cfg.Advertiser = avahi
 	}
 	if *updates != "" {

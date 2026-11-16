@@ -15,7 +15,8 @@ import (
 type Querier struct {
 	send func(dst netip.AddrPort, b []byte) error
 	// Zone, if set, names the zone (interface) of link-local IPv6
-	// addresses in a response from src that arrived over IPv4.
+	// addresses in a response from src that arrived over IPv4 (or over
+	// IPv6 without a zone).
 	Zone func(src netip.AddrPort) string
 
 	records []cached
@@ -115,7 +116,8 @@ func (q *Querier) HandlePacket(now time.Time, src netip.AddrPort, payload []byte
 	zone := ""
 	if a := src.Addr(); a.Is6() && !a.Is4In6() {
 		zone = a.Zone()
-	} else if q.Zone != nil {
+	}
+	if zone == "" && q.Zone != nil {
 		zone = q.Zone(src)
 	}
 	for i := 0; i < n; i++ {

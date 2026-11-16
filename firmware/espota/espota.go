@@ -179,6 +179,7 @@ type Slots struct {
 	written   uint32 // image bytes in buf or flash
 	crc       uint32
 	ready     bool
+	guarded   bool // Guard armed the watchdog
 }
 
 func (s *Slots) log(msg string) {
@@ -209,16 +210,19 @@ func (s *Slots) Running() (base, seq uint32, confirmed, ok bool) {
 	return base, cur.seq, cur.confirmed, true
 }
 
-// Confirm marks the running image good, so the loader keeps starting it.
-// Call it once the firmware works (it reaches the network).
+// Confirm marks the running image good, so the loader keeps starting it,
+// and disarms the watchdog Guard armed. Call it once the firmware works
+// (it reaches the network).
 func (s *Slots) Confirm() error {
 	if _, _, confirmed, ok := s.Running(); !ok || confirmed {
+		s.unguard()
 		return nil
 	}
 	zero := [1]uint32{0}
 	if err := flashWrite(s.running.addr+recConfirmed, zero[:]); err != nil {
 		return err
 	}
+	s.unguard()
 	s.log("image confirmed")
 	return nil
 }

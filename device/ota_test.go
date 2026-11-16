@@ -223,6 +223,52 @@ func TestOTAWrongImage(t *testing.T) {
 	}
 }
 
+// TestOTAResolveProvider: after a restart the device has no session to its
+// default provider and no address for it; it finds it with DNS-SD.
+func TestOTAResolveProvider(t *testing.T) {
+	store := &storage.Memory{}
+	h := otaHarness(t, store, &memImages{}, 1)
+	ctlF, s := h.commission()
+	p := &provider{image: testImage(t, 0x8000, []byte("x")), version: 1, token: bytes.Repeat([]byte{7}, 32)}
+	p.attach(h)
+	path := im.AttributePath{Endpoint: 0, Cluster: clusters.IDOTARequestor, Attribute: 0}
+	if st := h.write(s, path, func(w *tlv.Writer, tag tlv.Tag) {
+		w.StartArray(tag)
+		w.StartStruct(tlv.Anonymous)
+		w.PutUint(tlv.ContextTag(1), providerNode)
+		w.PutUint(tlv.ContextTag(2), 0)
+		w.EndContainer()
+		w.EndContainer()
+	}); st != im.Success {
+		t.Fatalf("write default provider: %#x", st)
+	}
+	h.w.Advance(5 * time.Second) // saved
+
+	var h2 *harness
+	lookups := 0
+	h2 = newHarnessConfig(t, store, false, func(cfg *device.Config) {
+		cfg.Updates = &memImages{}
+		cfg.Basic.SoftwareVersion = 1
+		cfg.Log = func(m string) { t.Log(m) }
+		cfg.Resolve = func(now time.Time, cfid [8]byte, node uint64) (exchange.Addr, bool) {
+			lookups++
+			if cfid != ctlF.CompressedFabricID || node != providerNode {
+				t.Errorf("resolving %x node %#x", cfid, node)
+			}
+			return h2.ctl.Addr, lookups > 2 // the answer takes a while
+		}
+	})
+	p.attach(h2)
+	ctlResponder(t, h2, ctlF)
+	if !h2.dev.CheckForUpdate(h2.w.Now) {
+		t.Fatal("no query started")
+	}
+	h2.w.Advance(10 * time.Second)
+	if p.queries != 1 || lookups != 3 || h2.dev.OTA.State() != clusters.OTAStateIdle {
+		t.Fatalf("%d queries after %d lookups, state %d", p.queries, lookups, h2.dev.OTA.State())
+	}
+}
+
 func TestOTADefaultProviders(t *testing.T) {
 	images := &memImages{}
 	h := otaHarness(t, nil, images, 1)

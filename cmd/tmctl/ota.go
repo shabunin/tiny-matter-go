@@ -3,13 +3,16 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/controller"
+	"github.com/shabunin/tiny-matter-go/dnssd"
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/internal/avahi"
 	"github.com/shabunin/tiny-matter-go/ota"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
@@ -114,6 +117,9 @@ type otaEvent struct {
 func cmdOTAUpdate(args []string) error {
 	fs := flagSet("ota-update")
 	wait := fs.Duration("wait", 3*time.Minute, "how long to wait for the node to restart with the new version")
+	asDefault := fs.Bool("default", false,
+		"instead of announcing the update, become the node's default OTA provider and wait for it to query (its periodic query, or a test event trigger)")
+	queryWait := fs.Duration("query-wait", 10*time.Minute, "with -default, how long to wait for the node's query")
 	pos, err := parseArgs(fs, args)
 	if err != nil || len(pos) != 2 {
 		return usageError{}
@@ -171,15 +177,34 @@ func cmdOTAUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Nodes without a session to us find us with DNS-SD.
+	adv := &avahi.Advertiser{}
+	if *verbose {
+		adv.Log = func(msg string) { log.Print(msg) }
+	}
+	adv.Advertise([]dnssd.Service{c.OperationalService()})
+	defer adv.Advertise(nil)
 	ctx, cancel := withTimeout(*timeout)
-	err = c.AnnounceOTA(ctx, id)
+	firstWait := *timeout
+	if *asDefault {
+		err = c.SetDefaultOTAProvider(ctx, id)
+		c.CloseSessions(id) // the node looks us up and connects itself
+		firstWait = *queryWait
+	} else {
+		err = c.AnnounceOTA(ctx, id)
+	}
 	cancel()
 	if err != nil {
-		return fmt.Errorf("announcing the update: %w", describe(err))
+		return fmt.Errorf("offering the update: %w", describe(err))
 	}
-	fmt.Printf("offering version %d (%s) to node %d\n", h.SoftwareVersion, h.SoftwareVersionString, id)
+	if *asDefault {
+		fmt.Printf("default OTA provider of node %d, offering version %d (%s); waiting for its query\n",
+			id, h.SoftwareVersion, h.SoftwareVersionString)
+	} else {
+		fmt.Printf("offering version %d (%s) to node %d\n", h.SoftwareVersion, h.SoftwareVersionString, id)
+	}
 	start := time.Now()
-	idle := time.NewTimer(*timeout)
+	idle := time.NewTimer(firstWait)
 	defer idle.Stop()
 	var restart <-chan time.Time
 	for {

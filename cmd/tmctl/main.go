@@ -79,8 +79,8 @@ func init() {
 		{"ota-image", "<payload> <image.ota> -vendor id -product id -version n [-version-string s] [-min n] [-max n] [-notes url]",
 			"wrap a firmware payload in a Matter OTA image file", cmdOTAImage},
 		{"ota-info", "<image.ota>", "show an OTA image's header and check its digest", cmdOTAInfo},
-		{"ota-update", "<node> <image.ota> [-wait duration]",
-			"update a node: offer it the image as its OTA provider and follow the download, apply and restart", cmdOTAUpdate},
+		{"ota-update", "<node> <image.ota> [-wait duration] [-default [-query-wait duration]]",
+			"update a node: offer it the image as its OTA provider (announced, or as its default provider) and follow the download, apply and restart", cmdOTAUpdate},
 		{"clusters", "[cluster]", "list known clusters, or a cluster's attributes, commands and events", cmdClusters},
 		{"payload", "<code>", "decode a QR or manual pairing code", cmdPayload},
 	}

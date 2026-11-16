@@ -11,6 +11,7 @@ import (
 
 	"github.com/shabunin/tiny-matter-go/bdx"
 	"github.com/shabunin/tiny-matter-go/clusters"
+	"github.com/shabunin/tiny-matter-go/dnssd"
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/message"
@@ -163,4 +164,28 @@ func (c *Controller) AnnounceOTA(ctx context.Context, node uint64) error {
 			w.PutUint(tlv.ContextTag(4), 0)
 		})
 	return err
+}
+
+// SetDefaultOTAProvider makes the controller the node's default OTA
+// provider on its fabric (DefaultOTAProviders), which the node queries
+// periodically. Only this run of the controller answers as that node ID,
+// and the node finds it with DNS-SD: advertise OperationalService.
+func (c *Controller) SetDefaultOTAProvider(ctx context.Context, node uint64) error {
+	return c.Write(ctx, node, im.AttributePath{Endpoint: 0, Cluster: clusters.IDOTARequestor, Attribute: 0}, 0,
+		func(w *tlv.Writer, tag tlv.Tag) {
+			w.StartArray(tag)
+			w.StartStruct(tlv.Anonymous)
+			w.PutUint(tlv.ContextTag(1), c.fab.NodeID)
+			w.PutUint(tlv.ContextTag(2), 0) // endpoint
+			w.EndContainer()
+			w.EndContainer()
+		})
+}
+
+// OperationalService is the controller's operational DNS-SD service
+// (_matter._tcp), for nodes that open sessions to it, such as OTA
+// requestors looking up their provider.
+func (c *Controller) OperationalService() dnssd.Service {
+	o := dnssd.Operational{CompressedFabricID: c.fab.CompressedFabricID, NodeID: c.fab.NodeID, Port: c.LocalAddr().Port()}
+	return o.Service()
 }

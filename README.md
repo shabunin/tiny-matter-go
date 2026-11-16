@@ -167,7 +167,13 @@ own if need be. `tmctl` is a provider for one image at a time:
 
 `ota-update` serves the image, announces itself to the node and follows
 the download, the apply request and the restart until the node runs the
-new version. `cmd/hostdevice -updates <dir>` updates itself this way: the
+new version. With `-default` it writes itself into the node's
+DefaultOTAProviders instead and waits for the node's query; a node with
+no session to its provider finds it with DNS-SD (`device.Config.Resolve`,
+`mdns.NodeResolver`), and `tmctl` advertises its operational service with
+avahi while it serves. On the Cardputer, General Diagnostics test event
+trigger 0x002A000000000100 (the SDK's) makes the node query its default
+providers at once. `cmd/hostdevice -updates <dir>` updates itself this way: the
 payload is a new hostdevice binary (version set at build time with
 `-ldflags "-X main.softwareVersion=2"`), which it executes in its place.
 
@@ -179,6 +185,10 @@ and adds a boot record for it; the loader starts the new image once, as a
 trial, and the firmware confirms it after it has been on the network for
 20 s. If the board is reset before that, the loader starts the previous
 image again and the device reports the failed update (DownloadError).
+An image on trial arms the RTC watchdog first thing (TinyGo's start-up
+code disables the watchdogs, so the loader cannot), and confirming
+disarms it: an image that hangs, or cannot reach the network, resets
+after 3 minutes and is rolled back too.
 Setting the board up once over USB:
 
     cd firmware
@@ -218,13 +228,13 @@ without the loader) runs as before, with updates disabled.
 | `bdx/` | Bulk Data Exchange (spec 11.22), synchronous and receiver-driven as OTA uses it: a download (receiver) and a file server (sender), with the SDK's message encodings |
 | `ota/` | OTA image files: header encoding and parsing, image creation with the SHA-256 digest, and a streaming reader that checks the digest |
 | `clusters/` | Server clusters: OTA Software Update Requestor and Provider (with the commands' codecs), Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi or Thread, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), Group Key Management (trust-first key sets, key map, group table), Groups (with names), Scenes Management (per fabric and group, recalled with a transition), On/Off (with the Lighting feature), Level Control and Color Control (all modes, transitions in Poll, start-up values), Identify (with effects), Switch (momentary, with long press); RGB conversion for lights |
-| `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator; resumption falls back to a full handshake |
+| `securechannel/casesession/` | CASE (Sigma1-3) responder and initiator, and session resumption (Sigma2_Resume) from a store of resumption records shared by both roles |
 | `credentials/` | Matter TLV certificates: decode/encode, X.509 reconstruction (byte-exact against SDK vectors), chain validation, CSR, attestation elements; `devcreds/` holds the SDK development DAC/PAI/CD |
-| `fabric/` | Fabric table with pending/commit for commissioning, compressed fabric ID, operational IPK |
+| `fabric/` | Fabric table with pending/commit for commissioning and for UpdateNOC (the committed credentials kept for rollback and saving), compressed fabric ID, operational IPK |
 | `dnssd/` | DNS-SD service descriptions (commissionable `_matterc._udp`, operational `_matter._tcp`) for an mDNS advertiser |
 | `ip6/` | Minimal IPv6 host over raw Ethernet frames: EUI-64 link-local address, Neighbor Discovery, Echo, multicast groups with MLDv2 reports, UDP |
 | `ip4/` | Minimal IPv4 host over the same frames: DHCP client (renew/rebind/expiry), ARP, default gateway, Echo, IGMPv2 reports, UDP |
-| `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies; a `dnssd.Advertiser`) and querier (browse, resolve, cache) |
+| `mdns/` | Small dual-stack mDNS/DNS-SD responder (PTR/SRV/TXT/A/AAAA over IPv6 and IPv4, announcements, goodbyes, legacy and QU replies; a `dnssd.Advertiser`), querier (browse, resolve, cache), and a frugal resolver of operational nodes for devices |
 | `onboarding/` | Onboarding payloads: QR codes (`MT:` base-38) and 11/21-digit manual pairing codes (Verhoeff check digit) |
 | `credentials/attestation/` | Device attestation for commissioners: DAC/PAI/PAA chain, certification declaration (CMS, CSA and SDK test signing keys), attestation and NOCSR signatures; PAA trust stores, with the production and SDK test PAAs built in |
 | `controller/` | Matter controller for hosts: own fabric (persisted), OTA provider (serves an image over BDX; accepts CASE from its nodes), mDNS and BLE discovery, commissioning over IP or BLE, chosen by where the device is found (PASE, attestation, CSR, NOC, Wi-Fi or Thread network provisioning, CASE), network scans, read/write/invoke, subscriptions that re-establish themselves, commissioning windows, node removal, groups (key sets, setting nodes up, multicast commands from a fixed sender with a saved counter) |

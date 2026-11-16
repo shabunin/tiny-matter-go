@@ -80,6 +80,7 @@ var (
 	ssid, password string // optional compiled-in network, set with -ldflags -X
 	stateSlot      string // "1" keeps state in a second flash area (testing)
 	testEventKey   string // hex key enabling test event triggers (testing)
+	testHang       string // "1" hangs at start (testing the trial watchdog)
 
 	// The software version, a number, set with -X main.softwareVersion=n.
 	softwareVersion = "1"
@@ -92,6 +93,9 @@ const (
 	iterations    = 1000
 
 	joinTimeout = 60 * time.Second // give up on a network provisioned over BLE
+	// trialTimeout is how long a new image has to confirm itself (20 s on
+	// the network) before the watchdog resets it.
+	trialTimeout = 3 * time.Minute
 )
 
 // network sends UDP over IPv6 or IPv4 by destination.
@@ -179,6 +183,10 @@ func stateStore() *storage.Flash {
 var wifiOn bool
 
 func main() {
+	// An image on trial resets (and is rolled back) if it hangs before it
+	// confirms itself.
+	slots := &espota.Slots{Restart: restart, Log: func(msg string) { println(msg) }}
+	slots.Guard(trialTimeout)
 	initBoard()
 	// Long P-256 computations (PASE, CASE) must let the radio tasks run:
 	// over BLE, a stall beyond the supervision timeout drops the link.
@@ -191,6 +199,11 @@ func main() {
 	time.Sleep(2 * time.Second)
 	store := stateStore()
 	println("tiny-matter-go light: starting")
+	if testHang == "1" {
+		println("test build: hanging")
+		for {
+		}
+	}
 
 	// The Wi-Fi driver is initialised (not started) first, so BLE can
 	// coexist with it; its arena must hold both the BT controller and Wi-Fi.
@@ -218,7 +231,16 @@ func main() {
 	}
 	// Updates go to the other flash slot when the loader started us.
 	var updates device.ImageStore
-	slots := &espota.Slots{Restart: restart, Log: func(msg string) { println(msg) }}
+	// nodes finds other nodes (the OTA provider) once the network is up.
+	var nodes *mdns.NodeResolver
+	resolve := func(now time.Time, cfid [8]byte, node uint64) (netip.AddrPort, bool) {
+		if nodes == nil {
+			return netip.AddrPort{}, false
+		}
+		a, ok := nodes.Resolve(now, cfid, node)
+		// One interface: the stack reports peers without a zone.
+		return netip.AddrPortFrom(a.Addr().WithZone(""), a.Port()), ok
+	}
 	if base, seq, confirmed, ok := slots.Running(); ok {
 		println("running slot", base, "record", seq, "confirmed", confirmed, "version", version)
 		updates = slots
@@ -247,6 +269,7 @@ func main() {
 		Log:        func(msg string) { println(msg) },
 		WiFi:       true,
 		Updates:    updates,
+		Resolve:    resolve,
 	})
 	if err != nil {
 		fatal("device", err)
@@ -429,9 +452,16 @@ func main() {
 			println("drop from", src.String(), err.Error())
 		}
 	}
+	nodes = mdns.NewNodeResolver(func(dst netip.AddrPort, b []byte) error {
+		return net.sendUDP(mdns.Port, dst, b)
+	}, func(netip.AddrPort) string { return "wlan0" })
+	// The IPv6 stack has only its link-local address.
+	nodes.Usable = func(a netip.Addr) bool { return a.Is4() || a.IsLinkLocalUnicast() }
 	onMDNS := func(src netip.AddrPort, dst netip.Addr, b []byte) {
 		nMDNS++
-		resp.HandlePacket(time.Now(), src, b)
+		now := time.Now()
+		resp.HandlePacket(now, src, b)
+		nodes.HandlePacket(now, src, b)
 	}
 	stack.Listen(matterPort, onMatter)
 	stack.Listen(mdns.Port, onMDNS)
