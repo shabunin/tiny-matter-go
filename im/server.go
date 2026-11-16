@@ -60,6 +60,11 @@ func NewServer(m *exchange.Manager, n *Node) *Server {
 	return s
 }
 
+// Accept takes an exchange a client starts (exchange.Factory), for a node
+// that routes Interaction Model exchanges itself instead of letting
+// NewServer register the server.
+func (s *Server) Accept(ex *exchange.Exchange) exchange.Delegate { return s.factory(ex) }
+
 func (s *Server) factory(ex *exchange.Exchange) exchange.Delegate {
 	if !ex.Session().IsSecure() {
 		return nil // the Interaction Model needs a secure session

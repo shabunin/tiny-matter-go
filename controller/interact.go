@@ -477,8 +477,36 @@ func (c *Controller) pollSubs(now time.Time) time.Time {
 	return next
 }
 
-// imFactory accepts exchanges a device starts: subscription reports.
-func (c *Controller) imFactory(ex *exchange.Exchange) exchange.Delegate { return &reportHandler{c: c} }
+// imFactory accepts exchanges a device starts: subscription reports, and
+// requests to the controller's own clusters when it serves them.
+func (c *Controller) imFactory(ex *exchange.Exchange) exchange.Delegate { return &imRouter{c: c} }
+
+// imRouter passes an exchange to the report handler or, for a request
+// over a CASE session of the controller's fabric, to the server.
+type imRouter struct {
+	c *Controller
+	d exchange.Delegate
+}
+
+func (r *imRouter) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.Message) {
+	if r.d == nil {
+		s := ex.Session()
+		r.d = &reportHandler{c: r.c}
+		if r.c.server != nil && msg.ProtocolID == message.ProtocolInteractionModel && msg.Opcode != im.OpReportData &&
+			s.AuthMode == exchange.AuthCASE && s.FabricIndex == r.c.fab.Index {
+			if d := r.c.server.Accept(ex); d != nil {
+				r.d = d
+			}
+		}
+	}
+	r.d.OnMessage(now, ex, msg)
+}
+
+func (r *imRouter) OnError(now time.Time, ex *exchange.Exchange, err error) {
+	if r.d != nil {
+		r.d.OnError(now, ex, err)
+	}
+}
 
 type reportHandler struct{ c *Controller }
 

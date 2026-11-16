@@ -71,6 +71,12 @@ const (
 // of network, and reachable over BLE through ble if not nil.
 func startDeviceWith(t *testing.T, kind netKind, ble *blePeripheral) *testDevice {
 	t.Helper()
+	return startDeviceConfig(t, kind, ble, nil)
+}
+
+// startDeviceConfig starts a device after edit adjusts its configuration.
+func startDeviceConfig(t *testing.T, kind netKind, ble *blePeripheral, edit func(cfg *device.Config)) *testDevice {
+	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +84,7 @@ func startDeviceWith(t *testing.T, kind netKind, ble *blePeripheral) *testDevice
 	salt := []byte("SPAKE2P Key Salt")
 	v, _ := spake2p.NewVerifier(passcode, salt, 1000)
 	dacKey, _ := p256.NewPrivateKey(devcreds.DACPrivateKey)
-	dev, err := device.New(device.Config{
+	cfg := device.Config{
 		Transport: udpTransport{conn, ble}, Rand: rand.Reader,
 		Verifier: v, Salt: salt, Iterations: 1000, Discriminator: 3840,
 		Attestation: &clusters.Attestation{DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
@@ -86,7 +92,11 @@ func startDeviceWith(t *testing.T, kind netKind, ble *blePeripheral) *testDevice
 		Basic: &clusters.BasicInformation{VendorName: "T", VendorID: devcreds.VendorID,
 			ProductName: "Test Light", ProductID: devcreds.ProductID},
 		WiFi: kind == wifiNetwork, Thread: kind == threadNetwork,
-	})
+	}
+	if edit != nil {
+		edit(&cfg)
+	}
+	dev, err := device.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

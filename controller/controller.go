@@ -31,6 +31,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/fabric"
+	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/message"
 	"github.com/shabunin/tiny-matter-go/securechannel"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
@@ -78,6 +79,7 @@ type Controller struct {
 	rootKey *p256.PrivateKey
 	root    *credentials.Cert
 	fab     *fabric.Fabric
+	fabrics *fabric.Table // fab, for the CASE responder
 
 	conn    *net.UDPConn
 	m       *exchange.Manager
@@ -100,6 +102,7 @@ type Controller struct {
 
 	sessions map[uint64]*exchange.Session
 	subs     map[uint32]*subState
+	server   *im.Server // serves nodes' requests (the OTA provider), if set
 	links    map[netip.AddrPort]*bleLink
 	nextLink uint16
 }
@@ -143,8 +146,8 @@ func Open(opts Options) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	var t fabric.Table
-	if c.fab, err = t.Add(st.Root, nil, noc.Encode(), key, st.IPK, st.VendorID); err != nil {
+	c.fabrics = &fabric.Table{}
+	if c.fab, err = c.fabrics.Add(st.Root, nil, noc.Encode(), key, st.IPK, st.VendorID); err != nil {
 		return nil, fmt.Errorf("controller: stored fabric: %w", err)
 	}
 	if c.conn, err = net.ListenUDP("udp", &net.UDPAddr{Port: opts.Port}); err != nil {
@@ -162,6 +165,9 @@ func Open(opts Options) (*Controller, error) {
 	disp.Handle(securechannel.OpStatusReport, func(ex *exchange.Exchange) exchange.Delegate {
 		return closeHandler{c}
 	})
+	// Nodes may open CASE sessions to the controller, as OTA requestors
+	// do to their provider.
+	casesession.NewResponder(c.m, disp, casesession.ResponderConfig{Fabrics: c.fabrics, Rand: rand.Reader})
 	c.m.Register(message.ProtocolInteractionModel, c.imFactory)
 	if !opts.NoDiscovery {
 		if c.disc, err = newDiscovery(); err != nil {
