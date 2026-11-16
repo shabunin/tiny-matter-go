@@ -94,6 +94,7 @@ or Bluetooth LE, and works with them:
     tmctl events lamp '*' '*'
     tmctl subscribe lamp 2 Switch -events -urgent   # until Ctrl-C
     tmctl open-window lamp                  # codes for another controller
+    tmctl update-noc lamp -id 7             # new operational key and certificate (UpdateNOC), as node 7
     tmctl remove lamp                       # RemoveFabric, then forget it
     tmctl group-add 0x101 lights            # a group, with a key set of its own
     tmctl group-join lamp 1 lights          # key set, key map, ACL entry, AddGroup
@@ -104,6 +105,15 @@ in the Matter SDK's IDL, case aside (a unique prefix will do: `basic` is
 BasicInformation), or by number; `tmctl clusters [cluster]` lists them.
 Lists and structs are written as JSON. Subscriptions come back by
 themselves after the device restarts.
+
+`update-noc` rotates a node's operational credentials: under the
+fail-safe the node makes a new key (CSRRequest for UpdateNOC), `tmctl`
+issues its certificate, optionally for a new node ID, and commits the
+change over a CASE session to the new identity; until then a restart
+keeps the old credentials, and the fail-safe rolls them back. Within one
+run, `tmctl` resumes CASE sessions instead of repeating the full
+handshake (both sides keep resumption records in memory; chip-tool
+resumes sessions with the devices too).
 
 `commission` and `scan` look for the device with mDNS and over Bluetooth
 LE at once (unless its QR code says it is not on BLE). A device on the IP

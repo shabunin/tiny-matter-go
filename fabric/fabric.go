@@ -44,6 +44,29 @@ type Fabric struct {
 	// Pending is set while the fabric was added under the fail-safe and not
 	// yet committed by CommissioningComplete.
 	Pending bool
+
+	// prev holds the committed credentials while an UpdateNOC is pending.
+	prev *creds
+}
+
+// creds is the part of a fabric UpdateNOC replaces.
+type creds struct {
+	icac, noc []byte
+	key       *p256.PrivateKey
+	nodeID    uint64
+}
+
+// Updating reports whether the fabric has new credentials from UpdateNOC
+// that are not yet committed.
+func (f *Fabric) Updating() bool { return f.prev != nil }
+
+// CommittedCredentials returns the fabric's committed ICAC, NOC and key:
+// the current ones, or those an uncommitted UpdateNOC replaced.
+func (f *Fabric) CommittedCredentials() (icac, noc []byte, key *p256.PrivateKey) {
+	if f.prev != nil {
+		return f.prev.icac, f.prev.noc, f.prev.key
+	}
+	return f.ICAC, f.NOC, f.Key
 }
 
 // CompressedFabricID derives the compressed fabric identifier from the root
@@ -151,10 +174,47 @@ func (t *Table) nextIndex() uint8 {
 	}
 }
 
-// Commit makes pending fabrics permanent.
+// Update gives a committed fabric a new NOC, ICAC and operational key
+// (UpdateNOC), pending until Commit; RevertUpdate restores the old ones.
+// The chain must lead to the fabric's root with the same fabric ID.
+func (t *Table) Update(index uint8, icac, noc []byte, key *p256.PrivateKey) (*Fabric, error) {
+	f := t.Get(index)
+	if f == nil || f.Pending {
+		return nil, ErrNotFound
+	}
+	if f.prev != nil {
+		return nil, errors.New("fabric: update already pending")
+	}
+	id, err := credentials.ValidateNOCChain(noc, icac, f.RCAC)
+	if err != nil {
+		return nil, err
+	}
+	if id.FabricID != f.FabricID {
+		return nil, ErrConflict
+	}
+	f.prev = &creds{icac: f.ICAC, noc: f.NOC, key: f.Key, nodeID: f.NodeID}
+	f.ICAC, f.NOC, f.Key, f.NodeID = icac, noc, key, id.NodeID
+	return f, nil
+}
+
+// RevertUpdate restores the credentials an uncommitted Update replaced,
+// returning the fabric's index, or 0 if there was none.
+func (t *Table) RevertUpdate() uint8 {
+	for _, f := range t.fabrics {
+		if p := f.prev; p != nil {
+			f.ICAC, f.NOC, f.Key, f.NodeID = p.icac, p.noc, p.key, p.nodeID
+			f.prev = nil
+			return f.Index
+		}
+	}
+	return 0
+}
+
+// Commit makes pending fabrics and updates permanent.
 func (t *Table) Commit() {
 	for _, f := range t.fabrics {
 		f.Pending = false
+		f.prev = nil
 	}
 }
 

@@ -223,6 +223,25 @@ func New(cfg Config) (*Device, error) {
 	})
 
 	d.OpCreds.OnFabricLeave = func(now time.Time, index uint8) { cfg.Basic.Leave(d.Node, now, index) }
+	d.OpCreds.OnFabricUpdated = func(now time.Time, index uint8, current *exchange.Session) {
+		if current != nil {
+			d.log("fabric credentials updated (pending commissioning complete)")
+		} else {
+			d.log("fabric credentials update rolled back")
+		}
+		d.Resumptions.ForgetFabric(index)
+		// Sessions on the fabric belong to the old identity (or, on a
+		// rollback, to the new one); the one carrying UpdateNOC stays for
+		// its response.
+		d.later(func(now time.Time) {
+			for _, s := range d.M.Sessions() {
+				if s.IsSecure() && s.FabricIndex == index && s != current {
+					d.M.CloseSession(now, s)
+				}
+			}
+		})
+		d.advertise()
+	}
 
 	d.Admin = &clusters.AdminCommissioning{Open: d.adminOpen, Revoke: d.adminRevoke}
 	d.Diagnostics = &clusters.GeneralDiagnostics{}

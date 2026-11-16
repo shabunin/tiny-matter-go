@@ -716,6 +716,32 @@ func cmdForget(args []string) error {
 	})
 }
 
+func cmdUpdateNOC(args []string) error {
+	fs := flagSet("update-noc")
+	newID := fs.Uint64("id", 0, "the node's new node ID (default: keep it)")
+	pos, err := parseArgs(fs, args)
+	if err != nil || len(pos) != 1 {
+		return usageError{}
+	}
+	c, err := open(false)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	id, err := nodeArg(c, pos[0])
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	n, err := c.UpdateNOC(ctx, id, *newID)
+	if err != nil {
+		return describe(err)
+	}
+	fmt.Printf("node %d has a new operational certificate as node %d\n", id, n.ID)
+	return nil
+}
+
 func withNode(args []string, f func(ctx context.Context, c *controller.Controller, id uint64) error) error {
 	if len(args) != 1 {
 		return usageError{}

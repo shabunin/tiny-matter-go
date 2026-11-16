@@ -51,12 +51,18 @@ type OperationalCredentials struct {
 	// OnFabricLeave is called before RemoveFabric removes a fabric (not
 	// when a fail-safe rolls one back).
 	OnFabricLeave func(now time.Time, index uint8)
+	// OnFabricUpdated is called after UpdateNOC gives a fabric new
+	// credentials, with the session the command came on (which stays open
+	// for the response), and with a nil session when the fail-safe rolls
+	// the update back.
+	OnFabricUpdated func(now time.Time, index uint8, current *exchange.Session)
 
 	// State of the commissioning in progress, reset when the fail-safe
 	// ends.
-	pendingKey  *p256.PrivateKey
-	pendingRoot []byte
-	addedNOC    bool
+	pendingKey       *p256.PrivateKey
+	pendingForUpdate bool // the CSR was requested for UpdateNOC
+	pendingRoot      []byte
+	addedNOC         bool // AddNOC or UpdateNOC succeeded
 }
 
 // NewOperationalCredentials returns the cluster and hooks its rollback to
@@ -78,12 +84,17 @@ func (o *OperationalCredentials) revert(now time.Time) {
 			o.OnFabricRemoved(now, idx)
 		}
 	}
+	if idx := o.Fabrics.RevertUpdate(); idx != 0 {
+		if o.OnFabricUpdated != nil {
+			o.OnFabricUpdated(now, idx, nil)
+		}
+	}
 	o.Reset()
 }
 
 // Reset clears the commissioning state (after commit or rollback).
 func (o *OperationalCredentials) Reset() {
-	o.pendingKey, o.pendingRoot, o.addedNOC = nil, nil, false
+	o.pendingKey, o.pendingForUpdate, o.pendingRoot, o.addedNOC = nil, false, nil, false
 }
 
 func (*OperationalCredentials) ID() uint32       { return IDOperationalCredentials }
@@ -104,6 +115,7 @@ const (
 	ocCSRRequest               = 0x04
 	ocCSRResponse              = 0x05
 	ocAddNOC                   = 0x06
+	ocUpdateNOC                = 0x07
 	ocNOCResponse              = 0x08
 	ocUpdateFabricLabel        = 0x09
 	ocRemoveFabric             = 0x0A
@@ -112,7 +124,7 @@ const (
 
 var (
 	ocAttrs     = []uint32{0, 1, 2, 3, 4, 5}
-	ocAccepted  = []uint32{ocAttestationRequest, ocCertificateChainRequest, ocCSRRequest, ocAddNOC, ocUpdateFabricLabel, ocRemoveFabric, ocAddTrustedRootCert}
+	ocAccepted  = []uint32{ocAttestationRequest, ocCertificateChainRequest, ocCSRRequest, ocAddNOC, ocUpdateNOC, ocUpdateFabricLabel, ocRemoveFabric, ocAddTrustedRootCert}
 	ocGenerated = []uint32{ocAttestationResponse, ocCertificateChainResponse, ocCSRResponse, ocNOCResponse}
 )
 
@@ -236,6 +248,9 @@ func (f *fields) has(tags ...uint8) bool {
 	return true
 }
 
+// maxCertLength is the largest Matter certificate a command may carry.
+const maxCertLength = 400
+
 func nocResponse(resp *im.Response, code uint8, index uint8) im.Status {
 	w := resp.Fields(ocNOCResponse)
 	w.PutUint(tlv.ContextTag(0), uint64(code))
@@ -284,11 +299,12 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if len(nonce) != 32 {
 			return im.InvalidCommand
 		}
+		forUpdate := f.uints[1] != 0 // IsForUpdateNOC
+		if forUpdate && o.Fabrics.Get(accessingFabric(ctx)) == nil {
+			return im.InvalidCommand // UpdateNOC needs a CASE session on the fabric
+		}
 		if !o.armed(ctx) {
 			return im.FailsafeRequired
-		}
-		if f.uints[1] != 0 { // IsForUpdateNOC: UpdateNOC is not supported yet
-			return im.InvalidCommand
 		}
 		if o.addedNOC {
 			return im.ConstraintError
@@ -306,7 +322,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if err != nil {
 			return im.Failure
 		}
-		o.pendingKey = key
+		o.pendingKey, o.pendingForUpdate = key, forUpdate
 		w := resp.Fields(ocCSRResponse)
 		w.PutBytes(tlv.ContextTag(0), elems)
 		w.PutBytes(tlv.ContextTag(1), sig)
@@ -341,6 +357,9 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		}
 		if o.pendingKey == nil {
 			return nocResponse(resp, NOCMissingCsr, 0)
+		}
+		if o.pendingForUpdate {
+			return im.ConstraintError
 		}
 		if o.pendingRoot == nil || len(f.bytes[2]) != 16 {
 			return nocResponse(resp, NOCInvalidNOC, 0)
@@ -387,6 +406,53 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 			o.OnFabricAdded(ctx.Now, fb)
 		}
 		return nocResponse(resp, NOCOK, fb.Index)
+
+	case ocUpdateNOC:
+		if !f.has(0) || len(f.bytes[0]) > maxCertLength || len(f.bytes[1]) > maxCertLength {
+			return im.InvalidCommand
+		}
+		if !o.armed(ctx) {
+			return im.FailsafeRequired
+		}
+		if o.addedNOC {
+			return im.ConstraintError
+		}
+		if o.pendingKey == nil {
+			return nocResponse(resp, NOCMissingCsr, 0)
+		}
+		if !o.pendingForUpdate {
+			return im.ConstraintError
+		}
+		idx := accessingFabric(ctx)
+		fb := o.Fabrics.Get(idx)
+		if fb == nil || fb.Pending { // over PASE
+			return nocResponse(resp, NOCInvalidNOC, 0)
+		}
+		noc := append([]byte{}, f.bytes[0]...)
+		var icac []byte
+		if len(f.bytes[1]) > 0 {
+			icac = append([]byte{}, f.bytes[1]...)
+		}
+		id, err := credentials.ValidateNOCChain(noc, icac, fb.RCAC)
+		if err != nil {
+			return nocResponse(resp, NOCInvalidNOC, 0)
+		}
+		if id.FabricID != fb.FabricID {
+			return nocResponse(resp, NOCInvalidFabricIndex, 0)
+		}
+		if string(id.PublicKey) != string(o.pendingKey.PublicKey().Bytes()) {
+			return nocResponse(resp, NOCInvalidPublicKey, 0)
+		}
+		if _, err := o.Fabrics.Update(idx, icac, noc, o.pendingKey); err != nil {
+			return nocResponse(resp, NOCInvalidNOC, 0)
+		}
+		o.addedNOC = true
+		ctx.Node.Changed(ctx.Endpoint, IDOperationalCredentials, ocNOCs)
+		ctx.Node.Changed(ctx.Endpoint, IDOperationalCredentials, ocFabrics)
+		if o.OnFabricUpdated != nil {
+			o.OnFabricUpdated(ctx.Now, idx, ctx.Session)
+		}
+		return nocResponse(resp, NOCOK, idx)
 
 	case ocUpdateFabricLabel:
 		label := string(f.bytes[0])

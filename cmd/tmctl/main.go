@@ -67,6 +67,7 @@ func init() {
 		{"close-window", "<node>", "close an open commissioning window", cmdCloseWindow},
 		{"remove", "<node>", "remove the controller's fabric from a node, and forget it", cmdRemove},
 		{"forget", "<node>", "forget a node without telling it", cmdForget},
+		{"update-noc", "<node> [-id n]", "give a node a new operational key and certificate, optionally as another node ID", cmdUpdateNOC},
 		{"groups", "", "list the fabric's groups", cmdGroups},
 		{"group-add", "<group> [name]", "create a group (ID 1 to 0xFEFF) with a key set of its own, or rename it", cmdGroupAdd},
 		{"group-delete", "<group>", "forget a group and its key set", cmdGroupDelete},

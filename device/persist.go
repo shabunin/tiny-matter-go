@@ -45,11 +45,12 @@ func (d *Device) encodeState() []byte {
 		w.PutUint(tlv.ContextTag(2), uint64(f.VendorID))
 		w.PutString(tlv.ContextTag(3), f.Label)
 		w.PutBytes(tlv.ContextTag(4), f.RCAC)
-		if f.ICAC != nil {
-			w.PutBytes(tlv.ContextTag(5), f.ICAC)
+		icac, noc, key := f.CommittedCredentials()
+		if icac != nil {
+			w.PutBytes(tlv.ContextTag(5), icac)
 		}
-		w.PutBytes(tlv.ContextTag(6), f.NOC)
-		w.PutBytes(tlv.ContextTag(7), f.Key.Bytes())
+		w.PutBytes(tlv.ContextTag(6), noc)
+		w.PutBytes(tlv.ContextTag(7), key.Bytes())
 		w.PutBytes(tlv.ContextTag(8), f.IPK[:])
 		w.EndContainer()
 	}

@@ -41,6 +41,9 @@ type harness struct {
 	emptyICAC bool
 	// afterArm, if set, runs on the PASE session after ArmFailSafe.
 	afterArm func(s *exchange.Session)
+	// The fabric's root, set by commission.
+	root    *credentials.Cert
+	rootKey *p256.PrivateKey
 }
 
 func newHarness(t *testing.T) *harness { return newHarnessStore(t, nil) }
@@ -197,6 +200,7 @@ func (h *harness) commissionWith(code uint32, wantFabrics int) (*fabric.Fabric, 
 	// Controller fabric: root, the device's NOC, and the controller's own.
 	rootKey, _ := p256.GenerateKey(rand.Reader)
 	root, _ := credentials.IssueRoot(rootKey, 1)
+	h.root, h.rootKey = root, rootKey
 	devNOC, _ := credentials.IssueNOC(root, rootKey, nodePub, 0xFAB, 0x1)
 	ctlKey, _ := p256.GenerateKey(rand.Reader)
 	ctlNOC, _ := credentials.IssueNOC(root, rootKey, ctlKey.PublicKey().Bytes(), 0xFAB, 0x1B669)
