@@ -17,6 +17,13 @@ var (
 	DeviceTypeExtendedColorLight    = im.DeviceType{ID: 0x010D, Revision: 4}
 )
 
+// Switches that send commands to the lights they are bound to: On/Off and
+// Level Control, and Color Control too.
+var (
+	DeviceTypeDimmerSwitch      = im.DeviceType{ID: 0x0104, Revision: 3}
+	DeviceTypeColorDimmerSwitch = im.DeviceType{ID: 0x0105, Revision: 3}
+)
+
 // numFields are the decoded top-level fields (context tags 0-7) of a
 // command: integers, signed or not, and which were present or null.
 type numFields struct {

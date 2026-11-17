@@ -10,6 +10,10 @@ import (
 // IDColorControl is the Color Control cluster ID.
 const IDColorControl = 0x0300
 
+// CmdMoveToHueAndSaturation is the Color Control command, for clients
+// (device.SendBound).
+const CmdMoveToHueAndSaturation = 0x06
+
 // Color Control features.
 const (
 	ColorHueSaturation    = 0x01
@@ -187,6 +191,14 @@ func (c *ColorControl) has(f uint32) bool { return c.features&f != 0 }
 // Mode returns EnhancedColorMode: 0 hue and saturation, 1 xy, 2 colour
 // temperature, 3 enhanced hue and saturation.
 func (c *ColorControl) Mode() uint8 { return c.mode }
+
+// MoveToHueSaturation moves the light to hue (0 to 254) and saturation
+// over dur, the shortest way round, as MoveToHueAndSaturation does.
+func (c *ColorControl) MoveToHueSaturation(n *im.Node, ep uint16, now time.Time, hue, sat uint8, dur time.Duration) {
+	c.startCommand(n, ep, colorModeHS)
+	c.moveAxis(n, ep, now, axHue, hueDelta(c.axisValue(axHue), int64(min(hue, colorMaxHue)), 255, dirShortest), dur, 255, 0, 0)
+	c.moveAxis(n, ep, now, axSat, int64(min(sat, colorMaxSat))-int64(c.sat), dur, 0, 0, colorMaxSat)
+}
 
 // HueSaturation returns the 8-bit hue and the saturation.
 func (c *ColorControl) HueSaturation() (hue, sat uint8) { return c.hue, c.sat }

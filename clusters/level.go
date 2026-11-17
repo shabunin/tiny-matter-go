@@ -10,6 +10,12 @@ import (
 // IDLevelControl is the Level Control cluster ID.
 const IDLevelControl = 0x0008
 
+// Level Control commands, for clients (device.SendBound).
+const (
+	CmdMoveToLevel          = 0x00
+	CmdMoveToLevelWithOnOff = 0x04
+)
+
 // LevelControl is the Level Control cluster (spec 1.6) with the OnOff
 // feature and, for lights, the Lighting feature: a level that moves over
 // time, coupled to the endpoint's On/Off cluster.
@@ -334,6 +340,13 @@ func absDiff(a, b uint8) uint8 {
 }
 
 func (l *LevelControl) clamp(v uint8) uint8 { return min(max(v, l.min), l.max) }
+
+// MoveToLevel moves to level (clamped to the cluster's range) over dur,
+// as a MoveToLevelWithOnOff command does: for local controls such as a
+// knob. Moving up turns the light on; ending at the minimum turns it off.
+func (l *LevelControl) MoveToLevel(n *im.Node, ep uint16, now time.Time, level uint8, dur time.Duration) {
+	l.moveTo(n, ep, now, l.clamp(level), dur, true)
+}
 
 // moveTo starts a transition to level over dur, cancelling any other. A
 // WithOnOff move upwards turns the light on first, and one that ends at
