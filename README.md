@@ -28,7 +28,7 @@ Flashed without Wi-Fi credentials, the device advertises over BLE and
 waits to be given a network:
 
     cd firmware
-    tinygo flash -target esp32s3-generic -port /dev/ttyACM0 ./esp32s3-light
+    tinygo flash -target esp32s3-generic -stack-size=12KB -port /dev/ttyACM0 ./esp32s3-light
     chip-tool pairing ble-wifi 1 YOUR_SSID YOUR_PASSWORD 20202021 3840
     # or, with this project's controller (see below):
     tmctl scan 34970112332                  # the networks it sees
@@ -36,7 +36,7 @@ waits to be given a network:
 
 Or compile the credentials in and commission over the IP network:
 
-    tinygo flash -target esp32s3-generic -port /dev/ttyACM0 \
+    tinygo flash -target esp32s3-generic -stack-size=12KB -port /dev/ttyACM0 \
         -ldflags "-X main.ssid=YOUR_SSID -X main.password=YOUR_PASSWORD" ./esp32s3-light
 
 Then commission it with manual code `34970112332` (passcode 20202021,
@@ -194,15 +194,15 @@ Setting the board up once over USB:
     cd firmware
     tinygo build -target ./esp32s3-loader/target.json -o loader.elf ./esp32s3-loader
     esptool --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 8MB -o loader.bin loader.elf
-    tinygo build -target esp32s3-generic -o app.elf ./esp32s3-light   # same flags for both
-    tinygo build -target esp32s3-generic -o app.bin ./esp32s3-light
+    tinygo build -target esp32s3-generic -stack-size=12KB -o app.elf ./esp32s3-light   # same flags for both
+    tinygo build -target esp32s3-generic -stack-size=12KB -o app.bin ./esp32s3-light
     go run ./espslot record -elf app.elf -bin app.bin -slot 0x10000 -seq 1 -o rec.bin
     esptool --port /dev/ttyACM0 write-flash 0 loader.bin 0xE000 rec.bin 0x10000 app.bin
 
 and each update after that:
 
-    tinygo build -target esp32s3-generic -ldflags "-X main.softwareVersion=2 ..." -o app.elf ./esp32s3-light
-    tinygo build -target esp32s3-generic -ldflags "-X main.softwareVersion=2 ..." -o app.bin ./esp32s3-light
+    tinygo build -target esp32s3-generic -stack-size=12KB -ldflags "-X main.softwareVersion=2 ..." -o app.elf ./esp32s3-light
+    tinygo build -target esp32s3-generic -stack-size=12KB -ldflags "-X main.softwareVersion=2 ..." -o app.bin ./esp32s3-light
     go run ./espslot payload -elf app.elf -bin app.bin -o app.payload
     tmctl ota-image app.payload app-2.ota -vendor 0xFFF1 -product 0x8000 -version 2
     tmctl ota-update lamp app-2.ota

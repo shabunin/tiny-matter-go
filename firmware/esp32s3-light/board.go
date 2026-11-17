@@ -14,6 +14,8 @@ const (
 	ledPin    = machine.GPIO21 // WS2812 RGB LED data
 	ledPower  = machine.GPIO38 // v1.1: RGB LED power switch (v1.0: display backlight)
 	buttonPin = machine.GPIO0  // G0 button (active low)
+	groveSDA  = machine.GPIO2  // Grove port (Port A) I2C data
+	groveSCL  = machine.GPIO1  // Grove port I2C clock
 )
 
 func ccount() uint32 { return uint32(device.AsmFull("rsr {}, CCOUNT", nil)) }

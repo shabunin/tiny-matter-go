@@ -23,6 +23,10 @@
 // factory reset. It blinks while a controller identifies an
 // endpoint: white for the light, green for the button.
 //
+// On the Grove port, an M5Stack ENV unit (II or III) adds temperature,
+// humidity and pressure sensors (endpoints 3 to 5); anything else is taken
+// for a PIR unit, an occupancy sensor (endpoint 6).
+//
 // Endpoint 1 is the light; endpoint 2 is a Generic Switch, the G0 button,
 // whose presses are Switch events (InitialPress, LongPress after 1 s,
 // ShortRelease or LongRelease). A test build can enable the General
@@ -45,33 +49,29 @@
 // which stalls the firmware. Keep a serial reader attached while it is
 // plugged into a computer.
 //
-//	tinygo flash -target esp32s3-generic ./esp32s3-light
+// Goroutine stacks must be 12 KB: commissioning (certificate checks)
+// takes main's to about 7.5 KB, past the 8 KB default's usable part.
+//
+//	tinygo flash -target esp32s3-generic -stack-size=12KB ./esp32s3-light
 package main
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"machine"
-	"net/netip"
 	"runtime"
-	"slices"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"firmware/espota"
 	"firmware/matterble"
+	"firmware/pir"
+	"firmware/wifinode"
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/credentials/devcreds"
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
 	"github.com/shabunin/tiny-matter-go/device"
-	"github.com/shabunin/tiny-matter-go/dnssd"
-	"github.com/shabunin/tiny-matter-go/exchange"
-	"github.com/shabunin/tiny-matter-go/im"
-	"github.com/shabunin/tiny-matter-go/ip4"
-	"github.com/shabunin/tiny-matter-go/ip6"
-	"github.com/shabunin/tiny-matter-go/mdns"
 	"github.com/shabunin/tiny-matter-go/storage"
 	"tinygo.org/x/espradio"
 )
@@ -87,7 +87,6 @@ var (
 )
 
 const (
-	matterPort    = 5540
 	passcode      = 20202021
 	discriminator = 3840
 	iterations    = 1000
@@ -97,69 +96,6 @@ const (
 	// the network) before the watchdog resets it.
 	trialTimeout = 3 * time.Minute
 )
-
-// network sends UDP over IPv6 or IPv4 by destination.
-type network struct {
-	s6 *ip6.Stack
-	s4 *ip4.Stack
-}
-
-func (n network) sendUDP(port uint16, to netip.AddrPort, b []byte) error {
-	var err error
-	if to.Addr().Unmap().Is4() {
-		err = n.s4.SendUDP(port, netip.AddrPortFrom(to.Addr().Unmap(), to.Port()), b)
-	} else {
-		err = n.s6.SendUDP(port, to, b)
-	}
-	if err == ip6.ErrNoNeighbor || err == ip4.ErrNoNeighbor {
-		return nil // sent once the neighbor answers
-	}
-	return err
-}
-
-// transport carries Matter messages over BTP to the BLE peer and over UDP
-// to everyone else. BTP is reliable, so MRP is not used over it.
-type transport struct {
-	ip  *network
-	ble *matterble.Server
-}
-
-func (t *transport) Send(to exchange.Addr, pkt []byte) error {
-	if to == matterble.Peer {
-		if t.ble == nil {
-			return nil
-		}
-		return t.ble.Send(pkt)
-	}
-	if t.ip == nil {
-		return nil
-	}
-	return t.ip.sendUDP(matterPort, to, pkt)
-}
-
-func (t *transport) Reliable(to exchange.Addr) bool { return to == matterble.Peer }
-
-// advertiser holds the DNS-SD services until the mDNS responder exists.
-type advertiser struct {
-	r    *mdns.Responder
-	svcs []dnssd.Service
-}
-
-func (a *advertiser) Advertise(svcs []dnssd.Service) {
-	a.svcs = append(a.svcs[:0], svcs...)
-	if a.r != nil {
-		a.r.Advertise(a.svcs)
-	}
-}
-
-func hexMAC(mac [6]byte) string {
-	const digits = "0123456789ABCDEF"
-	b := make([]byte, 0, 12)
-	for _, x := range mac {
-		b = append(b, digits[x>>4], digits[x&15])
-	}
-	return string(b)
-}
 
 func fatal(msg string, err error) {
 	for {
@@ -179,8 +115,6 @@ func stateStore() *storage.Flash {
 	}
 	return &storage.Flash{Dev: machine.Flash, Offset: off, SlotSize: slot}
 }
-
-var wifiOn bool
 
 func main() {
 	// An image on trial resets (and is rolled back) if it hangs before it
@@ -205,17 +139,14 @@ func main() {
 		}
 	}
 
-	// The Wi-Fi driver is initialised (not started) first, so BLE can
-	// coexist with it; its arena must hold both the BT controller and Wi-Fi.
-	radioCfg := espradio.Config{Logging: espradio.LogLevelError, ArenaPoolSize: 96 << 10}
-	if err := espradio.Enable(radioCfg); err != nil {
-		fatal("radio", err)
-	}
+	radioCfg := espradio.Config{Logging: espradio.LogLevelError}
 	mac := factoryMAC()
-	println("mac", hexMAC(mac))
+	println("mac", wifinode.HexMAC(mac))
 
-	tr := &transport{}
-	adv := &advertiser{}
+	node := wifinode.New(mac, radioCfg)
+	node.Log = func(msg string) { println(msg) }
+	tr := node.Transport
+	tr.Peer, tr.HasPeer = matterble.Peer, true
 	salt := []byte("SPAKE2P Key Salt")
 	v, err := spake2p.NewVerifier(passcode, salt, iterations)
 	if err != nil {
@@ -231,16 +162,6 @@ func main() {
 	}
 	// Updates go to the other flash slot when the loader started us.
 	var updates device.ImageStore
-	// nodes finds other nodes (the OTA provider) once the network is up.
-	var nodes *mdns.NodeResolver
-	resolve := func(now time.Time, cfid [8]byte, node uint64) (netip.AddrPort, bool) {
-		if nodes == nil {
-			return netip.AddrPort{}, false
-		}
-		a, ok := nodes.Resolve(now, cfid, node)
-		// One interface: the stack reports peers without a zone.
-		return netip.AddrPortFrom(a.Addr().WithZone(""), a.Port()), ok
-	}
 	if base, seq, confirmed, ok := slots.Running(); ok {
 		println("running slot", base, "record", seq, "confirmed", confirmed, "version", version)
 		updates = slots
@@ -249,7 +170,7 @@ func main() {
 		slots = nil
 	}
 	d, err := device.New(device.Config{
-		Transport: tr, Rand: rand.Reader, Port: matterPort,
+		Transport: tr, Rand: rand.Reader, Port: wifinode.MatterPort,
 		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: discriminator,
 		Attestation: &clusters.Attestation{
 			DACKey: dacKey, DACCert: devcreds.DACCert, PAICert: devcreds.PAICert,
@@ -260,19 +181,31 @@ func main() {
 			ProductName: "Cardputer Light", ProductID: devcreds.ProductID,
 			HardwareVersion: 1, HardwareVersionString: "ESP32-S3",
 			SoftwareVersion: uint32(version), SoftwareVersionString: "0.2." + softwareVersion,
-			SerialNumber: hexMAC(mac), UniqueID: "tmg-" + hexMAC(mac),
+			SerialNumber: wifinode.HexMAC(mac), UniqueID: "tmg-" + wifinode.HexMAC(mac),
 		},
 		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
-		Advertiser: adv,
+		Advertiser: node.Advertiser,
 		Store:      store,
 		Clock:      time.Now,
 		Log:        func(msg string) { println(msg) },
 		WiFi:       true,
 		Updates:    updates,
-		Resolve:    resolve,
+		Resolve:    node.Resolve,
 	})
 	if err != nil {
 		fatal("device", err)
+	}
+	// The Wi-Fi driver is initialised (not started) before BLE, so the two
+	// can coexist. Its arena (taken from the heap) must hold the BT
+	// controller too when the device may be commissioned over BLE: it has
+	// no network to join. Otherwise the default, Wi-Fi only, leaves the
+	// heap 48 KB more.
+	if len(d.Net.Networks) == 0 && ssid == "" {
+		radioCfg.ArenaPoolSize = 96 << 10
+	}
+	node.Radio = radioCfg
+	if err := espradio.Enable(radioCfg); err != nil {
+		fatal("radio", err)
 	}
 	if slots != nil {
 		// Restarting into an update saves the light's state first (it
@@ -280,6 +213,13 @@ func main() {
 		slots.Restart = func() { d.Flush(); restart() }
 	}
 	u := newUI(d, store)
+	sensors := newEnv(d)
+	var motion *pir.Sensor
+	if sensors == nil {
+		// Not an ENV unit: a PIR, its output on the port's G1 line.
+		motion = pir.Add(d, groveSCL, machine.PinInputPulldown, occupancyEndpoint)
+		println("grove: PIR occupancy sensor on endpoint", occupancyEndpoint)
+	}
 	cause := resetCause()
 	d.Diagnostics.BootReason = bootReason(cause)
 	println("reset cause", cause, "boot reason", d.Diagnostics.BootReason, "reboot count", d.Diagnostics.RebootCount)
@@ -293,33 +233,9 @@ func main() {
 			println("test event triggers enabled")
 		}
 	}
-	// The Wi-Fi station interface, for General Diagnostics.
-	var (
-		stack  *ip6.Stack
-		ipv4   netip.Addr
-		linkUp atomic.Bool
-	)
-	d.Diagnostics.Interfaces = func() []clusters.NetworkInterface {
-		ni := clusters.NetworkInterface{Name: "wlan0", Operational: linkUp.Load(),
-			HardwareAddress: mac[:], Type: clusters.InterfaceWiFi}
-		if stack != nil {
-			ni.IPv6 = []netip.Addr{stack.Addr()}
-		}
-		if ipv4.IsValid() {
-			ni.IPv4 = []netip.Addr{ipv4}
-		}
-		return []clusters.NetworkInterface{ni}
-	}
-	d.Net.Scan = func(ctx *im.Context, want []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
-		aps := bootScan // during BLE commissioning, BLE has the radio
-		if wifiOn {
-			var err error
-			if aps, err = espradio.Scan(); err != nil {
-				return nil, clusters.NetworkUnknownError
-			}
-		}
-		return scanResults(aps, want), clusters.NetworkOK
-	}
+	// During BLE commissioning, BLE has the radio: scans report what a
+	// scan saw as it started.
+	node.Attach(d, func() []espradio.AccessPoint { return bootScan })
 	if !d.Commissioned() {
 		d.OpenCommissioningWindow()
 		println("commissionable: passcode", passcode, "discriminator", discriminator)
@@ -350,179 +266,26 @@ func main() {
 	}
 
 	println("connecting to Wi-Fi", string(nw.SSID))
-	if err := espradio.Start(); err != nil {
-		fatal("wifi start", err)
-	}
-	wifiOn = true
-	if m, err := espradio.StationMAC(); err == nil && m != mac {
-		println("station MAC differs from eFuse:", hexMAC(m))
-		mac = m
-	}
-	params := espradio.STAConfig{SSID: string(nw.SSID), Password: string(nw.Credentials)}
-	link := espradio.Link{Config: radioCfg}
-	var reconnected, linkChanged atomic.Bool
-	link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
-		println("wifi link connected:", connected)
-		linkUp.Store(connected)
-		linkChanged.Store(true)
-		if !connected {
-			return 3, params
-		}
-		reconnected.Store(true)
-		return 0, espradio.STAConfig{}
-	})
 	joinStart := time.Now()
-	for {
-		u.poll(time.Now())
-		err := link.LinkConnect(params)
-		if err == nil {
-			break
-		}
-		println("wifi connect:", err.Error())
-		if viaBLE && time.Since(joinStart) > joinTimeout {
-			println("cannot join the provisioned network: restarting")
-			restart()
-		}
-		for i := 0; i < 60; i++ {
-			u.poll(time.Now())
-			time.Sleep(50 * time.Millisecond)
-		}
+	giveUp := func() bool { return viaBLE && time.Since(joinStart) > joinTimeout }
+	if !node.Join(nw, u.poll, giveUp) {
+		println("cannot join the network: restarting")
+		restart()
 	}
-	linkUp.Store(true)
-	linkChanged.Store(false)
-	reconnected.Store(false)
-	d.Net.SetConnected(d.Node, nw.SSID)
-	d.Net.SetLastConnect(d.Node, nw.SSID, clusters.NetworkOK, 0, false)
-	nd := link.NetDev()
-	sendFrame := func(f []byte) error {
-		nTX++
-		err := nd.SendOffsetEthFrame(f)
-		if err != nil {
-			nTXErr++
-			if nTXErr < 10 {
-				println("tx error:", err.Error(), "len", len(f))
-			}
-		}
-		return err
-	}
-	stack = ip6.New(mac, sendFrame)
-	stack4 := ip4.New(mac, sendFrame)
-	net := &network{stack, stack4}
-	println("wifi up, mac", hexMAC(mac), "address", stack.Addr().String())
-
-	resp := mdns.New(hexMAC(mac), []netip.Addr{stack.Addr()}, func(dst netip.AddrPort, b []byte) error {
-		return net.sendUDP(mdns.Port, dst, b)
-	})
-	if err := stack.Join(mdns.Group); err != nil {
-		fatal("join mdns", err)
-	}
-	stack4.Join(mdns.Group4)
-	// Listen on the multicast addresses of the groups the light is in.
-	var groupAddrs []netip.Addr
-	setGroups := func(addrs []netip.Addr) {
-		for _, a := range groupAddrs {
-			if !slices.Contains(addrs, a) {
-				stack.Leave(a)
-			}
-		}
-		for _, a := range addrs {
-			if !slices.Contains(groupAddrs, a) {
-				if err := stack.Join(a); err != nil {
-					println("join group address", a.String(), err.Error())
-				}
-			}
-		}
-		groupAddrs = append(groupAddrs[:0], addrs...)
-	}
-	setGroups(d.MulticastAddrs())
-	d.OnMulticast = setGroups
-	stack4.StartDHCP(hexMAC(mac), func(p netip.Prefix, gw netip.Addr) {
-		addrs := []netip.Addr{stack.Addr()}
-		ipv4 = netip.Addr{}
-		if p.IsValid() {
-			println("ipv4 address", p.String(), "gateway", gw.String())
-			addrs = append(addrs, p.Addr())
-			ipv4 = p.Addr()
-		} else {
-			println("ipv4 address lost")
-		}
-		resp.SetAddrs(addrs)
-	})
-	tr.ip = net
-	adv.r = resp
-	resp.Advertise(adv.svcs)
-
-	onMatter := func(src netip.AddrPort, dst netip.Addr, b []byte) {
-		if err := d.HandlePacket(time.Now(), src, b); err != nil {
-			println("drop from", src.String(), err.Error())
-		}
-	}
-	nodes = mdns.NewNodeResolver(func(dst netip.AddrPort, b []byte) error {
-		return net.sendUDP(mdns.Port, dst, b)
-	}, func(netip.AddrPort) string { return "wlan0" })
-	// The IPv6 stack has only its link-local address.
-	nodes.Usable = func(a netip.Addr) bool { return a.Is4() || a.IsLinkLocalUnicast() }
-	onMDNS := func(src netip.AddrPort, dst netip.Addr, b []byte) {
-		nMDNS++
-		now := time.Now()
-		resp.HandlePacket(now, src, b)
-		nodes.HandlePacket(now, src, b)
-	}
-	stack.Listen(matterPort, onMatter)
-	stack.Listen(mdns.Port, onMDNS)
-	stack4.Listen(matterPort, onMatter)
-	stack4.Listen(mdns.Port, onMDNS)
-	if d.Commissioned() {
-		println("commissioned; reachable over CASE")
-	}
-
-	var frame [espradio.MaxFrameSize]byte
-	lastReport := time.Now()
 	// A new image is confirmed once it has run on the network for a while;
 	// reset before that, the loader rolls it back.
 	confirmAt := time.Now().Add(20 * time.Second)
-	for {
-		for i := 0; i < 8; i++ {
-			off, n, err := nd.EthPoll(frame[:])
-			if err != nil || n == 0 {
-				break
-			}
-			f := frame[off : off+n]
-			countFrame(f)
-			stack.HandleFrame(f)
-			stack4.HandleFrame(f)
-		}
-		now := time.Now()
-		if linkChanged.Swap(false) {
-			if linkUp.Load() {
-				d.Net.SetConnected(d.Node, nw.SSID)
-			} else {
-				d.Net.SetConnected(d.Node, nil)
-			}
-		}
-		if reconnected.Swap(false) {
-			stack.ReportGroups()
-			stack4.ReportGroups()
-			stack4.RenewDHCP()
-			resp.Reannounce()
-		}
-		d.Poll(now)
-		resp.Poll(now)
-		stack4.Poll(now)
+	node.Run(func(now time.Time) {
 		u.poll(now)
-		if slots != nil && !confirmAt.IsZero() && now.After(confirmAt) && linkUp.Load() {
+		sensors.Poll(now)
+		motion.Poll(now)
+		if slots != nil && !confirmAt.IsZero() && now.After(confirmAt) && node.LinkUp() {
 			confirmAt = time.Time{}
 			if err := slots.Confirm(); err != nil {
 				println("confirming the image:", err.Error())
 			}
 		}
-		if now.Sub(lastReport) > 30*time.Second {
-			lastReport = now
-			rx, drops := espradio.NetifRxStats()
-			println("alive: rx frames", rx, "ring drops", drops, "ipv6", nIP6, "v6 multicast", nMcast6, "ipv4", nIP4, "tx", nTX, "txerr", nTXErr, "mdns rx", nMDNS)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	})
 }
 
 // bootScan is what a Wi-Fi scan saw as BLE commissioning started.
@@ -546,40 +309,10 @@ func scanOnce() []espradio.AccessPoint {
 	return aps
 }
 
-// scanResults lists the networks of aps (only want, if set), strongest
-// first, each once, at most 8. The radio reports only names and signal
-// strengths: WPA2 on 2.4 GHz is assumed.
-func scanResults(aps []espradio.AccessPoint, want []byte) []clusters.WiFiScanResult {
-	sorted := append([]espradio.AccessPoint(nil), aps...)
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j].RSSI > sorted[j-1].RSSI; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
-	var res []clusters.WiFiScanResult
-next:
-	for _, ap := range sorted {
-		if ap.SSID == "" || want != nil && ap.SSID != string(want) {
-			continue
-		}
-		for _, r := range res {
-			if string(r.SSID) == ap.SSID {
-				continue next
-			}
-		}
-		res = append(res, clusters.WiFiScanResult{Security: clusters.WiFiWPA2, SSID: []byte(ap.SSID),
-			Band: clusters.WiFiBand2G4, RSSI: int8(max(min(ap.RSSI, 0), -128))})
-		if len(res) == 8 {
-			break
-		}
-	}
-	return res
-}
-
 // commissionOverBLE advertises the Matter BLE service and serves the
 // commissioner over BTP until it provisions a network with ConnectNetwork,
 // then closes the BLE link and returns the network to join.
-func commissionOverBLE(d *device.Device, tr *transport, u *ui) clusters.WiFiNetwork {
+func commissionOverBLE(d *device.Device, tr *wifinode.Transport, u *ui) clusters.WiFiNetwork {
 	if err := espradio.BLEInit(); err != nil {
 		fatal("ble init", err)
 	}
@@ -591,7 +324,7 @@ func commissionOverBLE(d *device.Device, tr *transport, u *ui) clusters.WiFiNetw
 	if err != nil {
 		fatal("ble", err)
 	}
-	tr.ble = b
+	tr.Link = b
 	var join *clusters.WiFiNetwork
 	d.Net.Connect = func(now time.Time, n clusters.WiFiNetwork) {
 		println("ConnectNetwork: closing BLE, joining", string(n.SSID))
@@ -619,24 +352,7 @@ func commissionOverBLE(d *device.Device, tr *transport, u *ui) clusters.WiFiNetw
 	b.Advertise(false)
 	u.ble = false
 	d.HoldSaves = false
-	tr.ble = nil
+	tr.Link = nil
 	d.Net.Connect = nil
 	return *join
-}
-
-var nIP6, nMcast6, nIP4, nTX, nTXErr, nMDNS int
-
-func countFrame(f []byte) {
-	if len(f) < 14 {
-		return
-	}
-	switch {
-	case f[12] == 0x86 && f[13] == 0xDD:
-		nIP6++
-		if f[0] == 0x33 && f[1] == 0x33 {
-			nMcast6++
-		}
-	case f[12] == 0x08:
-		nIP4++
-	}
 }
