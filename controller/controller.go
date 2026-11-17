@@ -108,6 +108,7 @@ type Controller struct {
 	// resumptions lets reconnects to nodes skip the full CASE handshake;
 	// kept in memory, as each run of the controller has its own node ID.
 	resumptions *casesession.ResumptionStore
+	id          *identity
 }
 
 type packet struct {
@@ -146,8 +147,22 @@ func Open(opts Options) (*Controller, error) {
 		return nil, err
 	}
 	// This controller's identity: a node ID of its own, with the
-	// administrator CAT.
-	noc, err := credentials.IssueNOC(c.root, c.rootKey, key.PublicKey().Bytes(), st.FabricID, controllerNodeID(), st.AdminCAT)
+	// administrator CAT, and the sessions it can resume (see identity).
+	if c.id, err = claimIdentity(opts.Dir, c.resumptions); err != nil {
+		return nil, err
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			c.id.release()
+		}
+	}()
+	c.resumptions.OnChange = func() {
+		if err := c.id.save(c.resumptions); err != nil {
+			c.logf("saving CASE resumption records: %v", err)
+		}
+	}
+	noc, err := credentials.IssueNOC(c.root, c.rootKey, key.PublicKey().Bytes(), st.FabricID, c.id.NodeID, st.AdminCAT)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +197,7 @@ func Open(opts Options) (*Controller, error) {
 	}
 	go c.read()
 	go c.loop()
+	opened = true
 	return c, nil
 }
 
@@ -213,6 +229,7 @@ func (c *Controller) Close() error {
 		closeBluetooth(c.ble)
 	}
 	c.bleMu.Unlock()
+	c.id.release()
 	return c.conn.Close()
 }
 

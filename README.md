@@ -112,10 +112,16 @@ themselves after the device restarts.
 fail-safe the node makes a new key (CSRRequest for UpdateNOC), `tmctl`
 issues its certificate, optionally for a new node ID, and commits the
 change over a CASE session to the new identity; until then a restart
-keeps the old credentials, and the fail-safe rolls them back. Within one
-run, `tmctl` resumes CASE sessions instead of repeating the full
-handshake (both sides keep resumption records in memory; chip-tool
-resumes sessions with the devices too).
+keeps the old credentials, and the fail-safe rolls them back.
+
+`tmctl` resumes CASE sessions instead of repeating the full handshake,
+also from one run to the next: a command takes about 0.2 s instead of
+1.4 s with the boards here. Each running `tmctl` locks an identity slot
+in the state directory (`identities/`), with a node ID of its own and
+the resumption records of its sessions, so runs one after another reuse
+the first slot, and runs at the same time (a `subscribe` and an
+`invoke`) are distinct peers to a node. Devices keep their records with
+their state.
 
 `commission` and `scan` look for the device with mDNS and over Bluetooth
 LE at once (unless its QR code says it is not on BLE). A device on the IP

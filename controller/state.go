@@ -139,7 +139,13 @@ func (st *state) save(dir string) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, stateFile+".*")
+	return writeFile(dir, stateFile, append(b, '\n'))
+}
+
+// writeFile replaces dir/name with b, readable only by the user, through a
+// temporary file so a crash leaves the old or the new content.
+func writeFile(dir, name string, b []byte) error {
+	tmp, err := os.CreateTemp(dir, name+".*")
 	if err != nil {
 		return err
 	}
@@ -148,14 +154,14 @@ func (st *state) save(dir string) error {
 		tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
+	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(dir, stateFile))
+	return os.Rename(tmp.Name(), filepath.Join(dir, name))
 }
 
 func (st *state) node(id uint64) *Node {
