@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
+	"github.com/shabunin/tiny-matter-go/storage"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
@@ -36,13 +38,12 @@ const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
 
-// encodeState serializes committed fabrics and their ACL entries, into a
-// buffer that is kept and reused: the result is valid until the next call.
-// A state of a few KB is the largest block the device needs, and a small,
-// fragmented heap may not have one later, so it is allocated once, early,
-// with room to grow.
-func (d *Device) encodeState() []byte {
-	w := tlv.NewWriter(d.stateBuf[:0])
+// encodeState writes the persistent state (committed fabrics, ACL,
+// networks, groups, application state...) to w. The state can be tens of
+// KB (scene tables, five fabrics), a block a small, fragmented heap does not
+// have once the node runs, so it is never held whole: save streams it
+// through stateBuf, a small buffer allocated at start.
+func (d *Device) encodeState(w *tlv.Writer) {
 	w.StartStruct(tlv.Anonymous)
 	w.PutUint(tlv.ContextTag(1), stateVersion)
 	w.PutUint(tlv.ContextTag(2), uint64(d.Fabrics.LastIndex()))
@@ -116,17 +117,23 @@ func (d *Device) encodeState() []byte {
 		})
 	}
 	w.EndContainer()
-	b := w.Bytes()
-	if cap(b) < len(b)+stateSlack/2 {
-		b = append(make([]byte, 0, len(b)+stateSlack), b...)
-	}
-	d.stateBuf = b
-	return b
 }
 
-// stateSlack is the room left in the state buffer for it to grow (more
-// fabrics, ACL entries, resumption records) without a new allocation.
-const stateSlack = 1024
+// stateBufSize is the size of stateBuf, through which the state is hashed
+// and saved.
+const stateBufSize = 512
+
+// stateSum returns the SHA-256 of the encoded state, which save compares
+// with that of the state last saved.
+func (d *Device) stateSum() [32]byte {
+	h := sha256.New()
+	w := tlv.NewStreamWriter(d.stateBuf[:0], func(p []byte) error { h.Write(p); return nil })
+	d.encodeState(w)
+	w.Flush()
+	var sum [32]byte
+	h.Sum(sum[:0])
+	return sum
+}
 
 // decodeBasic restores Basic Information's NodeLabel and Location.
 func (d *Device) decodeBasic(r *tlv.Reader) error {
@@ -436,17 +443,32 @@ func (d *Device) save() {
 	if d.cfg.Store == nil {
 		return
 	}
-	b := d.encodeState()
-	sum := sha256.Sum256(b)
+	sum := d.stateSum()
 	if sum == d.savedSum {
 		return
 	}
-	if err := d.cfg.Store.Save(b); err != nil {
+	var err error
+	n := 0
+	if st, ok := d.cfg.Store.(storage.Streamer); ok {
+		err = st.SaveFunc(func(write func([]byte) error) error {
+			w := tlv.NewStreamWriter(d.stateBuf[:0], func(p []byte) error { n += len(p); return write(p) })
+			d.encodeState(w)
+			return w.Flush()
+		})
+	} else {
+		// A Store that wants the whole blob (a host's file): only hosts
+		// have the memory for it.
+		w := tlv.NewWriter(nil)
+		d.encodeState(w)
+		n = w.Len()
+		err = d.cfg.Store.Save(w.Bytes())
+	}
+	if err != nil {
 		d.log("saving state failed: " + err.Error())
 		return
 	}
 	d.savedSum = sum
-	d.log("state saved")
+	d.log("state saved, " + strconv.Itoa(n) + " bytes")
 }
 
 // persistent reports whether a change to p affects stored state.

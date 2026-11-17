@@ -6,7 +6,6 @@
 package device
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -131,7 +130,7 @@ type Device struct {
 	windowMode     int
 	windowDeadline time.Time
 	dirty          bool     // persistent state changed since the last save
-	stateBuf       []byte   // encoding buffer, reused (see encodeState)
+	stateBuf       []byte   // stateBufSize bytes to stream the state through (see encodeState)
 	savedSum       [32]byte // SHA-256 of the last saved state
 	started        bool     // the boot events were recorded
 	eventLimit     uint64   // event numbers reserved in the store
@@ -175,6 +174,7 @@ func New(cfg Config) (*Device, error) {
 		FailSafe: &clusters.FailSafe{},
 
 		Resumptions: &casesession.ResumptionStore{Max: 2 * fabric.MaxFabrics},
+		stateBuf:    make([]byte, 0, stateBufSize),
 	}
 	// A new record is saved with the next batch of state changes: losing
 	// it costs only a full handshake.
@@ -343,7 +343,7 @@ func New(cfg Config) (*Device, error) {
 		} else if n := d.Fabrics.Committed(); n > 0 {
 			d.log("restored " + strconv.Itoa(n) + " fabric(s)")
 		}
-		d.savedSum = sha256.Sum256(d.encodeState())
+		d.savedSum = d.stateSum()
 		// Event numbers continue past those reserved before the restart,
 		// and the reboot is counted; both are saved now.
 		d.eventLimit = d.Node.Events.Start(d.eventLimit)

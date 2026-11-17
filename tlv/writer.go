@@ -13,16 +13,89 @@ type Writer struct {
 	buf   []byte
 	depth int
 	err   error
+	sink  func([]byte) error // streaming: receives buf whenever it is full
 }
 
 // NewWriter returns a Writer that appends to buf. Pass buf[:0] of a
 // preallocated slice to encode without allocating.
 func NewWriter(buf []byte) *Writer { return &Writer{buf: buf} }
 
+// minStreamBuf is the smallest buffer a streaming Writer works with: room
+// for the largest element header and scalar.
+const minStreamBuf = 32
+
+// NewStreamWriter returns a Writer that encodes into buf and passes its
+// contents to sink, then reuses it, whenever buf would grow past its
+// capacity, and on Flush: an encoding of any size in a fixed buffer.
+// sink must not keep its argument. Its first error is kept (see Flush and
+// Err) and later output dropped. Checkpoint and Rollback must not be used
+// across a flush.
+func NewStreamWriter(buf []byte, sink func([]byte) error) *Writer {
+	if cap(buf) < minStreamBuf {
+		buf = make([]byte, 0, minStreamBuf)
+	}
+	return &Writer{buf: buf[:0], sink: sink}
+}
+
+// Flush passes what a streaming Writer holds to its sink and returns the
+// first error the sink returned. It does nothing for other Writers.
+func (w *Writer) Flush() error {
+	w.flush()
+	if w.sink == nil {
+		return nil
+	}
+	return w.err
+}
+
+func (w *Writer) flush() {
+	if w.sink == nil || len(w.buf) == 0 {
+		return
+	}
+	if w.err == nil {
+		if err := w.sink(w.buf); err != nil {
+			w.err = err
+		}
+	}
+	w.buf = w.buf[:0]
+}
+
+// room makes space for n more bytes (n <= minStreamBuf) in a streaming
+// Writer's buffer.
+func (w *Writer) room(n int) {
+	if w.sink != nil && len(w.buf)+n > cap(w.buf) {
+		w.flush()
+	}
+}
+
+// payload appends p, a piece at a time through a streaming Writer's
+// buffer. p itself never reaches the sink, which would make every caller's
+// argument escape to the heap under TinyGo.
+func (w *Writer) payload(p []byte) {
+	for w.sink != nil && len(w.buf)+len(p) > cap(w.buf) {
+		n := cap(w.buf) - len(w.buf)
+		w.buf = append(w.buf, p[:n]...)
+		p = p[n:]
+		w.flush()
+	}
+	w.buf = append(w.buf, p...)
+}
+
+// payloadString is payload for a string.
+func (w *Writer) payloadString(s string) {
+	for w.sink != nil && len(w.buf)+len(s) > cap(w.buf) {
+		n := cap(w.buf) - len(w.buf)
+		w.buf = append(w.buf, s[:n]...)
+		s = s[n:]
+		w.flush()
+	}
+	w.buf = append(w.buf, s...)
+}
+
 // Reset discards the writer state and starts appending to buf.
 func (w *Writer) Reset(buf []byte) { *w = Writer{buf: buf} }
 
-// Bytes returns the encoded data.
+// Bytes returns the encoded data (for a streaming Writer, what it has not
+// flushed yet).
 func (w *Writer) Bytes() []byte { return w.buf }
 
 // Len returns the number of encoded bytes.
@@ -40,7 +113,10 @@ func (w *Writer) Err() error {
 	return w.err
 }
 
+// header writes an element's control octet and tag. It makes room for up
+// to 8 more octets of value or length after them (13 in all).
 func (w *Writer) header(tag Tag, elem byte) {
+	w.room(13)
 	switch tag.Kind {
 	case TagAnonymous:
 		w.buf = append(w.buf, elem)
@@ -159,13 +235,13 @@ func (w *Writer) putLen(tag Tag, base byte, n int) {
 // valid UTF-8.
 func (w *Writer) PutString(tag Tag, s string) {
 	w.putLen(tag, elemUTF8_1, len(s))
-	w.buf = append(w.buf, s...)
+	w.payloadString(s)
 }
 
 // PutBytes writes an octet string.
 func (w *Writer) PutBytes(tag Tag, b []byte) {
 	w.putLen(tag, elemBytes1, len(b))
-	w.buf = append(w.buf, b...)
+	w.payload(b)
 }
 
 // PutNull writes a null.
@@ -192,12 +268,13 @@ func (w *Writer) EndContainer() {
 		return
 	}
 	w.depth--
+	w.room(1)
 	w.buf = append(w.buf, elemEndOfContainer)
 }
 
 // PutRaw appends an already encoded element verbatim, such as one returned by
 // Reader.RawElement. The element's own tag is kept.
-func (w *Writer) PutRaw(elem []byte) { w.buf = append(w.buf, elem...) }
+func (w *Writer) PutRaw(elem []byte) { w.payload(elem) }
 
 // Checkpoint is a writer position to roll back to.
 type Checkpoint struct{ n, depth int }
