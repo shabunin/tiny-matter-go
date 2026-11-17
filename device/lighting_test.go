@@ -256,6 +256,11 @@ func TestScenes(t *testing.T) {
 		t.Helper()
 		return groupStatus(t, res)
 	}
+	// FabricSceneInfo lists a fabric only once it has had a scene.
+	rds := h.readQ(s, im.Request{Attributes: []im.AttributePath{{Endpoint: lightEP, Cluster: clusters.IDScenesManagement, Attribute: 0x0002}}})
+	if r := tlv.NewReader(rds[0].Reports[0].Data); r.Next() != nil || r.EnterContainer() != nil || r.Next() == nil {
+		t.Fatal("FabricSceneInfo lists a fabric without scenes")
+	}
 	if st := sceneStatus(h.cmd(s, clusters.IDScenesManagement, cmdStoreScene, uint(0), uint(1))); st != im.Success {
 		t.Fatalf("StoreScene: %#x", st)
 	}

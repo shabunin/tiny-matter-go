@@ -85,7 +85,8 @@ type scene struct {
 //
 // FabricSceneInfo tracks each fabric's current scene: the one it last
 // stored or recalled, valid until a command changes the endpoint's lights
-// (Invalidate) or the scene is removed. It is not kept across restarts.
+// (Invalidate) or the scene is removed. Like the SDK, it lists a fabric
+// once the fabric has had a scene. It is not kept across restarts.
 type ScenesManagement struct {
 	im.ClusterBase
 	// Groups is the node's group data: scenes of a group need the
@@ -229,11 +230,15 @@ func (s *ScenesManagement) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.Wr
 					continue
 				}
 				n, _ := s.count(f.Index)
+				c := s.currentOf(f.Index)
+				if c == nil && n == 0 {
+					continue // never had a scene
+				}
 				w.StartStruct(tlv.Anonymous)
 				w.PutUint(tlv.ContextTag(0), uint64(n))
 				if f.Index == accessing { // fabric-sensitive fields
-					cur := currentScene{id: sceneUndefined}
-					if c := s.currentOf(f.Index); c != nil {
+					var cur currentScene
+					if c != nil {
 						cur = *c
 					}
 					w.PutUint(tlv.ContextTag(1), uint64(cur.id))
@@ -260,6 +265,11 @@ func (s *ScenesManagement) inGroup(fabric uint8, group uint16, ep uint16) bool {
 
 // changed reports the table change (FabricSceneInfo), which also saves it.
 func (s *ScenesManagement) changed(ctx *im.Context) {
+	for _, sc := range s.scenes {
+		if s.currentOf(sc.fabric) == nil {
+			s.current = append(s.current, currentScene{fabric: sc.fabric})
+		}
+	}
 	ctx.Node.Changed(ctx.Endpoint, IDScenesManagement, scenesFabricInfo)
 }
 
@@ -700,7 +710,7 @@ func (s *ScenesManagement) copy(ctx *im.Context, fabric uint8, r *tlv.Reader, re
 		return respond(im.ConstraintError)
 	case !s.inGroup(fabric, uint16(gFrom), ctx.Endpoint) || !s.inGroup(fabric, uint16(gTo), ctx.Endpoint):
 		return respond(im.InvalidCommand)
-	case s.find(fabric, uint16(gTo), uint8(sTo)) == nil && s.capacity(fabric) == 0:
+	case s.capacity(fabric) == 0: // like the SDK, even to replace a scene
 		return respond(im.ResourceExhausted)
 	}
 	copyOne := func(src *scene, toID uint8) im.Status {
