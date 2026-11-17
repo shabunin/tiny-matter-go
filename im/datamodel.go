@@ -1,6 +1,7 @@
 package im
 
 import (
+	"slices"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/exchange"
@@ -88,7 +89,11 @@ type DeviceType struct {
 type Endpoint struct {
 	ID          uint16
 	DeviceTypes []DeviceType
-	clusters    []clusterEntry
+	// Parent is the endpoint this one is part of (0: the node itself),
+	// as bridged devices are parts of their aggregator: an endpoint's
+	// PartsList holds its descendants, and the root's every endpoint.
+	Parent   uint16
+	clusters []clusterEntry
 }
 
 type clusterEntry struct {
@@ -131,11 +136,101 @@ func NewNode(seed uint32) *Node {
 	return &Node{version: seed, Events: NewEventLog(DefaultDebugBuffer, DefaultInfoBuffer, DefaultCriticalBuffer)}
 }
 
-// AddEndpoint adds an endpoint. Endpoints should be added in ascending order.
+// AddEndpoint adds an endpoint (keeping endpoints in ascending order).
+// After the node has started, add the endpoint's clusters, then call
+// EndpointAdded.
 func (n *Node) AddEndpoint(id uint16, types ...DeviceType) *Endpoint {
 	e := &Endpoint{ID: id, DeviceTypes: types}
-	n.endpoints = append(n.endpoints, e)
+	i := len(n.endpoints)
+	for i > 0 && n.endpoints[i-1].ID > id {
+		i--
+	}
+	n.endpoints = append(n.endpoints, nil)
+	copy(n.endpoints[i+1:], n.endpoints[i:])
+	n.endpoints[i] = e
 	return e
+}
+
+// descriptorID and partsListID name the Descriptor cluster's PartsList,
+// which changes as endpoints come and go.
+const (
+	descriptorID = 0x001D
+	partsListID  = 3
+)
+
+// EndpointAdded reports an endpoint added after the node started (such as
+// a newly bridged device): every attribute of its clusters, and the parts
+// lists that now include it, count as changed for subscriptions.
+func (n *Node) EndpointAdded(id uint16) {
+	e := n.Endpoint(id)
+	if e == nil {
+		return
+	}
+	for _, ce := range e.clusters {
+		for _, a := range ce.c.Attributes() {
+			n.Changed(id, ce.c.ID(), a)
+		}
+		for _, a := range globalAttributes {
+			n.Changed(id, ce.c.ID(), a)
+		}
+	}
+	n.partsChanged(e.Parent)
+}
+
+// RemoveEndpoint removes an endpoint and its descendants, reporting the
+// parts lists that held them as changed.
+func (n *Node) RemoveEndpoint(id uint16) {
+	e := n.Endpoint(id)
+	if e == nil || id == 0 {
+		return
+	}
+	parent := e.Parent
+	n.endpoints = slices.DeleteFunc(n.endpoints, func(o *Endpoint) bool { return o.ID == id || n.descends(o, id) })
+	n.partsChanged(parent)
+}
+
+// partsChanged reports the PartsList of endpoint id, its ancestors and the
+// root as changed.
+func (n *Node) partsChanged(id uint16) {
+	for range n.endpoints { // bounded walk up the parents
+		n.Changed(id, descriptorID, partsListID)
+		if id == 0 {
+			return
+		}
+		e := n.Endpoint(id)
+		if e == nil {
+			break
+		}
+		id = e.Parent
+	}
+	n.Changed(0, descriptorID, partsListID)
+}
+
+// descends reports whether e is a descendant of the endpoint ancestor.
+func (n *Node) descends(e *Endpoint, ancestor uint16) bool {
+	for range n.endpoints { // bounded: a cycle of parents ends the walk
+		if e.Parent == 0 || e.Parent == e.ID {
+			return false
+		}
+		if e.Parent == ancestor {
+			return true
+		}
+		if e = n.Endpoint(e.Parent); e == nil {
+			return false
+		}
+	}
+	return false
+}
+
+// Parts appends to dst the endpoints in the PartsList of endpoint id: for
+// the root every other endpoint, otherwise its descendants.
+func (n *Node) Parts(id uint16, dst []uint16) []uint16 {
+	for _, o := range n.endpoints {
+		if o.ID != id && o.ID != 0 && (id == 0 || n.descends(o, id)) {
+			dst = append(dst, o.ID)
+		}
+	}
+	return dst
 }
 
 // AddCluster adds clusters to endpoint e.

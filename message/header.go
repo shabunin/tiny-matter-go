@@ -61,7 +61,7 @@ const (
 type Header struct {
 	SessionID      uint16
 	SessionType    SessionType
-	Privacy        bool // P flag; privacy obfuscation is not supported yet
+	Privacy        bool // P flag: header obfuscated (group messages, see Obfuscate)
 	Control        bool // C flag: message counter synchronization traffic
 	MessageCounter uint32
 

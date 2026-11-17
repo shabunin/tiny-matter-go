@@ -364,6 +364,28 @@ func (d *Device) NewGroups(identify *clusters.Identify) *clusters.Groups {
 // and On/Off cluster too (Groups.Scenes, OnOff.Scenes).
 func (d *Device) NewScenes() *clusters.ScenesManagement { return clusters.NewScenes(d.Groups) }
 
+// AddedEndpoint reports an application endpoint added after start, such
+// as a newly bridged device: add the endpoint and its clusters to Node,
+// then call this. Its saved state (if any) was restored as its clusters
+// were added.
+func (d *Device) AddedEndpoint(id uint16) { d.Node.EndpointAdded(id) }
+
+// RemoveEndpoint removes an application endpoint and its descendants
+// after start, such as a bridged device that is gone for good: their
+// group memberships and saved state go with them.
+func (d *Device) RemoveEndpoint(id uint16) {
+	if id == 0 {
+		return
+	}
+	var ids []uint16
+	ids = append(d.Node.Parts(id, ids), id)
+	d.Node.RemoveEndpoint(id)
+	for _, ep := range ids {
+		d.Groups.ForgetEndpoint(d.Node, ep)
+	}
+	d.dirty = true
+}
+
 // removeFabricScenes deletes a removed fabric's scenes on every endpoint.
 func (d *Device) removeFabricScenes(index uint8) {
 	for _, e := range d.Node.Endpoints() {

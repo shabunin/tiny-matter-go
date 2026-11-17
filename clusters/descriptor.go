@@ -35,8 +35,9 @@ var (
 )
 
 // Descriptor is the Descriptor cluster. One value serves every endpoint: it
-// describes the endpoint it is read on. The node is flat: the root endpoint's
-// parts list holds every other endpoint.
+// describes the endpoint it is read on. The root endpoint's parts list
+// holds every other endpoint; another endpoint's, its descendants (see
+// im.Endpoint.Parent), as an aggregator lists its bridged devices.
 type Descriptor struct{ im.ClusterBase }
 
 func (Descriptor) ID() uint32       { return IDDescriptor }
@@ -67,12 +68,9 @@ func (Descriptor) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.Writer, tag
 		}
 	case 2: // ClientList
 	case 3: // PartsList
-		if e.ID == 0 {
-			for _, o := range ctx.Node.Endpoints() {
-				if o.ID != 0 {
-					w.PutUint(tlv.Anonymous, uint64(o.ID))
-				}
-			}
+		var buf [16]uint16
+		for _, id := range ctx.Node.Parts(e.ID, buf[:0]) {
+			w.PutUint(tlv.Anonymous, uint64(id))
 		}
 	default:
 		w.EndContainer()

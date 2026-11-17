@@ -1,14 +1,22 @@
 // Command hostdevice runs the stack on a host over UDP for interoperability
-// testing against a Matter controller such as chip-tool. It is an Extended
-// Color Light (endpoint 1: on/off, level, colour, scenes and groups; it
-// logs the colour it would show) and a push button (endpoint 2, Generic
-// Switch) using the SDK development attestation credentials (vendor
-// 0xFFF1, product 0x8000), test passcode 20202021 and discriminator 3840.
+// testing against a Matter controller such as chip-tool, using the SDK
+// development attestation credentials (vendor 0xFFF1, product 0x8000),
+// test passcode 20202021 and discriminator 3840.
 //
-// Lines on standard input work the button: "press", "release", "click"
-// (a short press) and "long" (held 1.5 s). With -test-key, the General
-// Diagnostics TestEventTrigger command does the same: trigger
-// 0x003B000000000001 clicks and 0x003B000000000002 long-presses.
+// By default (-type light) it is an Extended Color Light (endpoint 1:
+// on/off, level, colour, scenes and groups; it logs the colour it would
+// show) and a push button (endpoint 2, Generic Switch). Other types are
+// lights and plugs, sensors, and a bridge (an Aggregator on endpoint 1 with
+// bridged devices from endpoint 3); see -help.
+//
+// Lines on standard input work the device: "press", "release", "click" (a
+// short press) and "long" (held 1.5 s) the button; "contact open|closed",
+// "occupancy on|off", "temp 21.5", "humidity 40", "pressure 1013" and
+// "lux 300" the sensors; "add <kind> [label]", "remove <ep>" and
+// "reach <ep> on|off" the bridge. "@<ep> " before a command picks the
+// endpoint. With -test-key, the General Diagnostics TestEventTrigger
+// command works the button: trigger 0x003B000000000001 clicks and
+// 0x003B000000000002 long-presses.
 //
 // With -updates, it is an OTA requestor that updates itself: an image's
 // payload is a new hostdevice binary, which it executes in its place. The
@@ -58,7 +66,12 @@ func main() {
 	state := flag.String("state", "", "file keeping fabrics and the ACL across restarts")
 	testKey := flag.String("test-key", "", "hex enable key (16 bytes) for TestEventTrigger")
 	updates := flag.String("updates", "", "accept OTA software updates, keeping downloaded binaries in `dir`")
+	typ := flag.String("type", "light", "device `type`: "+kindNames())
 	flag.Parse()
+	k, ok := kinds[*typ]
+	if !ok {
+		log.Fatalf("unknown -type %q; types: %s", *typ, kindNames())
+	}
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	version, err := strconv.ParseUint(softwareVersion, 10, 32)
 	if err != nil || version == 0 {
@@ -94,12 +107,12 @@ func main() {
 		},
 		Basic: &clusters.BasicInformation{
 			VendorName: "tiny-matter-go", VendorID: devcreds.VendorID,
-			ProductName: "Host Light", ProductID: devcreds.ProductID,
+			ProductName: k.product, ProductID: devcreds.ProductID,
 			HardwareVersion: 1, HardwareVersionString: "1",
 			SoftwareVersion: uint32(version), SoftwareVersionString: "0." + softwareVersion,
 			SerialNumber: "TMG-0001", UniqueID: "tmg-host-0001",
 		},
-		DeviceType: clusters.DeviceTypeExtendedColorLight.ID,
+		DeviceType: k.deviceType.ID,
 		Log:        func(msg string) { log.Print(msg) },
 		Clock:      time.Now,
 	}
@@ -122,41 +135,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	light := d.Node.AddEndpoint(1, clusters.DeviceTypeExtendedColorLight)
-	lightID := &clusters.Identify{Type: clusters.IdentifyLightOutput, Effects: true}
-	lightID.OnIdentify = func(on bool) { log.Printf("light identify=%v effect=%#x", on, lightID.Effect()) }
-	lightChanged := false
-	onOff := &clusters.OnOff{Lighting: true, OnChange: func(on bool) { lightChanged = true }}
-	level := clusters.NewLevelControl(onOff, true)
-	level.OnChange = func(uint8) { lightChanged = true }
-	color := clusters.NewColorControl(clusters.ColorAllFeatures, onOff, level)
-	color.OnChange = func() { lightChanged = true }
-	scenes := d.NewScenes()
-	onOff.Scenes = scenes
-	lightGroups := d.NewGroups(lightID)
-	lightGroups.Scenes = scenes
-	d.Node.AddCluster(light, clusters.Descriptor{}, lightID, lightGroups, scenes, onOff, level, color)
-	// The light's output, logged at most every 250 ms.
-	var lastLog time.Time
-	logLight := func(now time.Time) {
-		if !lightChanged || now.Sub(lastLog) < 250*time.Millisecond {
-			return
-		}
-		lightChanged, lastLog = false, now
-		r, g, b := color.RGB(level.Brightness())
-		log.Printf("light on=%v level=%d mode=%d rgb=#%02x%02x%02x", onOff.On, level.Level(), color.Mode(), r, g, b)
-	}
+	cmds := make(chan string, 4)
+	a := &app{d: d, cmds: cmds}
+	k.build(a)
 	groups := &groupMemberships{c: conn, joined: map[netip.Addr]bool{}}
 	d.OnMulticast = groups.set
 	groups.set(d.MulticastAddrs())
-	button := &clusters.Switch{}
-	sw := d.Node.AddEndpoint(2, clusters.DeviceTypeGenericSwitch)
-	d.Node.AddCluster(sw, clusters.Descriptor{},
-		&clusters.Identify{Type: clusters.IdentifyVisibleIndicator, OnIdentify: func(on bool) { log.Printf("button identify=%v", on) }},
-		button)
 	d.Diagnostics.Interfaces = hostInterfaces
 
-	cmds := make(chan string, 4)
 	if *testKey != "" {
 		key, err := hex.DecodeString(*testKey)
 		if err != nil || len(key) != 16 {
@@ -208,9 +194,8 @@ func main() {
 	for {
 		var timer <-chan time.Time
 		deadline := d.Poll(time.Now())
-		logLight(time.Now())
-		if lightChanged {
-			deadline = earliest(deadline, lastLog.Add(250*time.Millisecond))
+		if t := a.poll(time.Now()); !t.IsZero() {
+			deadline = earliest(deadline, t)
 		}
 		if !deadline.IsZero() {
 			timer = time.After(time.Until(deadline))
@@ -221,23 +206,9 @@ func main() {
 				log.Printf("drop packet from %v: %v", p.from, err)
 			}
 		case c := <-cmds:
-			now := time.Now()
-			switch c {
-			case "press":
-				button.Press(d.Node, 2, now)
-			case "release":
-				button.Release(d.Node, 2, now)
-			case "click":
-				button.Press(d.Node, 2, now)
-				time.AfterFunc(150*time.Millisecond, func() { cmds <- "release" })
-			case "long":
-				button.Press(d.Node, 2, now)
-				time.AfterFunc(1500*time.Millisecond, func() { cmds <- "release" })
-			default:
-				log.Printf("unknown command %q (press, release, click, long)", c)
-				continue
+			if err := a.command(time.Now(), c); err != nil {
+				log.Print(err)
 			}
-			log.Printf("button: %s", c)
 		case <-timer:
 		case sig := <-stop:
 			d.Flush()

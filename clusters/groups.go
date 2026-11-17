@@ -216,6 +216,25 @@ func (g *GroupData) addEndpoint(fabricIndex uint8, groupID uint16, name string, 
 	return im.Success
 }
 
+// ForgetEndpoint ends every group membership of an endpoint that is gone
+// (a bridged device removed), reporting the change. It reports whether
+// the endpoint was in any group.
+func (g *GroupData) ForgetEndpoint(n *im.Node, endpoint uint16) bool {
+	found := false
+	for i := 0; i < len(g.Groups); i++ {
+		gi := &g.Groups[i]
+		if g.removeEndpoint(gi.FabricIndex, gi.GroupID, endpoint) {
+			found = true
+			i = -1 // the group may be gone: start over
+		}
+	}
+	if found {
+		g.changed()
+		n.Changed(0, IDGroupKeyManagement, gkGroupTable)
+	}
+	return found
+}
+
 // removeEndpoint ends endpoint's membership of a group, dropping a group
 // left without members. It reports whether endpoint was a member.
 func (g *GroupData) removeEndpoint(fabricIndex uint8, groupID uint16, endpoint uint16) bool {
