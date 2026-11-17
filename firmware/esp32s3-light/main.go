@@ -66,6 +66,7 @@ import (
 	"firmware/espota"
 	"firmware/matterble"
 	"firmware/pir"
+	"firmware/watchdog"
 	"firmware/wifinode"
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/credentials/devcreds"
@@ -95,6 +96,10 @@ const (
 	// trialTimeout is how long a new image has to confirm itself (20 s on
 	// the network) before the watchdog resets it.
 	trialTimeout = 3 * time.Minute
+	// watchdogTimeout is how long the main loop may go without polling
+	// (the longest blocking call, a Wi-Fi connect, takes about 12 s)
+	// before the watchdog resets the chip.
+	watchdogTimeout = 60 * time.Second
 )
 
 func fatal(msg string, err error) {
@@ -117,10 +122,23 @@ func stateStore() *storage.Flash {
 }
 
 func main() {
-	// An image on trial resets (and is rolled back) if it hangs before it
-	// confirms itself.
+	// The watchdog resets the chip if the main loop stops (a hang, or a
+	// fatal error, on which TinyGo halts for good). An image on trial is
+	// fed only until trialTimeout: if it has not confirmed itself by then,
+	// it is reset and the loader rolls it back.
+	watchdog.Start(watchdogTimeout)
+	println("watchdog:", watchdogTimeout.String(), "on a", watchdog.SlowClockHz(), "Hz RTC clock")
 	slots := &espota.Slots{Restart: restart, Log: func(msg string) { println(msg) }}
-	slots.Guard(trialTimeout)
+	var trialEnd time.Time
+	if _, _, confirmed, ok := slots.Running(); ok && !confirmed {
+		trialEnd = time.Now().Add(trialTimeout)
+		println("trial image: must confirm itself within", trialTimeout.String())
+	}
+	alive := func(now time.Time) {
+		if trialEnd.IsZero() || now.Before(trialEnd) {
+			watchdog.Feed()
+		}
+	}
 	initBoard()
 	// Long P-256 computations (PASE, CASE) must let the radio tasks run:
 	// over BLE, a stall beyond the supervision timeout drops the link.
@@ -213,6 +231,7 @@ func main() {
 		slots.Restart = func() { d.Flush(); restart() }
 	}
 	u := newUI(d, store)
+	u.alive = alive
 	sensors := newEnv(d)
 	var motion *pir.Sensor
 	if sensors == nil {
@@ -283,6 +302,8 @@ func main() {
 			confirmAt = time.Time{}
 			if err := slots.Confirm(); err != nil {
 				println("confirming the image:", err.Error())
+			} else {
+				trialEnd = time.Time{}
 			}
 		}
 	})

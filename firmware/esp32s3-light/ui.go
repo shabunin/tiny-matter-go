@@ -37,6 +37,8 @@ const (
 type ui struct {
 	d     *device.Device
 	store *storage.Flash
+	// alive, if set, runs first in every poll: it feeds the watchdog.
+	alive func(now time.Time)
 
 	button   clusters.Switch
 	lightID  clusters.Identify
@@ -93,6 +95,9 @@ func newUI(d *device.Device, store *storage.Flash) *ui {
 
 // poll debounces the button, ends triggered presses and updates the LED.
 func (u *ui) poll(now time.Time) {
+	if u.alive != nil {
+		u.alive(now)
+	}
 	n := u.d.Node
 	if s := buttonPressed(); s != u.sample {
 		u.sample, u.sampledAt = s, now

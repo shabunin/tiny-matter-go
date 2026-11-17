@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"firmware/esp32flash"
+	"firmware/watchdog"
 	"firmware/wifinode"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
@@ -49,6 +50,11 @@ var (
 
 	// The software version, a number, set with -X main.softwareVersion=n.
 	softwareVersion = "1"
+
+	// testFault, for testing the watchdog, makes the firmware fail 30 s
+	// after it reaches the network: "hang" spins, "panic" panics (TinyGo
+	// then halts).
+	testFault string
 )
 
 const (
@@ -57,6 +63,10 @@ const (
 	iterations    = 1000
 
 	resetHold = 5 * time.Second // holding button A this long erases the state
+	// watchdogTimeout is how long the main loop may go without polling
+	// (the longest blocking call, a Wi-Fi connect, takes about 12 s)
+	// before the watchdog resets the chip.
+	watchdogTimeout = 60 * time.Second
 )
 
 func fatal(msg string, err error) {
@@ -75,7 +85,11 @@ func stateStore() *storage.Flash {
 }
 
 func main() {
+	// The watchdog resets the chip if the main loop stops: a hang, or a
+	// fatal error, on which TinyGo halts for good.
+	watchdog.Start(watchdogTimeout)
 	time.Sleep(time.Second)
+	println("watchdog:", watchdogTimeout.String(), "on a", watchdog.SlowClockHz(), "Hz RTC clock")
 	println("tiny-matter-go", boardName, "starting")
 	p256.SetYield(runtime.Gosched)
 	store := stateStore()
@@ -152,11 +166,22 @@ func main() {
 		}
 	}
 	println("connecting to Wi-Fi", string(nw.SSID))
+	faultAt := time.Now().Add(time.Hour)
 	all := func(now time.Time) {
+		if testFault != "" && now.After(faultAt) {
+			println("test fault:", testFault)
+			if testFault == "panic" {
+				panic("test fault")
+			}
+			for {
+			}
+		}
+		watchdog.Feed()
 		poll(now)
 		reset.poll(now)
 	}
 	node.Join(nw, all, nil)
+	faultAt = time.Now().Add(30 * time.Second)
 	node.Run(all)
 }
 
