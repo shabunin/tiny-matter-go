@@ -39,6 +39,10 @@ type boundCall struct {
 	cmd      uint32
 	fields   func(w *tlv.Writer)
 	expires  time.Time
+	// run, if set, replaces the command: it is given the session once one
+	// is open (see resumer). expired, if set, hears that it was not.
+	run     func(now time.Time, s *exchange.Session)
+	expired func(now time.Time)
 }
 
 type boundPeer struct {
@@ -116,8 +120,8 @@ func (b *binder) queue(now time.Time, k peerKey, c *boundCall) {
 	if p.busy {
 		first = 1
 	}
-	for i := first; i < len(p.calls); i++ {
-		if p.calls[i].endpoint == c.endpoint && p.calls[i].cluster == c.cluster {
+	for i := first; i < len(p.calls) && c.run == nil; i++ {
+		if p.calls[i].run == nil && p.calls[i].endpoint == c.endpoint && p.calls[i].cluster == c.cluster {
 			p.calls = append(p.calls[:i], p.calls[i+1:]...)
 			break
 		}
@@ -161,7 +165,11 @@ func (b *binder) fabric(k peerKey) *fabric.Fabric {
 // step starts delivering a peer's first command if it is due.
 func (b *binder) step(now time.Time, k peerKey, p *boundPeer) {
 	for len(p.calls) > 0 && !now.Before(p.calls[0].expires) {
-		b.log(k, "command not delivered in time; dropped")
+		if c := p.calls[0]; c.expired != nil {
+			c.expired(now)
+		} else {
+			b.log(k, "command not delivered in time; dropped")
+		}
 		p.calls = p.calls[1:]
 	}
 	if len(p.calls) == 0 {
@@ -174,6 +182,11 @@ func (b *binder) step(now time.Time, k peerKey, p *boundPeer) {
 	fab := b.fabric(k)
 	if fab == nil {
 		b.log(k, "fabric gone; commands dropped")
+		for _, c := range p.calls {
+			if c.expired != nil {
+				c.expired(now)
+			}
+		}
 		p.calls = nil
 		return
 	}
@@ -226,6 +239,15 @@ func (b *binder) step(now time.Time, k peerKey, p *boundPeer) {
 // lost it; the command is then retried with a new one.
 func (b *binder) invoke(now time.Time, k peerKey, p *boundPeer, s *exchange.Session, reused bool) {
 	c := p.calls[0]
+	if c.run != nil {
+		p.calls = p.calls[1:]
+		p.at = time.Time{}
+		if s.Peer.IsValid() {
+			p.addr = s.Peer
+		}
+		c.run(now, s)
+		return
+	}
 	p.busy = true
 	inv := &im.Invocation{Timeout: 5 * time.Second, Done: func(now time.Time, res im.InvokeResult, err error) {
 		p.busy = false

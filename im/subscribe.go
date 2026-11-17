@@ -1,6 +1,7 @@
 package im
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/exchange"
@@ -25,6 +26,7 @@ const (
 	subPriming   subState = iota // initial report in progress
 	subIdle                      // established, no report in flight
 	subReporting                 // a report exchange is in flight
+	subLost                      // kept for resumption, without a session
 )
 
 // subscription is an established or priming subscription.
@@ -37,7 +39,9 @@ type subscription struct {
 	filtered bool // fabric-filtered
 	min, max time.Duration
 	state    subState
-	last     time.Time // when the last report started
+	last     time.Time      // when the last report started
+	addr     netip.AddrPort // where the subscriber was last reached
+	tries    uint8          // resumptions failed since it was last reported to
 
 	dirty    []ConcretePath
 	dirtyAll bool
@@ -51,12 +55,51 @@ func (s *Server) removeSub(sub *subscription) {
 	for i, x := range s.subs {
 		if x == sub {
 			s.subs = append(s.subs[:i], s.subs[i+1:]...)
+			if sub.state != subPriming {
+				s.subsChanged()
+			}
 			return
 		}
 	}
 }
 
-// Subscriptions returns the number of subscriptions held.
+// keeps reports whether lost subscriptions are kept for resumption.
+func (s *Server) keeps() bool { return s.OnSubscriptionsChanged != nil }
+
+func (s *Server) subsChanged() {
+	if s.OnSubscriptionsChanged != nil {
+		s.OnSubscriptionsChanged()
+	}
+}
+
+// lose handles a report the subscriber did not answer. If the server
+// keeps lost subscriptions, the session is taken for dead, as the SDK
+// does: it is closed, so a resumption opens a new one, and the
+// established subscriptions on it are kept for resumption. Otherwise the
+// subscription ends.
+func (s *Server) lose(now time.Time, sub *subscription) {
+	if sub.state == subLost {
+		return // with its session, closed below
+	}
+	if !s.keeps() || sub.state == subPriming {
+		s.removeSub(sub)
+		return
+	}
+	sess := sub.session
+	for _, x := range s.subs {
+		if x.session == sess && x.state != subPriming {
+			x.session, x.state = nil, subLost
+			if x.tries < 255 {
+				x.tries++
+			}
+		}
+	}
+	s.subsChanged()
+	s.m.CloseSession(now, sess) // fails the other exchanges on it
+}
+
+// Subscriptions returns the number of subscriptions held, lost ones
+// included.
 func (s *Server) Subscriptions() int { return len(s.subs) }
 
 func matches(p *AttributePath, c ConcretePath) bool {
@@ -172,6 +215,7 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 		return UnsupportedAccess
 	}
 	if !keep {
+		n := len(h.s.subs)
 		for i := 0; i < len(h.s.subs); {
 			x := h.s.subs[i]
 			if x.fabric == sess.FabricIndex && x.peer == sess.PeerNodeID() {
@@ -180,11 +224,27 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 			}
 			i++
 		}
+		if len(h.s.subs) != n {
+			h.s.subsChanged()
+		}
+	}
+	if len(h.s.subs) >= MaxSubscriptions {
+		// A live subscription comes before one kept for resumption.
+		for i, x := range h.s.subs {
+			if x.state == subLost {
+				h.s.subs = append(h.s.subs[:i], h.s.subs[i+1:]...)
+				h.s.subsChanged()
+				break
+			}
+		}
 	}
 	if len(h.s.subs) >= MaxSubscriptions {
 		return ResourceExhausted
 	}
 	h.s.nextSubID++
+	for h.s.sub(h.s.nextSubID) != nil || h.s.nextSubID == 0 { // restored IDs stay unique
+		h.s.nextSubID++
+	}
 	maxInterval := time.Duration(maxCeil) * time.Second
 	if maxInterval > maxIntervalLimit {
 		maxInterval = maxIntervalLimit
@@ -196,7 +256,7 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 		id: h.s.nextSubID, session: sess, fabric: sess.FabricIndex, peer: sess.PeerNodeID(),
 		paths: rs.paths, filtered: rs.fabricFiltered, events: rs.events,
 		min: time.Duration(minFloor) * time.Second, max: maxInterval,
-		state: subPriming, last: now,
+		state: subPriming, last: now, addr: sess.Peer,
 	}
 	h.s.subs = append(h.s.subs, sub)
 	rs.sub = sub
@@ -220,7 +280,13 @@ func (h *handler) finishSubReport(now time.Time, ex *exchange.Exchange) {
 		ex.Send(now, message.ProtocolInteractionModel, OpSubscribeResp, w.Bytes())
 	}
 	ex.Close(now)
+	priming := sub.state == subPriming
 	sub.state = subIdle
+	if priming || sub.tries != 0 { // established, or resumed
+		sub.tries = 0
+		sub.addr = sub.session.Peer
+		h.s.subsChanged()
+	}
 }
 
 // due returns when sub next needs a report.
@@ -237,8 +303,18 @@ func (s *Server) Poll(now time.Time) time.Time {
 	var next time.Time
 	for i := 0; i < len(s.subs); {
 		sub := s.subs[i]
+		if sub.state == subLost {
+			i++
+			continue
+		}
 		if sub.session.Closed() {
+			// The subscriber closed it (or its fabric went): as in the
+			// SDK, that ends the subscription; only one the subscriber
+			// stopped answering is kept.
 			s.subs = append(s.subs[:i], s.subs[i+1:]...)
+			if sub.state != subPriming {
+				s.subsChanged()
+			}
 			continue
 		}
 		i++
@@ -277,4 +353,180 @@ func (s *Server) report(now time.Time, sub *subscription) {
 	sub.state, sub.last = subReporting, now
 	h.read = rs
 	h.sendReport(now, ex)
+}
+
+// sub returns the subscription with the given ID, or nil.
+func (s *Server) sub(id uint32) *subscription {
+	for _, x := range s.subs {
+		if x.id == id {
+			return x
+		}
+	}
+	return nil
+}
+
+// LostSubscription describes a subscription kept for resumption.
+type LostSubscription struct {
+	ID     uint32
+	Fabric uint8
+	Peer   uint64         // the subscriber's node ID
+	Addr   netip.AddrPort // where it was last reached
+	Min    time.Duration  // the subscription's min interval
+	Tries  uint8          // resumptions failed so far
+}
+
+// Lost calls f for each subscription kept for resumption.
+func (s *Server) Lost(f func(LostSubscription)) {
+	for _, x := range s.subs {
+		if x.state == subLost {
+			f(LostSubscription{ID: x.id, Fabric: x.fabric, Peer: x.peer, Addr: x.addr, Min: x.min, Tries: x.tries})
+		}
+	}
+}
+
+// Resume continues a lost subscription on sess, a CASE session to its
+// subscriber, with a report of all its paths, as the subscription it
+// was (spec 8.5.1: the subscriber matches it by its ID). It reports
+// whether the subscription was resumed.
+func (s *Server) Resume(now time.Time, sess *exchange.Session, id uint32) bool {
+	sub := s.sub(id)
+	if sub == nil || sub.state != subLost || sess.Closed() || sess.AuthMode != exchange.AuthCASE ||
+		sess.FabricIndex != sub.fabric || sess.PeerNodeID() != sub.peer {
+		return false
+	}
+	sub.session, sub.state = sess, subIdle
+	sub.dirty, sub.dirtyAll = sub.dirty[:0], true
+	sub.last = now.Add(-sub.min) // due now
+	return true
+}
+
+// ResumeFailed records a failed attempt to resume a lost subscription.
+func (s *Server) ResumeFailed(id uint32) {
+	if sub := s.sub(id); sub != nil && sub.state == subLost && sub.tries < 255 {
+		sub.tries++
+		s.subsChanged()
+	}
+}
+
+// Drop ends a subscription.
+func (s *Server) Drop(id uint32) {
+	if sub := s.sub(id); sub != nil {
+		s.removeSub(sub)
+	}
+}
+
+// RemoveFabric ends the subscriptions of a removed fabric.
+func (s *Server) RemoveFabric(index uint8) {
+	n := len(s.subs)
+	for i := 0; i < len(s.subs); {
+		if s.subs[i].fabric == index {
+			s.subs = append(s.subs[:i], s.subs[i+1:]...)
+			continue
+		}
+		i++
+	}
+	if len(s.subs) != n {
+		s.subsChanged()
+	}
+}
+
+// EncodeSubscriptions writes the established subscriptions, and those
+// lost and kept for resumption, of the fabrics keep accepts, as an array
+// under tag: what a restarted node needs to resume them.
+func (s *Server) EncodeSubscriptions(w *tlv.Writer, tag tlv.Tag, keep func(fabricIndex uint8) bool) {
+	w.StartArray(tag)
+	for _, x := range s.subs {
+		if x.state == subPriming || !keep(x.fabric) {
+			continue
+		}
+		w.StartStruct(tlv.Anonymous)
+		w.PutUint(tlv.ContextTag(1), uint64(x.id))
+		w.PutUint(tlv.ContextTag(2), uint64(x.fabric))
+		w.PutUint(tlv.ContextTag(3), x.peer)
+		w.PutUint(tlv.ContextTag(4), uint64(x.min/time.Second))
+		w.PutUint(tlv.ContextTag(5), uint64(x.max/time.Second))
+		if x.filtered {
+			w.PutBool(tlv.ContextTag(6), true)
+		}
+		if len(x.paths) > 0 {
+			w.StartArray(tlv.ContextTag(7))
+			for _, p := range x.paths {
+				EncodeAttributePath(w, tlv.Anonymous, p)
+			}
+			w.EndContainer()
+		}
+		if len(x.events) > 0 {
+			w.StartArray(tlv.ContextTag(8))
+			for _, p := range x.events {
+				EncodeEventPath(w, tlv.Anonymous, p)
+			}
+			w.EndContainer()
+		}
+		if x.addr.IsValid() {
+			var b [18]byte
+			a := x.addr.Addr().As16()
+			copy(b[:], a[:])
+			b[16], b[17] = byte(x.addr.Port()>>8), byte(x.addr.Port())
+			w.PutBytes(tlv.ContextTag(9), b[:])
+		}
+		if x.tries != 0 {
+			w.PutUint(tlv.ContextTag(10), uint64(x.tries))
+		}
+		w.EndContainer()
+	}
+	w.EndContainer()
+}
+
+// DecodeSubscriptions restores subscriptions EncodeSubscriptions wrote,
+// as lost ones to resume. Those beyond MaxSubscriptions are ignored.
+func (s *Server) DecodeSubscriptions(r *tlv.Reader) error {
+	return arrayItems(r, func() error {
+		sub := &subscription{state: subLost}
+		var min, max uint16
+		err := structFields(r, func(r *tlv.Reader, tag uint8) (err error) {
+			switch tag {
+			case 1:
+				sub.id, err = r.Uint32()
+			case 2:
+				sub.fabric, err = r.Uint8()
+			case 3:
+				sub.peer, err = r.Uint()
+			case 4:
+				min, err = r.Uint16()
+			case 5:
+				max, err = r.Uint16()
+			case 6:
+				sub.filtered, err = r.Bool()
+			case 7:
+				return arrayItems(r, func() error {
+					p, err := DecodeAttributePath(r)
+					sub.paths = append(sub.paths, p)
+					return err
+				})
+			case 8:
+				return arrayItems(r, func() error {
+					p, err := DecodeEventPath(r)
+					sub.events = append(sub.events, p)
+					return err
+				})
+			case 9:
+				var b []byte
+				if b, err = r.Bytes(); err == nil && len(b) == 18 {
+					sub.addr = netip.AddrPortFrom(netip.AddrFrom16([16]byte(b[:16])).Unmap(), uint16(b[16])<<8|uint16(b[17]))
+				}
+			case 10:
+				sub.tries, err = r.Uint8()
+			}
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		sub.min, sub.max = time.Duration(min)*time.Second, time.Duration(max)*time.Second
+		if sub.id != 0 && sub.peer != 0 && len(s.subs) < MaxSubscriptions && s.sub(sub.id) == nil &&
+			(len(sub.paths) > 0 || len(sub.events) > 0) {
+			s.subs = append(s.subs, sub)
+		}
+		return nil
+	})
 }

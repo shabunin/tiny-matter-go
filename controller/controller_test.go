@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/im"
 	"github.com/shabunin/tiny-matter-go/onboarding"
+	"github.com/shabunin/tiny-matter-go/storage"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
 
@@ -34,6 +36,16 @@ type testDevice struct {
 	calls chan func()
 	quit  chan struct{}
 	done  chan struct{}
+	once  sync.Once
+}
+
+// stop stops the device, as a power cut does.
+func (d *testDevice) stop() {
+	d.once.Do(func() {
+		close(d.quit)
+		<-d.done
+		d.conn.Close()
+	})
 }
 
 // udpTransport sends over UDP and, to blePeer, over the device's BTP
@@ -148,11 +160,7 @@ func startDeviceConfig(t *testing.T, kind netKind, ble *blePeripheral, edit func
 			timer.Stop()
 		}
 	}()
-	t.Cleanup(func() {
-		close(d.quit)
-		<-d.done
-		conn.Close()
-	})
+	t.Cleanup(d.stop)
 	return d
 }
 
@@ -419,5 +427,65 @@ func TestControllerCloseWithActiveSubscription(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Subscription did not exit after Controller.Close")
+	}
+}
+
+// A device that restarts resumes the controller's subscription: its
+// reports go on under the same ID, over a session the device opens, and
+// the controller does not see the subscription lost.
+func TestSubscriptionResumedByDevice(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := &storage.Memory{}
+	withStore := func(cfg *device.Config) { cfg.Store = store }
+	d := startDeviceConfig(t, noNetwork, nil, withStore)
+	c := openController(t, t.TempDir())
+	defer c.Close()
+	n, err := c.Commission(ctx, &onboarding.Payload{Passcode: passcode, Discriminator: 3840},
+		controller.CommissionOptions{Addr: d.addr()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reports := make(chan uint32, 8)
+	lost := make(chan error, 8)
+	sub, err := c.Subscribe(ctx, n.ID, im.Request{Attributes: []im.AttributePath{onOffPath}},
+		controller.SubscribeOptions{MaxInterval: 60,
+			OnReport: func(rd *im.ReportData) { reports <- rd.SubscriptionID },
+			OnStatus: func(err error) { lost <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	id := <-reports
+	time.Sleep(time.Second) // saved
+
+	d.stop()
+	d2 := startDeviceConfig(t, noNetwork, nil, withStore)
+	select {
+	case got := <-reports:
+		if got != id {
+			t.Fatalf("report under %#x after the restart, want %#x", got, id)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("no report after the restart")
+	}
+	select {
+	case err := <-lost:
+		t.Fatalf("subscription status: %v", err)
+	default:
+	}
+	// Changes are reported on.
+	d2.do(func() {
+		l := d2.dev.Node.Endpoint(1).Cluster(clusters.IDOnOff).(*clusters.OnOff)
+		l.On = !l.On
+		d2.dev.Node.Changed(1, clusters.IDOnOff, 0)
+	})
+	select {
+	case got := <-reports:
+		if got != id {
+			t.Fatalf("report under %#x, want %#x", got, id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("change not reported")
 	}
 }

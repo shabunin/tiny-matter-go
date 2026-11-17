@@ -39,6 +39,11 @@ type Server struct {
 	// OnInvoked, if set, is called after a command a client sent ran
 	// successfully (a status of Success, or a response command).
 	OnInvoked func(ctx *Context, p CommandPath)
+	// OnSubscriptionsChanged, if set, makes the server keep a subscription
+	// whose subscriber stopped answering for resumption (Lost, Resume)
+	// instead of ending it, and is called when the subscriptions
+	// EncodeSubscriptions writes change, to save them.
+	OnSubscriptionsChanged func()
 
 	subs      []*subscription
 	nextSubID uint32
@@ -126,13 +131,18 @@ func (h *handler) ctx(now time.Time, ex *exchange.Exchange) *Context {
 	return &Context{Now: now, Node: h.s.node, Session: ex.Session()}
 }
 
-func (h *handler) OnError(now time.Time, ex *exchange.Exchange, err error) { h.abort() }
+func (h *handler) OnError(now time.Time, ex *exchange.Exchange, err error) { h.abort(now, true) }
 
-// abort ends the read, report, timed state, or chunked write in progress;
-// a failed subscription report ends the subscription.
-func (h *handler) abort() {
+// abort ends the read, report, timed state, or chunked write in progress.
+// A subscription report the subscriber did not answer (lost) loses the
+// subscription; one it refused ends it.
+func (h *handler) abort(now time.Time, lost bool) {
 	if h.read != nil && h.read.sub != nil {
-		h.s.removeSub(h.read.sub)
+		if lost {
+			h.s.lose(now, h.read.sub)
+		} else {
+			h.s.removeSub(h.read.sub)
+		}
 	}
 	h.read = nil
 	h.write = nil
@@ -168,7 +178,7 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 			return
 		}
 		if s, err := decodeStatusResponse(msg.Payload); err != nil || s != Success {
-			h.abort()
+			h.abort(now, false)
 			ex.Close(now)
 			return
 		}
@@ -204,7 +214,7 @@ func (h *handler) OnMessage(now time.Time, ex *exchange.Exchange, msg exchange.M
 		st = InvalidAction
 	}
 	if st != Success {
-		h.abort()
+		h.abort(now, false)
 		h.sendStatus(now, ex, st, true)
 	}
 }

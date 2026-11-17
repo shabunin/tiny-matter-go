@@ -521,6 +521,12 @@ func (h *reportHandler) OnMessage(now time.Time, ex *exchange.Exchange, msg exch
 	if err == nil {
 		st = h.c.subs[rd.SubscriptionID]
 	}
+	if s := ex.Session(); st != nil && st.session != s && s.AuthMode == exchange.AuthCASE &&
+		s.FabricIndex == h.c.fab.Index && s.PeerNodeID() == st.sub.node {
+		// The node resumed the subscription over a session it opened,
+		// after a restart (spec 8.5.1): it goes on there.
+		st.session = s
+	}
 	if st == nil || st.session != ex.Session() {
 		sendStatus(now, ex, im.InvalidSubscription)
 		ex.Close(now)

@@ -116,6 +116,13 @@ func (d *Device) encodeState(w *tlv.Writer) {
 			return f != nil && !f.Pending
 		})
 	}
+	// Subscriptions, resumed after a restart.
+	if d.Server.Subscriptions() > 0 {
+		d.Server.EncodeSubscriptions(w, tlv.ContextTag(14), func(index uint8) bool {
+			f := d.Fabrics.Get(index)
+			return f != nil && !f.Pending
+		})
+	}
 	w.EndContainer()
 }
 
@@ -315,6 +322,8 @@ func (d *Device) decodeState(b []byte) error {
 			v, err := r.Uint32()
 			d.groupLimit = v
 			return err
+		case 14:
+			return d.Server.DecodeSubscriptions(r)
 		}
 		return nil
 	})

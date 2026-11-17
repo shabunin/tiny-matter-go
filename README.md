@@ -105,8 +105,8 @@ or Bluetooth LE, and works with them:
 Clusters, attributes, commands, events and enum values go by their names
 in the Matter SDK's IDL, case aside (a unique prefix will do: `basic` is
 BasicInformation), or by number; `tmctl clusters [cluster]` lists them.
-Lists and structs are written as JSON. Subscriptions come back by
-themselves after the device restarts.
+Lists and structs are written as JSON. Subscriptions survive a restart
+of the device, which resumes them, and are made again if they are lost.
 
 `update-noc` rotates a node's operational credentials: under the
 fail-safe the node makes a new key (CSRRequest for UpdateNOC), `tmctl`
@@ -232,7 +232,7 @@ without the loader) runs as before, with updates disabled.
 | `crypto/spake2p/` | SPAKE2+ (P-256, RFC 9383 as used by Matter) and the passcode verifier (W0, L) |
 | `securechannel/` | Secure Channel opcodes, status reports, session parameters, session key derivation, opcode dispatcher |
 | `securechannel/pase/` | PASE: device responder (commissioning window, busy handling, attempt limit) and commissioner initiator |
-| `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming), Write, Invoke, Timed; group Invoke and Write (no endpoint, no response); events (a compact log per priority, event reads with filters, urgent and batched event reports, fabric-sensitive events); data model of endpoints and clusters with global attributes |
+| `im/` | Interaction Model server: Read (wildcards, data version filters, chunked reports), Subscribe (change reports with min/max intervals, keep-alives, chunked priming; subscriptions kept when the subscriber stops answering, saved, and resumed under their ID), Write, Invoke, Timed; group Invoke and Write (no endpoint, no response); events (a compact log per priority, event reads with filters, urgent and batched event reports, fabric-sensitive events); data model of endpoints and clusters with global attributes |
 | `bdx/` | Bulk Data Exchange (spec 11.22), synchronous and receiver-driven as OTA uses it: a download (receiver) and a file server (sender), with the SDK's message encodings |
 | `ota/` | OTA image files: header encoding and parsing, image creation with the SHA-256 digest, and a streaming reader that checks the digest |
 | `clusters/` | Server clusters: OTA Software Update Requestor and Provider (with the commands' codecs), Descriptor, Access Control (and the ACL checker, with entry-change events), Basic Information (StartUp, Leave), General Commissioning (fail-safe), Administrator Commissioning (enhanced and basic windows, multi-admin), Operational Credentials, Network Commissioning (Wi-Fi or Thread, with fail-safe rollback), General Diagnostics (boot reason, network interfaces, test event triggers), Group Key Management (trust-first key sets, key map, group table), Groups (with names), Scenes Management (per fabric and group, recalled with a transition), On/Off (with the Lighting feature), Level Control and Color Control (all modes, transitions in Poll, start-up values), Identify (with effects), Switch (momentary, with long press); RGB conversion for lights |
@@ -252,7 +252,7 @@ without the loader) runs as before, with updates disabled.
 | `internal/bluez/` | BLE central over BlueZ's D-Bus API: LE discovery with service data, connect, GATT writes and indications for the Matter service |
 | `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers, the group message counter, the reboot count and application cluster state (saved a few seconds after it changes); commands through bindings (to a node over a CASE session it opens or reuses, to a group by multicast) (reopens commissioning when the last fabric is removed); the OTA requestor (query, download, apply, report after the restart) over an `ImageStore` |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers, the group message counter, the reboot count, subscriptions (resumed after a restart, or when the subscriber answers again, over a CASE session the device opens, as the SDK does) and application cluster state (saved a few seconds after it changes); commands through bindings (to a node over a CASE session it opens or reuses, to a group by multicast) (reopens commissioning when the last fabric is removed); the OTA requestor (query, download, apply, report after the restart) over an `ImageStore` |
 | `cmd/hostdevice/` | An Extended Color Light (with scenes and groups; logs the colour it would show) and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS), updating itself over OTA with `-updates`; chip-tool and matter.js commission and control it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |

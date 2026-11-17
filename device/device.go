@@ -123,7 +123,8 @@ type Device struct {
 	deferred []func(now time.Time)
 	ota      *updater
 	binder   *binder // commands on their way to bound nodes
-	instance uint64  // commissionable instance name
+	resume   *resumer
+	instance uint64 // commissionable instance name
 	// The open commissioning window: its advertised discriminator and
 	// commissioning mode, and when it closes (zero: no timeout).
 	windowDisc     uint16
@@ -227,6 +228,7 @@ func New(cfg Config) (*Device, error) {
 		d.Resumptions.ForgetFabric(index)
 		d.removeFabricScenes(index)
 		d.removeFabricBindings(index)
+		d.Server.RemoveFabric(index)
 		if d.ota != nil {
 			d.ota.removeFabric(now, index)
 		}
@@ -303,6 +305,7 @@ func New(cfg Config) (*Device, error) {
 	d.Server = im.NewServer(m, d.Node)
 	d.Server.Access = d.ACL
 	d.Server.GroupEndpoints = d.Groups.Endpoints
+	d.Server.OnSubscriptionsChanged = func() { d.dirty = true }
 	// Clients write configuration (StartUpOnOff, OnLevel...) rarely, and
 	// expect it kept across a restart right away: save without the delay.
 	d.Server.OnWritten = func(p im.ConcretePath) {
@@ -457,6 +460,7 @@ func (d *Device) Poll(now time.Time) time.Time {
 		if d.ota != nil {
 			d.ota.boot(now)
 		}
+		d.resumer().boot(now)
 	}
 	d.runDeferred(now)
 	if d.appDirty {
@@ -496,16 +500,27 @@ func (d *Device) Poll(now time.Time) time.Time {
 			next = t
 		}
 	}
+	if t := d.resumer().poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
 	if d.binder != nil {
 		if t := d.binder.poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 			next = t
 		}
+	}
+	if t := d.resumer().at; !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t // planned while the binder ran
 	}
 	d.runDeferred(now)
 	if t := d.Node.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
 	if t := d.Server.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+		next = t
+	}
+	// The work above may have sent messages (reports, CASE, commands):
+	// their retransmissions come due before anything else may.
+	if t := d.M.Poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 		next = t
 	}
 	return next
