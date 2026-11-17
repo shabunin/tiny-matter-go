@@ -129,6 +129,8 @@ type Device struct {
 	savedSum       [32]byte // SHA-256 of the last saved state
 	started        bool     // the boot events were recorded
 	eventLimit     uint64   // event numbers reserved in the store
+	groupNext      uint32   // next group data message counter (0: not started)
+	groupLimit     uint32   // group counter values from here on are unused (saved)
 	// Application cluster state (im.Persister): stored entries not yet
 	// restored into a cluster, and when changed state is next saved.
 	appState   []appState

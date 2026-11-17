@@ -49,11 +49,16 @@ import (
 	"github.com/shabunin/tiny-matter-go/device"
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/internal/mcast"
 )
 
 type udpTransport struct{ c *net.UDPConn }
 
 func (t udpTransport) Send(to exchange.Addr, pkt []byte) error {
+	if to.Addr().IsMulticast() { // a group message (bindings to groups)
+		_, err := mcast.Send(t.c, to, pkt)
+		return err
+	}
 	_, err := t.c.WriteToUDPAddrPort(pkt, to)
 	return err
 }

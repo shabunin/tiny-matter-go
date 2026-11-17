@@ -117,6 +117,44 @@ func (g *GroupData) Keys(sessionID uint16, yield func(k *exchange.GroupKey) bool
 	}
 }
 
+// SendKey returns the key to send a message to a group of a fabric with
+// (spec 4.17.3): the operational key of the current epoch key of the key
+// set the group is mapped to, the latest to have started by now (epoch_us),
+// or the earliest when the time is unknown (now is zero) or none has
+// started. It returns nil if the group is not mapped to a key set.
+func (g *GroupData) SendKey(fabricIndex uint8, groupID uint16, now uint64) *exchange.GroupKey {
+	var ks *GroupKeySet
+	for _, m := range g.KeyMap {
+		if m.FabricIndex == fabricIndex && m.GroupID == groupID {
+			ks = g.keySet(fabricIndex, m.KeySetID)
+			break
+		}
+	}
+	if ks == nil || len(ks.Epochs) == 0 {
+		return nil
+	}
+	cur, earliest := -1, 0
+	for i, e := range ks.Epochs {
+		if e.StartTime < ks.Epochs[earliest].StartTime {
+			earliest = i
+		}
+		if now != 0 && e.StartTime <= now && (cur < 0 || e.StartTime > ks.Epochs[cur].StartTime) {
+			cur = i
+		}
+	}
+	if cur < 0 {
+		cur = earliest
+	}
+	sid := ks.Epochs[cur].Keys.SessionID
+	for i := range g.keys {
+		k := &g.keys[i]
+		if k.FabricIndex == fabricIndex && k.GroupID == groupID && k.SessionID == sid {
+			return k
+		}
+	}
+	return nil
+}
+
 // Endpoints returns the endpoints that are members of a group, for
 // im.Server.GroupEndpoints.
 func (g *GroupData) Endpoints(fabricIndex uint8, groupID uint16) []uint16 {

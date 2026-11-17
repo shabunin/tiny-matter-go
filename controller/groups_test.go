@@ -69,6 +69,42 @@ func TestGroups(t *testing.T) {
 		t.Fatal("group Off from a reopened controller not applied")
 	}
 
+	// Binding to a group gives the node the group's key, not membership,
+	// and keeps the node targets.
+	if _, err := c.AddGroup(8, "kitchen"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Bind(ctx, n.ID, 1, n.ID, 1, 0x0006); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := c.BindGroup(ctx, n.ID, 1, 8, 0x0006); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.do(func() {
+		acl, maps = len(d.dev.ACL.Entries), len(d.dev.Groups.KeyMap)
+	})
+	if acl != 3 || maps != 2 { // admin, group 7, the node's own binding entry
+		t.Fatalf("%d ACL entries, %d key mappings after binding to a group", acl, maps)
+	}
+	bs, err := c.Bindings(ctx, n.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bs) != 2 || bs[0].Node != n.ID || bs[0].Group != 0 || bs[1].Group != 8 || bs[1].Cluster != 0x0006 {
+		t.Fatalf("bindings %+v", bs)
+	}
+	if err := c.UnbindGroup(ctx, n.ID, 1, 8, 0); err != nil {
+		t.Fatal(err)
+	}
+	if bs, err = c.Bindings(ctx, n.ID, 1); err != nil || len(bs) != 1 || bs[0].Group != 0 {
+		t.Fatalf("bindings after UnbindGroup %+v %v", bs, err)
+	}
+	if err := c.DeleteGroup(8); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := c.LeaveGroup(ctx, n.ID, 1, 7); err != nil {
 		t.Fatal(err)
 	}

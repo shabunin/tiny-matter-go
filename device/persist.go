@@ -31,6 +31,7 @@ import (
 //	10: OTA requestor: default providers and an update being applied
 //	11: Basic Information { 1: NodeLabel, 2: Location }
 //	12: CASE resumption records (see casesession.ResumptionStore.Encode)
+//	13: group data message counter: values from here on are unused
 const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
@@ -84,6 +85,9 @@ func (d *Device) encodeState() []byte {
 	}
 	if d.Diagnostics.RebootCount != 0 {
 		w.PutUint(tlv.ContextTag(7), uint64(d.Diagnostics.RebootCount))
+	}
+	if d.groupLimit != 0 {
+		w.PutUint(tlv.ContextTag(13), uint64(d.groupLimit))
 	}
 	if len(d.Groups.KeySets) > 0 || len(d.Groups.KeyMap) > 0 || len(d.Groups.Groups) > 0 {
 		d.Groups.Encode(w, tlv.ContextTag(8), func(index uint8) bool {
@@ -300,6 +304,10 @@ func (d *Device) decodeState(b []byte) error {
 			return d.decodeBasic(r)
 		case 12:
 			return d.Resumptions.Decode(r)
+		case 13:
+			v, err := r.Uint32()
+			d.groupLimit = v
+			return err
 		}
 		return nil
 	})

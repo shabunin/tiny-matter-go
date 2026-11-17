@@ -1,14 +1,17 @@
 package device
 
 import (
+	"encoding/binary"
 	"errors"
 	"net/netip"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
+	"github.com/shabunin/tiny-matter-go/credentials"
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/fabric"
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/message"
 	"github.com/shabunin/tiny-matter-go/securechannel/casesession"
 	"github.com/shabunin/tiny-matter-go/tlv"
 )
@@ -56,10 +59,12 @@ type binder struct {
 // the clients to Endpoint.Clients).
 func (d *Device) NewBinding() *clusters.Binding { return &clusters.Binding{} }
 
-// SendBound invokes a command of cluster on every node target the
-// endpoint's Binding cluster holds for that cluster, from the target's
-// fabric. Delivery is asynchronous and best effort; failures are logged.
-// It reports how many targets the command is queued for.
+// SendBound invokes a command of cluster on every target the endpoint's
+// Binding cluster holds for that cluster, from the target's fabric. A node
+// target's command is queued and delivered asynchronously; a group
+// target's is sent at once as a group message, which nobody answers. Both
+// are best effort; failures are logged. It reports how many targets the
+// command was queued or sent for.
 func (d *Device) SendBound(now time.Time, endpoint uint16, cluster, cmd uint32, fields func(w *tlv.Writer)) int {
 	e := d.Node.Endpoint(endpoint)
 	if e == nil {
@@ -75,7 +80,11 @@ func (d *Device) SendBound(now time.Time, endpoint uint16, cluster, cmd uint32, 
 			continue
 		}
 		if t.IsGroup() {
-			d.log("binding: group targets are not supported yet")
+			if err := d.sendGroup(now, t.FabricIndex, t.Group, cluster, cmd, fields); err != nil {
+				d.log("binding: group " + hex64(uint64(t.Group))[12:] + ": " + err.Error())
+				continue
+			}
+			n++
 			continue
 		}
 		d.bound().queue(now, peerKey{t.FabricIndex, t.Node}, &boundCall{
@@ -253,6 +262,65 @@ func (b *binder) invoke(now time.Time, k peerKey, p *boundPeer, s *exchange.Sess
 		b.log(k, err.Error())
 		p.at = now.Add(boundRetry)
 	}
+}
+
+// sendGroup sends a command to a group of a fabric (spec 4.16.2): to the
+// group's multicast address, from the device's node ID on the fabric,
+// with the group's current key, which the device needs a key set and
+// key map entry for (it need not be a member).
+func (d *Device) sendGroup(now time.Time, fabricIndex uint8, group uint16, cluster, cmd uint32, fields func(w *tlv.Writer)) error {
+	f := d.Fabrics.Get(fabricIndex)
+	if f == nil || f.Pending {
+		return errors.New("fabric gone")
+	}
+	var epochUS uint64
+	if s := now.Unix() - credentials.MatterEpoch; s > 0 && now.Year() >= 2020 { // known time
+		epochUS = uint64(s) * 1e6
+	}
+	k := d.Groups.SendKey(fabricIndex, group, epochUS)
+	if k == nil {
+		return errors.New("no group key")
+	}
+	counter, err := d.nextGroupCounter()
+	if err != nil {
+		return err
+	}
+	to := netip.AddrPortFrom(exchange.GroupMulticastAddr(f.FabricID, group), matterPort)
+	return d.M.SendGroup(to, k, f.NodeID, counter, message.ProtocolInteractionModel, im.OpInvokeRequest,
+		im.EncodeGroupInvokeRequest(cluster, cmd, fields))
+}
+
+// matterPort is the UDP port of Matter nodes, where group messages go.
+const matterPort = 5540
+
+// groupCounterStep is how far the stored limit of the group data message
+// counter is moved ahead of it at a time; the state is saved when the
+// counter is half way there.
+const groupCounterStep = 1024
+
+// nextGroupCounter returns the next value of the device's group data
+// message counter (spec 4.6.1.2). Receivers trust the first value they see
+// from a sender and drop older ones, so it must never go back: it starts
+// after the limit saved with the state, or at random the first time, and
+// the limit is saved ahead of it before it is used.
+func (d *Device) nextGroupCounter() (uint32, error) {
+	if d.groupNext == 0 {
+		d.groupNext = d.groupLimit
+		if d.groupNext == 0 {
+			var b [4]byte
+			if _, err := d.cfg.Rand.Read(b[:]); err != nil {
+				return 0, err
+			}
+			d.groupNext = binary.LittleEndian.Uint32(b[:])>>4 + 1 // [1, 2^28]
+		}
+	}
+	if d.groupLimit-d.groupNext < groupCounterStep/2 || d.groupLimit < d.groupNext {
+		d.groupLimit = d.groupNext + groupCounterStep
+		d.save()
+	}
+	c := d.groupNext
+	d.groupNext++
+	return c, nil
 }
 
 // removeFabricBindings drops a removed fabric's targets on every endpoint.

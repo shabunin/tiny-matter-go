@@ -14,9 +14,11 @@ const (
 	authModeCASE = 2
 )
 
-// Binding is a node target of a Binding cluster entry.
+// Binding is a Binding cluster entry: a node's endpoint, or a group
+// (Group nonzero), optionally for one cluster only.
 type Binding struct {
 	Node       uint64
+	Group      uint16
 	Endpoint   uint16
 	Cluster    uint32
 	HasCluster bool
@@ -63,11 +65,51 @@ func (c *Controller) Bind(ctx context.Context, node uint64, endpoint uint16, tar
 	}
 	return c.editBindings(ctx, node, endpoint, func(bs []Binding) []Binding {
 		for _, b := range bs {
-			if b.Node == target && b.Endpoint == targetEndpoint && (!b.HasCluster || b.Cluster == cluster) {
+			if b.Group == 0 && b.Node == target && b.Endpoint == targetEndpoint && (!b.HasCluster || b.Cluster == cluster) {
 				return bs
 			}
 		}
 		return append(bs, Binding{Node: target, Endpoint: targetEndpoint, Cluster: cluster, HasCluster: true})
+	})
+}
+
+// BindGroup makes an endpoint of node send the commands of cluster to a
+// group of the controller's fabric (as group messages): it gives node the
+// group's key (without making it a member), then adds the group to node's
+// Binding list. Members are added with JoinGroup.
+func (c *Controller) BindGroup(ctx context.Context, node uint64, endpoint uint16, group uint16, cluster uint32) error {
+	_, ks, err := c.groupKeySet(group)
+	if err != nil {
+		return err
+	}
+	err = c.withSession(ctx, node, func(s *exchange.Session) error {
+		return c.giveGroupKey(ctx, s, group, ks)
+	})
+	if err != nil {
+		return err
+	}
+	return c.editBindings(ctx, node, endpoint, func(bs []Binding) []Binding {
+		for _, b := range bs {
+			if b.Group == group && (!b.HasCluster || b.Cluster == cluster) {
+				return bs
+			}
+		}
+		return append(bs, Binding{Group: group, Cluster: cluster, HasCluster: true})
+	})
+}
+
+// UnbindGroup removes node's bindings to a group (for cluster only,
+// unless cluster is zero). The node keeps the group's key.
+func (c *Controller) UnbindGroup(ctx context.Context, node uint64, endpoint uint16, group uint16, cluster uint32) error {
+	return c.editBindings(ctx, node, endpoint, func(bs []Binding) []Binding {
+		var keep []Binding
+		for _, b := range bs {
+			if b.Group == group && (cluster == 0 || b.Cluster == cluster) {
+				continue
+			}
+			keep = append(keep, b)
+		}
+		return keep
 	})
 }
 
@@ -77,7 +119,7 @@ func (c *Controller) Unbind(ctx context.Context, node uint64, endpoint uint16, t
 	return c.editBindings(ctx, node, endpoint, func(bs []Binding) []Binding {
 		var keep []Binding
 		for _, b := range bs {
-			if b.Node == target && b.Endpoint == targetEndpoint && (cluster == 0 || b.Cluster == cluster) {
+			if b.Group == 0 && b.Node == target && b.Endpoint == targetEndpoint && (cluster == 0 || b.Cluster == cluster) {
 				continue
 			}
 			keep = append(keep, b)
@@ -86,8 +128,7 @@ func (c *Controller) Unbind(ctx context.Context, node uint64, endpoint uint16, t
 	})
 }
 
-// Bindings returns the node targets of an endpoint's Binding list on the
-// controller's fabric.
+// Bindings returns an endpoint's Binding list on the controller's fabric.
 func (c *Controller) Bindings(ctx context.Context, node uint64, endpoint uint16) ([]Binding, error) {
 	var bs []Binding
 	err := c.withSession(ctx, node, func(s *exchange.Session) error {
@@ -103,23 +144,21 @@ func (c *Controller) readBindings(ctx context.Context, s *exchange.Session, endp
 	if err != nil {
 		return nil, fmt.Errorf("reading the Binding list: %w", err)
 	}
-	var bs []Binding
+	bs := make([]Binding, 0, len(items))
 	for _, it := range items {
-		if b, ok := parseBinding(it); ok { // group targets are left out
-			bs = append(bs, b)
-		}
+		bs = append(bs, parseBinding(it))
 	}
 	return bs, nil
 }
 
-// parseBinding decodes a Binding list entry; ok is false for a group
-// target.
-func parseBinding(item []byte) (b Binding, ok bool) {
+// parseBinding decodes a Binding list entry.
+func parseBinding(item []byte) (b Binding) {
 	im.ForEachField(tlv.NewReader(item), func(r *tlv.Reader, tag uint8) (err error) {
 		switch tag {
 		case 1:
 			b.Node, err = r.Uint()
-			ok = true
+		case 2:
+			b.Group, err = r.Uint16()
 		case 3:
 			b.Endpoint, err = r.Uint16()
 		case 4:
@@ -128,37 +167,29 @@ func parseBinding(item []byte) (b Binding, ok bool) {
 		}
 		return err
 	})
-	return b, ok
+	return b
 }
 
 // editBindings rewrites an endpoint's Binding list on the controller's
-// fabric with what edit makes of its node targets. Group targets are kept.
+// fabric with what edit makes of it.
 func (c *Controller) editBindings(ctx context.Context, node uint64, endpoint uint16, edit func([]Binding) []Binding) error {
 	return c.withSession(ctx, node, func(s *exchange.Session) error {
-		items, err := c.readList(ctx, s, endpoint, idBinding, 0)
+		bs, err := c.readBindings(ctx, s, endpoint)
 		if err != nil {
-			return fmt.Errorf("reading the Binding list: %w", err)
-		}
-		var groups [][]byte
-		var bs []Binding
-		for _, it := range items {
-			if b, ok := parseBinding(it); ok {
-				bs = append(bs, b)
-			} else {
-				groups = append(groups, it)
-			}
+			return err
 		}
 		bs = edit(bs)
 		err = c.writeOn(ctx, s, im.AttributePath{Endpoint: endpoint, Cluster: idBinding, Attribute: 0}, 0,
 			func(w *tlv.Writer, tag tlv.Tag) {
 				w.StartArray(tag)
-				for _, g := range groups {
-					w.PutRaw(g)
-				}
 				for _, b := range bs {
 					w.StartStruct(tlv.Anonymous)
-					w.PutUint(tlv.ContextTag(1), b.Node)
-					w.PutUint(tlv.ContextTag(3), uint64(b.Endpoint))
+					if b.Group != 0 {
+						w.PutUint(tlv.ContextTag(2), uint64(b.Group))
+					} else {
+						w.PutUint(tlv.ContextTag(1), b.Node)
+						w.PutUint(tlv.ContextTag(3), uint64(b.Endpoint))
+					}
 					if b.HasCluster {
 						w.PutUint(tlv.ContextTag(4), uint64(b.Cluster))
 					}

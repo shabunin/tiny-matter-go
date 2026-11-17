@@ -71,7 +71,9 @@ func (w *World) Deliver() {
 		p := w.Queue[0]
 		w.Queue = w.Queue[1:]
 		for _, n := range w.nodes {
-			if n.Addr == p.To {
+			// A multicast packet reaches every other node; their group
+			// keys decide whether it is for them.
+			if n.Addr == p.To || p.To.Addr().IsMulticast() && n.Addr != p.From {
 				n.handle(w.Now, p.From, p.Data)
 			}
 		}

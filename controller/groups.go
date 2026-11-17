@@ -132,95 +132,40 @@ func deleteFunc[T any](s []T, del func(T) bool) []T {
 	return out
 }
 
+// groupKeySet returns a group and its key set.
+func (c *Controller) groupKeySet(group uint16) (Group, GroupKeySet, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g := c.st.group(group)
+	if g == nil {
+		return Group{}, GroupKeySet{}, ErrUnknownGroup
+	}
+	var ks GroupKeySet
+	if k := c.st.keySet(g.KeySetID); k != nil {
+		ks = *k
+	}
+	if ks.EpochKey == nil {
+		return Group{}, GroupKeySet{}, fmt.Errorf("controller: group %#x has no key set", group)
+	}
+	return *g, ks, nil
+}
+
 // JoinGroup makes an endpoint of a node a member of a group: it gives the
 // node the group's key set and maps the group to it (Group Key
 // Management), lets the group operate the node (an Access Control entry),
 // and adds the endpoint to the group (Groups).
 func (c *Controller) JoinGroup(ctx context.Context, node uint64, endpoint uint16, group uint16) error {
-	c.mu.Lock()
-	g := c.st.group(group)
-	var (
-		gi Group
-		ks GroupKeySet
-	)
-	if g != nil {
-		gi = *g
-		if k := c.st.keySet(g.KeySetID); k != nil {
-			ks = *k
-		}
-	}
-	c.mu.Unlock()
-	if g == nil {
-		return ErrUnknownGroup
-	}
-	if ks.EpochKey == nil {
-		return fmt.Errorf("controller: group %#x has no key set", group)
+	gi, ks, err := c.groupKeySet(group)
+	if err != nil {
+		return err
 	}
 	return c.withSession(ctx, node, func(s *exchange.Session) error {
-		// The key set.
-		_, err := c.invokeOn(ctx, s, im.CommandPath{Endpoint: 0, Cluster: idGroupKeyManagement, Command: 0}, 0, func(w *tlv.Writer) {
-			w.StartStruct(tlv.ContextTag(0))
-			w.PutUint(tlv.ContextTag(0), uint64(ks.ID))
-			w.PutUint(tlv.ContextTag(1), groupKeyTrustFirst)
-			w.PutBytes(tlv.ContextTag(2), ks.EpochKey)
-			w.PutUint(tlv.ContextTag(3), ks.StartTime)
-			for tag := uint8(4); tag <= 7; tag++ {
-				w.PutNull(tlv.ContextTag(tag))
-			}
-			w.EndContainer()
-		})
-		if err != nil {
-			return fmt.Errorf("KeySetWrite: %w", err)
-		}
-
-		// The group key map: replaced whole, with the group mapped to its
-		// key set.
-		items, err := c.readList(ctx, s, 0, idGroupKeyManagement, 0)
-		if err != nil {
-			return fmt.Errorf("reading the group key map: %w", err)
-		}
-		type mapping struct{ group, keySet uint16 }
-		var maps []mapping
-		mapped := false
-		for _, it := range items {
-			var m mapping
-			im.ForEachField(tlv.NewReader(it), func(r *tlv.Reader, tag uint8) (err error) {
-				switch tag {
-				case 1:
-					m.group, err = r.Uint16()
-				case 2:
-					m.keySet, err = r.Uint16()
-				}
-				return err
-			})
-			if m.group == group {
-				mapped = m.keySet == ks.ID
-				m.keySet = ks.ID
-			}
-			maps = append(maps, m)
-		}
-		if !mapped {
-			if !containsFunc(maps, func(m mapping) bool { return m.group == group }) {
-				maps = append(maps, mapping{group, ks.ID})
-			}
-			err = c.writeOn(ctx, s, im.AttributePath{Endpoint: 0, Cluster: idGroupKeyManagement, Attribute: 0}, 0,
-				func(w *tlv.Writer, tag tlv.Tag) {
-					w.StartArray(tag)
-					for _, m := range maps {
-						w.StartStruct(tlv.Anonymous)
-						w.PutUint(tlv.ContextTag(1), uint64(m.group))
-						w.PutUint(tlv.ContextTag(2), uint64(m.keySet))
-						w.EndContainer()
-					}
-					w.EndContainer()
-				})
-			if err != nil {
-				return fmt.Errorf("writing the group key map: %w", err)
-			}
+		if err := c.giveGroupKey(ctx, s, group, ks); err != nil {
+			return err
 		}
 
 		// Access: an entry letting the group operate the node.
-		items, err = c.readList(ctx, s, 0, idAccessControl, 0)
+		items, err := c.readList(ctx, s, 0, idAccessControl, 0)
 		if err != nil {
 			return fmt.Errorf("reading the ACL: %w", err)
 		}
@@ -255,6 +200,73 @@ func (c *Controller) JoinGroup(ctx context.Context, node uint64, endpoint uint16
 		}
 		return groupsStatus(res, "AddGroup")
 	})
+}
+
+// giveGroupKey gives a node a group's key set and maps the group to it,
+// so the node can send to the group and, if a member, receive from it.
+func (c *Controller) giveGroupKey(ctx context.Context, s *exchange.Session, group uint16, ks GroupKeySet) error {
+	// The key set.
+	_, err := c.invokeOn(ctx, s, im.CommandPath{Endpoint: 0, Cluster: idGroupKeyManagement, Command: 0}, 0, func(w *tlv.Writer) {
+		w.StartStruct(tlv.ContextTag(0))
+		w.PutUint(tlv.ContextTag(0), uint64(ks.ID))
+		w.PutUint(tlv.ContextTag(1), groupKeyTrustFirst)
+		w.PutBytes(tlv.ContextTag(2), ks.EpochKey)
+		w.PutUint(tlv.ContextTag(3), ks.StartTime)
+		for tag := uint8(4); tag <= 7; tag++ {
+			w.PutNull(tlv.ContextTag(tag))
+		}
+		w.EndContainer()
+	})
+	if err != nil {
+		return fmt.Errorf("KeySetWrite: %w", err)
+	}
+
+	// The group key map: replaced whole, with the group mapped to its
+	// key set.
+	items, err := c.readList(ctx, s, 0, idGroupKeyManagement, 0)
+	if err != nil {
+		return fmt.Errorf("reading the group key map: %w", err)
+	}
+	type mapping struct{ group, keySet uint16 }
+	var maps []mapping
+	mapped := false
+	for _, it := range items {
+		var m mapping
+		im.ForEachField(tlv.NewReader(it), func(r *tlv.Reader, tag uint8) (err error) {
+			switch tag {
+			case 1:
+				m.group, err = r.Uint16()
+			case 2:
+				m.keySet, err = r.Uint16()
+			}
+			return err
+		})
+		if m.group == group {
+			mapped = m.keySet == ks.ID
+			m.keySet = ks.ID
+		}
+		maps = append(maps, m)
+	}
+	if !mapped {
+		if !containsFunc(maps, func(m mapping) bool { return m.group == group }) {
+			maps = append(maps, mapping{group, ks.ID})
+		}
+		err = c.writeOn(ctx, s, im.AttributePath{Endpoint: 0, Cluster: idGroupKeyManagement, Attribute: 0}, 0,
+			func(w *tlv.Writer, tag tlv.Tag) {
+				w.StartArray(tag)
+				for _, m := range maps {
+					w.StartStruct(tlv.Anonymous)
+					w.PutUint(tlv.ContextTag(1), uint64(m.group))
+					w.PutUint(tlv.ContextTag(2), uint64(m.keySet))
+					w.EndContainer()
+				}
+				w.EndContainer()
+			})
+		if err != nil {
+			return fmt.Errorf("writing the group key map: %w", err)
+		}
+	}
+	return nil
 }
 
 // LeaveGroup removes an endpoint of a node from a group.

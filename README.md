@@ -99,6 +99,8 @@ or Bluetooth LE, and works with them:
     tmctl group-add 0x101 lights            # a group, with a key set of its own
     tmctl group-join lamp 1 lights          # key set, key map, ACL entry, AddGroup
     tmctl group-invoke lights OnOff Toggle  # to every member, by IPv6 multicast
+    tmctl bind pir 6 lamp 1 OnOff           # the sensor switches the lamp itself (Binding, ACL entry)
+    tmctl group-bind pir 6 lights OnOff     # ...or the whole group, by multicast (Binding, group key)
 
 Clusters, attributes, commands, events and enum values go by their names
 in the Matter SDK's IDL, case aside (a unique prefix will do: `basic` is
@@ -244,7 +246,7 @@ without the loader) runs as before, with updates disabled.
 | `internal/bluez/` | BLE central over BlueZ's D-Bus API: LE discovery with service data, connect, GATT writes and indications for the Matter service |
 | `internal/datamodel/` | Cluster, attribute, command and event names and types from the SDK's IDL; formats TLV with names and encodes typed values for `tmctl` |
 | `storage/` | Persistent state as one blob: `Store` interface, in-memory store, and an A/B flash store (CRC, sequence numbers, power-cut safe) over a TinyGo block device |
-| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers, the reboot count and application cluster state (saved a few seconds after it changes) (reopens commissioning when the last fabric is removed); the OTA requestor (query, download, apply, report after the restart) over an `ImageStore` |
+| `device/` | Assembles a node: sessions, PASE, CASE, IM server, root clusters, ACL, fail-safe, commissioning completion, advertising, boot events, persistence of fabrics, ACL, networks, groups, event numbers, the group message counter, the reboot count and application cluster state (saved a few seconds after it changes); commands through bindings (to a node over a CASE session it opens or reuses, to a group by multicast) (reopens commissioning when the last fabric is removed); the OTA requestor (query, download, apply, report after the restart) over an `ImageStore` |
 | `cmd/hostdevice/` | An Extended Color Light (with scenes and groups; logs the colour it would show) and a push button (Generic Switch, worked from standard input or test event triggers) over UDP on a host (SDK dev credentials, passcode 20202021, discriminator 3840, avahi mDNS), updating itself over OTA with `-updates`; chip-tool and matter.js commission and control it |
 | `internal/simnet/` | Deterministic simulated network for multi-node tests |
 | `crypto/internal/` | Go's constant-time `nistec`/`fiat` P-256 and `bigmod`, vendored (BSD, `LICENSE-GO`) with the base table moved to flash |

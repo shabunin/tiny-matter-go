@@ -101,7 +101,7 @@ func startDeviceConfig(t *testing.T, kind netKind, ble *blePeripheral, edit func
 		t.Fatal(err)
 	}
 	ep := dev.Node.AddEndpoint(1, clusters.DeviceTypeOnOffLight)
-	dev.Node.AddCluster(ep, clusters.Descriptor{}, &clusters.OnOff{}, dev.NewGroups(nil))
+	dev.Node.AddCluster(ep, clusters.Descriptor{}, &clusters.OnOff{}, dev.NewGroups(nil), dev.NewBinding())
 	dev.OpenCommissioningWindow()
 
 	d := &testDevice{t: t, dev: dev, conn: conn,
