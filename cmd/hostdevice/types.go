@@ -265,15 +265,27 @@ func (a *app) contact(ep, parent uint16) {
 	})
 }
 
-// occupancy adds a PIR Occupancy Sensor ("occupancy on|off").
+// occupancy adds a PIR Occupancy Sensor ("occupancy on|off"). It switches
+// the lights bound to it (tmctl bind) on and off with the occupancy.
 func (a *app) occupancy(ep, parent uint16) {
 	occ := &clusters.OccupancySensing{Sensors: clusters.OccupancyPassiveInfrared}
-	a.endpoint(ep, parent, clusters.DeviceTypeOccupancySensor, sensorIdentify(ep), occ)
+	e := a.endpoint(ep, parent, clusters.DeviceTypeOccupancySensor, sensorIdentify(ep), occ, a.d.NewBinding())
+	e.Clients = []uint32{clusters.IDOnOff}
 	a.handle(ep, "occupancy", "on|off", func(now time.Time, args []string) error {
 		if len(args) != 1 || args[0] != "on" && args[0] != "off" {
 			return errors.New("occupancy on|off")
 		}
-		occ.Set(a.d.Node, ep, now, args[0] == "on")
+		on := args[0] == "on"
+		if on != occ.Occupied() {
+			occ.Set(a.d.Node, ep, now, on)
+			cmd := uint32(clusters.CmdOff)
+			if on {
+				cmd = clusters.CmdOn
+			}
+			if n := a.d.SendBound(now, ep, clusters.IDOnOff, cmd, nil); n > 0 {
+				log.Printf("endpoint %d: On/Off to %d bound target(s)", ep, n)
+			}
+		}
 		return nil
 	})
 }

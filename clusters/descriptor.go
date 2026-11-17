@@ -67,6 +67,9 @@ func (Descriptor) ReadAttribute(ctx *im.Context, attr uint32, w *tlv.Writer, tag
 			w.PutUint(tlv.Anonymous, uint64(id))
 		}
 	case 2: // ClientList
+		for _, id := range e.Clients {
+			w.PutUint(tlv.Anonymous, uint64(id))
+		}
 	case 3: // PartsList
 		var buf [16]uint16
 		for _, id := range ctx.Node.Parts(e.ID, buf[:0]) {

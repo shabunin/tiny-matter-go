@@ -43,15 +43,23 @@ type GlobalScene interface {
 	RecallGlobalScene(ctx *im.Context)
 }
 
+// On/Off cluster commands, for clients (a sensor sending through its
+// bindings).
+const (
+	CmdOff    = 0x00
+	CmdOn     = 0x01
+	CmdToggle = 0x02
+)
+
 const (
 	onOffAttr              = 0x0000
 	onOffGlobalSceneCtrl   = 0x4000
 	onOffOnTime            = 0x4001
 	onOffOffWaitTime       = 0x4002
 	onOffStartUpOnOff      = 0x4003
-	onOffCmdOff            = 0x00
-	onOffCmdOn             = 0x01
-	onOffCmdToggle         = 0x02
+	onOffCmdOff            = CmdOff
+	onOffCmdOn             = CmdOn
+	onOffCmdToggle         = CmdToggle
 	onOffCmdOffWithEffect  = 0x40
 	onOffCmdOnWithRecall   = 0x41
 	onOffCmdOnWithTimedOff = 0x42

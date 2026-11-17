@@ -120,6 +120,8 @@ func main() {
 	if *mdns {
 		avahi = newAvahiAdvertiser()
 		cfg.Advertiser = avahi
+		// Bound nodes (and OTA providers) are found with avahi-browse.
+		cfg.Resolve = (&avahiResolver{}).Resolve
 	}
 	if *updates != "" {
 		cfg.Updates = &binaryUpdates{dir: *updates, beforeExec: func() {

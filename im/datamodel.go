@@ -92,7 +92,10 @@ type Endpoint struct {
 	// Parent is the endpoint this one is part of (0: the node itself),
 	// as bridged devices are parts of their aggregator: an endpoint's
 	// PartsList holds its descendants, and the root's every endpoint.
-	Parent   uint16
+	Parent uint16
+	// Clients are the client clusters the endpoint uses (the Descriptor's
+	// ClientList), as an endpoint sending commands through bindings has.
+	Clients  []uint32
 	clusters []clusterEntry
 }
 

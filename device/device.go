@@ -116,7 +116,8 @@ type Device struct {
 
 	deferred []func(now time.Time)
 	ota      *updater
-	instance uint64 // commissionable instance name
+	binder   *binder // commands on their way to bound nodes
+	instance uint64  // commissionable instance name
 	// The open commissioning window: its advertised discriminator and
 	// commissioning mode, and when it closes (zero: no timeout).
 	windowDisc     uint16
@@ -215,6 +216,7 @@ func New(cfg Config) (*Device, error) {
 		d.Groups.RemoveFabric(index)
 		d.Resumptions.ForgetFabric(index)
 		d.removeFabricScenes(index)
+		d.removeFabricBindings(index)
 		if d.ota != nil {
 			d.ota.removeFabric(now, index)
 		}
@@ -476,6 +478,11 @@ func (d *Device) Poll(now time.Time) time.Time {
 	}
 	if d.ota != nil {
 		if t := d.ota.poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
+	if d.binder != nil {
+		if t := d.binder.poll(now); !t.IsZero() && (next.IsZero() || t.Before(next)) {
 			next = t
 		}
 	}
