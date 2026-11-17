@@ -214,6 +214,9 @@ func (h *handler) onSubscribe(now time.Time, ex *exchange.Exchange, b []byte) St
 	if sess.AuthMode != exchange.AuthCASE {
 		return UnsupportedAccess
 	}
+	if !h.anyExistingPath(rs) {
+		return InvalidAction // as the SDK does: nothing could ever be reported
+	}
 	if !keep {
 		n := len(h.s.subs)
 		for i := 0; i < len(h.s.subs); {

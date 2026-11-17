@@ -40,6 +40,15 @@ type Context struct {
 	FabricFiltered bool
 	// Timed is set for writes and invokes inside a timed interaction.
 	Timed bool
+
+	clusterStatus *uint8
+}
+
+// ClusterStatus fails an attribute read or write with a cluster-specific
+// status code: the callback returns its result.
+func (c *Context) ClusterStatus(code uint8) Status {
+	c.clusterStatus = &code
+	return Failure
 }
 
 // Cluster is a server cluster instance on an endpoint. Implementations

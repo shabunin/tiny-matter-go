@@ -135,10 +135,13 @@ func EncodeWriteRequest(p AttributePath, timed bool, value func(w *tlv.Writer, t
 
 // AttributeReport is one report from a ReportData message.
 type AttributeReport struct {
-	Path        AttributePath
-	Status      Status
-	DataVersion uint32
-	Data        []byte // raw TLV element (anonymous-tagged value not guaranteed)
+	Path   AttributePath
+	Status Status
+	// ClusterStatus is the cluster-specific status, if HasClusterStatus.
+	ClusterStatus    uint8
+	HasClusterStatus bool
+	DataVersion      uint32
+	Data             []byte // raw TLV element (anonymous-tagged value not guaranteed)
 }
 
 // EventReport is one event, or the status of an event path, from a
@@ -181,7 +184,7 @@ func DecodeReportData(b []byte) (*ReportData, error) {
 						case tag == 0 && f == 0, tag == 1 && f == 1:
 							rep.Path, err = DecodeAttributePath(r)
 						case tag == 0 && f == 1:
-							rep.Status, _, _, err = DecodeStatusIB(r)
+							rep.Status, rep.ClusterStatus, rep.HasClusterStatus, err = DecodeStatusIB(r)
 						case tag == 1 && f == 0:
 							rep.DataVersion, err = r.Uint32()
 						case tag == 1 && f == 2:
@@ -288,7 +291,7 @@ func DecodeWriteResponse(b []byte) ([]AttributeReport, error) {
 				case 0:
 					rep.Path, err = DecodeAttributePath(r)
 				case 1:
-					rep.Status, _, _, err = DecodeStatusIB(r)
+					rep.Status, rep.ClusterStatus, rep.HasClusterStatus, err = DecodeStatusIB(r)
 				}
 				return err
 			})

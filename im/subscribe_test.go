@@ -188,4 +188,23 @@ func TestSubscribeInvalid(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Opcode != im.OpStatusResponse {
 		t.Fatalf("min > max accepted: %v", msgs)
 	}
+	// Paths that name nothing: an endpoint, cluster and attribute that do
+	// not exist, and a wildcard that matches nothing.
+	for _, p := range []im.AttributePath{
+		path(9, clusters.IDOnOff, 0),
+		path(1, 0xFFF11FFF, 0),
+		path(1, clusters.IDOnOff, 0xFFF1),
+		{AnyEndpoint: true, Cluster: 0xFFF11FFF, AnyAttribute: true},
+	} {
+		msgs := f.request(im.OpSubscribeRequest, im.EncodeSubscribeRequest([]im.AttributePath{p}, 1, 5, false, true))
+		if len(msgs) != 1 || msgs[0].Opcode != im.OpStatusResponse {
+			t.Fatalf("%+v: %v", p, msgs)
+		}
+		if st, _ := im.DecodeStatusResponse(msgs[0].Payload); st != im.InvalidAction {
+			t.Errorf("%+v: status %#x", p, st)
+		}
+	}
+	if f.server.Subscriptions() != 0 {
+		t.Fatal("a subscription to nothing was kept")
+	}
 }

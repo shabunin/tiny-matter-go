@@ -176,18 +176,18 @@ func TestReadEvents(t *testing.T) {
 		{Endpoint: 3, Cluster: evClusterID, Event: 1},
 		{Endpoint: 9, Cluster: evClusterID, Event: 1},
 		{Endpoint: 3, Cluster: 0x1234, Event: 1},
-		{Endpoint: 3, Cluster: evClusterID, Event: 7},
+		{Endpoint: 3, Cluster: evClusterID, Event: 7},        // not generated: silent
 		{AnyEndpoint: true, Cluster: 0x1234, AnyEvent: true}, // wildcard: silent
 	}}))
-	if len(evs) != 5 {
+	if len(evs) != 4 {
 		t.Fatalf("%d reports", len(evs))
 	}
-	for i, want := range []im.Status{im.UnsupportedEndpoint, im.UnsupportedCluster, im.UnsupportedEvent} {
+	for i, want := range []im.Status{im.UnsupportedEndpoint, im.UnsupportedCluster} {
 		if evs[i].Status != want || evs[i].Data != nil {
 			t.Errorf("status %d: %+v", i, evs[i])
 		}
 	}
-	if payload(t, evs[3]) != "b" || payload(t, evs[4]) != "own fabric" {
+	if payload(t, evs[2]) != "b" || payload(t, evs[3]) != "own fabric" {
 		t.Fatal("EventMin or the concrete path not applied")
 	}
 

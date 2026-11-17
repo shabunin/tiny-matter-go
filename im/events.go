@@ -135,7 +135,9 @@ func decodeEventFilter(r *tlv.Reader) (min uint64, err error) {
 	return min, err
 }
 
-// EventInfo is implemented by clusters that generate events.
+// EventInfo is implemented by clusters that generate events. It describes
+// them: like the SDK, the server does not refuse a path naming another
+// event ID, which just matches nothing.
 type EventInfo interface {
 	// Events returns the IDs of the events the instance generates, in
 	// ascending order.
@@ -146,13 +148,6 @@ type EventInfo interface {
 // than View to read.
 type EventPrivilegeInfo interface {
 	EventPrivilege(event uint32) Privilege
-}
-
-func eventIDs(c Cluster) []uint32 {
-	if ei, ok := c.(EventInfo); ok {
-		return ei.Events()
-	}
-	return nil
 }
 
 func eventPrivilege(c Cluster, event uint32) Privilege {

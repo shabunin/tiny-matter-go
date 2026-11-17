@@ -103,6 +103,10 @@ type readState struct {
 	filters        []versionFilter
 	fabricFiltered bool
 	next           int // index of the first candidate path not yet reported
+	// When a list too large for one message is split across chunks,
+	// inList is set and item is the index of the next item to report.
+	inList bool
+	item   int
 
 	events      []EventPath
 	eventNext   uint64 // number of the first event not yet considered
@@ -538,17 +542,26 @@ func (h *handler) encodeAttributes(ctx *Context, rs *readState, w *tlv.Writer, l
 			}
 			c.status = UnsupportedAccess
 		}
-		wrote := encodeReport(ctx, w, c)
-		if w.Len() > limit {
-			w.Rollback(cp)
-			if inChunk > 0 {
+		var wrote bool
+		if !rs.inList {
+			wrote = encodeReport(ctx, w, c)
+		}
+		if rs.inList || w.Len() > limit {
+			if !rs.inList {
+				w.Rollback(cp)
+				if inChunk > 0 {
+					more = true // the attribute starts the next chunk
+					return false
+				}
+			}
+			n, next, done := encodeListChunk(ctx, w, c, rs.inList, rs.item, limit)
+			inChunk += n
+			if !done {
+				rs.inList, rs.item = true, next
 				more = true
 				return false
 			}
-			// A single attribute too large for a message.
-			// TODO: split list attributes across chunks.
-			encodeStatusReport(w, c.path, ResourceExhausted)
-			wrote = true
+			rs.inList, rs.item = false, 0
 		}
 		rs.next = i + 1
 		if wrote {
@@ -621,6 +634,25 @@ func (h *handler) encodeEvents(ctx *Context, rs *readState, w *tlv.Writer, limit
 }
 
 // eventPathStatus checks a concrete event path of a request.
+// anyExistingPath reports whether a path of rs names an existing attribute,
+// or an event of an existing cluster (a wildcard event path always may).
+func (h *handler) anyExistingPath(rs *readState) bool {
+	for _, p := range rs.events {
+		if p.IsWildcard() {
+			return true
+		}
+		if e := h.s.node.Endpoint(p.Endpoint); e != nil && e.Cluster(p.Cluster) != nil {
+			return true
+		}
+	}
+	found := false
+	h.candidates(rs, func(c *candidate) bool {
+		found = c.status == Success
+		return !found
+	})
+	return found
+}
+
 func (h *handler) eventPathStatus(ctx *Context, p ConcreteEventPath) Status {
 	e := h.s.node.Endpoint(p.Endpoint)
 	if e == nil {
@@ -630,9 +662,8 @@ func (h *handler) eventPathStatus(ctx *Context, p ConcreteEventPath) Status {
 	if c == nil {
 		return UnsupportedCluster
 	}
-	if !hasID(eventIDs(c), p.Event) {
-		return UnsupportedEvent
-	}
+	// An event the cluster does not generate is not an error: like the SDK
+	// (and its TestEventsById), the path just matches nothing.
 	if !h.s.allowed(ctx, p.Endpoint, p.Cluster, eventPrivilege(c, p.Event)) {
 		return UnsupportedAccess
 	}
@@ -663,10 +694,11 @@ func (h *handler) eventReadable(ctx *Context, e *eventRecord) bool {
 // anything (wildcard expansions with errors are skipped).
 func encodeReport(ctx *Context, w *tlv.Writer, c *candidate) bool {
 	if c.status != Success {
-		encodeStatusReport(w, c.path, c.status)
+		encodeStatusReport(w, c.path, c.status, nil)
 		return true
 	}
 	ctx.Endpoint = c.path.Endpoint
+	ctx.clusterStatus = nil
 	cp := w.Checkpoint()
 	w.StartStruct(tlv.Anonymous)
 	w.StartStruct(tlv.ContextTag(1)) // AttributeDataIB
@@ -682,15 +714,88 @@ func encodeReport(ctx *Context, w *tlv.Writer, c *candidate) bool {
 	if c.wildcard {
 		return false
 	}
-	encodeStatusReport(w, c.path, st)
+	encodeStatusReport(w, c.path, st, ctx.clusterStatus)
 	return true
 }
 
-func encodeStatusReport(w *tlv.Writer, p ConcretePath, st Status) {
+// encodeListChunk writes as much of a list attribute too large for one
+// message as fits within limit: at first (started unset) the attribute with
+// the items that fit, then from item from on one AttributeReportIB each, as
+// list appends. It returns how many reports it wrote, the next item, and
+// whether the attribute is complete. An attribute that is not a list, or an
+// item too large for any message, is reported as ResourceExhausted.
+func encodeListChunk(ctx *Context, w *tlv.Writer, c *candidate, started bool, from, limit int) (n, next int, done bool) {
+	whole := tlv.NewWriter(nil)
+	ctx.clusterStatus = nil
+	st := readAttribute(ctx, c.cluster, c.path.Attribute, whole, tlv.Anonymous)
+	r := tlv.NewReader(whole.Bytes())
+	if st != Success || r.Next() != nil || r.Type() != tlv.TypeArray || r.EnterContainer() != nil {
+		if started {
+			return 0, 0, true // gone since the first chunk: the client keeps what it has
+		}
+		if st == Success {
+			st = ResourceExhausted
+		}
+		encodeStatusReport(w, c.path, st, ctx.clusterStatus)
+		return 1, 0, true
+	}
+	var items [][]byte
+	for r.Next() == nil {
+		raw, err := r.RawElement()
+		if err != nil {
+			break
+		}
+		items = append(items, raw)
+	}
+	const closing = 3 // the containers still open around an item
+	start := func(appendItem bool) {
+		w.StartStruct(tlv.Anonymous)     // AttributeReportIB
+		w.StartStruct(tlv.ContextTag(1)) // AttributeDataIB
+		w.PutUint(tlv.ContextTag(0), uint64(c.version))
+		encodeAttributePath(w, tlv.ContextTag(1), c.path, appendItem)
+	}
+	i := from
+	if !started {
+		start(false)
+		w.StartArray(tlv.ContextTag(2))
+		for ; i < len(items); i++ {
+			cp := w.Checkpoint()
+			w.PutRaw(items[i])
+			if w.Len()+closing > limit {
+				w.Rollback(cp)
+				break
+			}
+		}
+		w.EndContainer()
+		w.EndContainer()
+		w.EndContainer()
+		n = 1
+	}
+	for ; i < len(items); i++ {
+		cp := w.Checkpoint()
+		start(true)
+		item := items[i]
+		w.PutRaw(append([]byte{item[0] | 0x20, 2}, item[1:]...)) // retagged as context tag 2
+		w.EndContainer()
+		w.EndContainer()
+		if w.Len() > limit {
+			w.Rollback(cp)
+			if n == 0 {
+				encodeStatusReport(w, c.path, ResourceExhausted, nil)
+				return 1, 0, true
+			}
+			return n, i, false
+		}
+		n++
+	}
+	return n, i, true
+}
+
+func encodeStatusReport(w *tlv.Writer, p ConcretePath, st Status, clusterStatus *uint8) {
 	w.StartStruct(tlv.Anonymous)
 	w.StartStruct(tlv.ContextTag(0)) // AttributeStatusIB
 	encodeAttributePath(w, tlv.ContextTag(0), p, false)
-	encodeStatusIB(w, tlv.ContextTag(1), st, nil)
+	encodeStatusIB(w, tlv.ContextTag(1), st, clusterStatus)
 	w.EndContainer()
 	w.EndContainer()
 }
@@ -704,6 +809,12 @@ type Response struct {
 	started bool
 	cluster *uint8 // cluster-specific status
 }
+
+// NewResponse returns a Response that writes to w, to call a cluster's
+// Invoke outside a server (in tests): a response command it starts is an
+// InvokeResponseIB left open in w (w.Depth() > 0), its fields in
+// CommandDataIB field 1.
+func NewResponse(w *tlv.Writer, p CommandPath) *Response { return &Response{w: w, path: p} }
 
 // ClusterStatus fails the command with a cluster-specific status code. The
 // handler returns its result.
@@ -1011,6 +1122,7 @@ func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status
 	w.StartArray(tlv.ContextTag(0))
 	for i := range items {
 		it := &items[i]
+		ctx.clusterStatus = nil
 		if it.st == Success {
 			ctx.Endpoint = it.path.Endpoint
 			dr := tlv.NewReader(it.data)
@@ -1022,7 +1134,7 @@ func (h *handler) onWrite(now time.Time, ex *exchange.Exchange, b []byte) Status
 		}
 		w.StartStruct(tlv.Anonymous) // AttributeStatusIB
 		encodeAttributePath(w, tlv.ContextTag(0), it.cpath, it.path.ListAppend)
-		encodeStatusIB(w, tlv.ContextTag(1), it.st, nil)
+		encodeStatusIB(w, tlv.ContextTag(1), it.st, ctx.clusterStatus)
 		w.EndContainer()
 	}
 	w.EndContainer()
