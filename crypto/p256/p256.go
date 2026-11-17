@@ -16,6 +16,7 @@ import (
 
 	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
 	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec/fiat"
 )
 
 const (
@@ -39,7 +40,6 @@ var orderBytes = []byte{
 var (
 	orderOnce sync.Once
 	order     *bigmod.Modulus
-	nMinus2   []byte
 )
 
 // n returns the group order as a bigmod.Modulus.
@@ -50,8 +50,6 @@ func n() *bigmod.Modulus {
 		if err != nil {
 			panic("p256: invalid order")
 		}
-		two, _ := bigmod.NewNat().SetBytes([]byte{2}, order)
-		nMinus2 = bigmod.NewNat().ExpandFor(order).Sub(two, order).Bytes(order)
 	})
 	return order
 }
@@ -63,15 +61,15 @@ var (
 
 // randomScalar returns a uniformly random non-zero scalar k and k*G, using
 // rejection sampling over bytes produced by generate.
-func randomScalar(generate func([]byte) error) (*bigmod.Nat, *nistec.P256Point, error) {
+func randomScalar(generate func([]byte) error) (*fiat.P256Scalar, *nistec.P256Point, error) {
 	var b [ScalarSize]byte
 	for {
 		if err := generate(b[:]); err != nil {
 			return nil, nil, err
 		}
-		k, err := bigmod.NewNat().SetBytes(b[:], n())
+		k, err := new(fiat.P256Scalar).SetBytes(b[:])
 		if err == nil && k.IsZero() == 0 {
-			p, err := nistec.NewP256Point().ScalarBaseMult(k.Bytes(n()))
+			p, err := nistec.NewP256Point().ScalarBaseMult(b[:])
 			return k, p, err
 		}
 	}

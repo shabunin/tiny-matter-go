@@ -267,3 +267,80 @@ func TestScalarBaseMultTable(t *testing.T) {
 		}
 	}
 }
+
+// TestECDSAEdges checks against crypto/ecdsa the cases the scalar
+// arithmetic decides: r and s out of range, the malleated (r, n-s), and
+// digests that are short, long, or at least n.
+func TestECDSAEdges(t *testing.T) {
+	N := elliptic.P256().Params().N
+	k, err := GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sk := stdKey(t, k)
+	pub := k.PublicKey()
+
+	ff := bytes.Repeat([]byte{0xff}, 64)
+	digests := [][]byte{nil, {0}, make([]byte, 20), ff[:20], ff[:32], ff[:48], ff[:64],
+		N.Bytes(), new(big.Int).Add(N, big.NewInt(5)).Bytes(), new(big.Int).Sub(N, big.NewInt(1)).Bytes()}
+	for i := 0; i < 10; i++ {
+		d := make([]byte, 16+8*i)
+		rand.Read(d)
+		digests = append(digests, d)
+	}
+	for _, d := range digests {
+		sig, err := k.Sign(rand.Reader, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, s := new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])
+		if !ecdsa.Verify(&sk.PublicKey, d, r, s) {
+			t.Fatalf("digest %x: stdlib rejects our signature", d)
+		}
+		if !pub.Verify(d, sig) {
+			t.Fatalf("digest %x: we reject our signature", d)
+		}
+		sr, ss, err := ecdsa.Sign(rand.Reader, sk, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := make([]byte, 64)
+		sr.FillBytes(raw[:32])
+		ss.FillBytes(raw[32:])
+		if !pub.Verify(d, raw) {
+			t.Fatalf("digest %x: we reject stdlib's signature", d)
+		}
+		// (r, n-s) is valid ECDSA too; neither side enforces low s.
+		new(big.Int).Sub(N, ss).FillBytes(raw[32:])
+		if !pub.Verify(d, raw) {
+			t.Fatalf("digest %x: we reject (r, n-s)", d)
+		}
+	}
+
+	d := sha256.Sum256([]byte("edges"))
+	sig, err := k.Sign(rand.Reader, d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, s := new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])
+	two256m1 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	bad := []*big.Int{big.NewInt(0), N, new(big.Int).Add(N, big.NewInt(1)), two256m1}
+	for _, b := range bad {
+		for _, pair := range [][2]*big.Int{{b, s}, {r, b}} {
+			raw := make([]byte, 64)
+			pair[0].FillBytes(raw[:32])
+			pair[1].FillBytes(raw[32:])
+			if pub.Verify(d[:], raw) {
+				t.Fatalf("accepted r=%x s=%x", pair[0], pair[1])
+			}
+		}
+	}
+	// The right signature for the wrong digest, and a truncated one.
+	other := sha256.Sum256([]byte("other"))
+	if pub.Verify(other[:], sig) {
+		t.Fatal("signature verified for another digest")
+	}
+	if pub.Verify(d[:], sig[:63]) {
+		t.Fatal("short signature verified")
+	}
+}

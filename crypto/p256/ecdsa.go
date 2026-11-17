@@ -10,8 +10,8 @@ import (
 	"errors"
 	"io"
 
-	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
 	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec/fiat"
 )
 
 // Sign signs digest (normally a SHA-256 hash) and returns a raw r||s
@@ -56,13 +56,14 @@ func (k *PublicKey) VerifyMessage(msg, sig []byte) bool {
 }
 
 func bits2octets(digest []byte) []byte {
-	e := bigmod.NewNat()
-	hashToNat(e, digest)
-	return e.Bytes(n())
+	e := hashToScalar(digest).Bytes()
+	return e[:]
 }
 
+// The scalar arithmetic below is fiat.P256Scalar's: fixed size and free of
+// heap allocations, which bigmod makes on TinyGo for every multiplication.
+
 func sign(k *PrivateKey, drbg *hmacDRBG, digest []byte) ([]byte, error) {
-	N := n()
 	kk, R, err := randomScalar(func(b []byte) error {
 		drbg.Generate(b)
 		return nil
@@ -71,67 +72,64 @@ func sign(k *PrivateKey, drbg *hmacDRBG, digest []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	kInv := bigmod.NewNat().Exp(kk, nMinus2, N)
+	kInv := new(fiat.P256Scalar).Invert(kk)
 
 	Rx, err := R.BytesX()
 	if err != nil {
 		return nil, err
 	}
-	r, err := bigmod.NewNat().SetOverflowingBytes(Rx, N)
-	if err != nil {
-		return nil, err
-	}
+	r := new(fiat.P256Scalar).SetReducedBytes((*[ScalarSize]byte)(Rx))
 	if r.IsZero() == 1 {
 		return nil, errors.New("p256: internal error: r is zero")
 	}
 
-	e := bigmod.NewNat()
-	hashToNat(e, digest)
+	e := hashToScalar(digest)
 
-	s, err := bigmod.NewNat().SetBytes(k.d[:], N)
+	s, err := new(fiat.P256Scalar).SetBytes(k.d[:])
 	if err != nil {
 		return nil, err
 	}
-	s.Mul(r, N)
-	s.Add(e, N)
-	s.Mul(kInv, N)
+	s.Mul(s, r)
+	s.Add(s, e)
+	s.Mul(s, kInv)
 	if s.IsZero() == 1 {
 		return nil, errors.New("p256: internal error: s is zero")
 	}
 
+	rb, sb := r.Bytes(), s.Bytes()
 	sig := make([]byte, 0, SignatureSize)
-	sig = append(sig, r.Bytes(N)...)
-	return append(sig, s.Bytes(N)...), nil
+	sig = append(sig, rb[:]...)
+	return append(sig, sb[:]...), nil
 }
 
 func verify(pub *PublicKey, digest, sig []byte) error {
 	if len(sig) != SignatureSize {
 		return errors.New("p256: invalid signature length")
 	}
-	N := n()
 	Q, err := nistec.NewP256Point().SetBytes(pub.q[:])
 	if err != nil {
 		return err
 	}
-	r, err := bigmod.NewNat().SetBytes(sig[:ScalarSize], N)
+	r, err := new(fiat.P256Scalar).SetBytes(sig[:ScalarSize])
 	if err != nil || r.IsZero() == 1 {
 		return errors.New("p256: invalid signature")
 	}
-	s, err := bigmod.NewNat().SetBytes(sig[ScalarSize:], N)
+	s, err := new(fiat.P256Scalar).SetBytes(sig[ScalarSize:])
 	if err != nil || s.IsZero() == 1 {
 		return errors.New("p256: invalid signature")
 	}
 
-	e := bigmod.NewNat()
-	hashToNat(e, digest)
+	e := hashToScalar(digest)
 
-	w := bigmod.NewNat().Exp(s, nMinus2, N)
+	w := new(fiat.P256Scalar).Invert(s)
 
-	p1, err := nistec.NewP256Point().ScalarBaseMult(e.Mul(w, N).Bytes(N))
+	u1 := new(fiat.P256Scalar).Mul(e, w).Bytes()
+	p1, err := nistec.NewP256Point().ScalarBaseMult(u1[:])
 	if err != nil {
 		return err
 	}
-	p2, err := Q.ScalarMult(Q, w.Mul(r, N).Bytes(N))
+	u2 := new(fiat.P256Scalar).Mul(r, w).Bytes()
+	p2, err := Q.ScalarMult(Q, u2[:])
 	if err != nil {
 		return err
 	}
@@ -139,24 +137,22 @@ func verify(pub *PublicKey, digest, sig []byte) error {
 	if err != nil {
 		return err
 	}
-	v, err := bigmod.NewNat().SetOverflowingBytes(Rx, N)
-	if err != nil {
-		return err
-	}
+	v := new(fiat.P256Scalar).SetReducedBytes((*[ScalarSize]byte)(Rx))
 	if v.Equal(r) != 1 {
 		return errors.New("p256: signature did not verify")
 	}
 	return nil
 }
 
-// hashToNat sets e to the left-most bits of hash, as specified in SEC 1,
-// Section 4.1.3, Step 5 and Section 4.1.4, Step 3. For P-256 the order is
-// exactly 256 bits, so no bit shifting is needed.
-func hashToNat(e *bigmod.Nat, hash []byte) {
+// hashToScalar returns the left-most bits of hash as a scalar, as specified
+// in SEC 1, Section 4.1.3, Step 5 and Section 4.1.4, Step 3. For P-256 the
+// order is exactly 256 bits, so no bit shifting is needed, and a 256-bit
+// value is below 2n, so one reduction suffices.
+func hashToScalar(hash []byte) *fiat.P256Scalar {
 	if len(hash) > ScalarSize {
 		hash = hash[:ScalarSize]
 	}
-	if _, err := e.SetOverflowingBytes(hash, n()); err != nil {
-		panic("p256: internal error: truncated hash is too long")
-	}
+	var b [ScalarSize]byte
+	copy(b[ScalarSize-len(hash):], hash)
+	return new(fiat.P256Scalar).SetReducedBytes(&b)
 }

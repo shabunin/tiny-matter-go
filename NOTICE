@@ -10,6 +10,12 @@ It includes software from other projects:
   Used in crypto/internal/ (nistec, fiat, bigmod) and in the files of
   crypto/p256/ that carry The Go Authors' copyright header.
 
+* Fiat Cryptography (https://github.com/mit-plv/fiat-crypto), MIT OR
+  Apache-2.0 OR BSD-1-Clause license, Copyright the fiat-crypto authors.
+  crypto/internal/nistec/fiat/p256scalar_fiat64.go is its generated P-256
+  scalar arithmetic with the identifiers renamed (Go's p256_fiat64.go, from
+  the same project, comes with the Go code above).
+
 * connectedhomeip, the Matter SDK (https://github.com/project-chip/connectedhomeip),
   Apache License 2.0, Copyright Project CHIP Authors.
   credentials/devcreds/ holds its public development attestation credentials

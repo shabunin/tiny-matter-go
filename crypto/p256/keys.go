@@ -4,8 +4,8 @@ import (
 	"errors"
 	"io"
 
-	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
 	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec/fiat"
 )
 
 // PrivateKey is a P-256 private key, usable for both ECDSA and ECDH.
@@ -26,7 +26,7 @@ func GenerateKey(rand io.Reader) (*PrivateKey, error) {
 		return nil, err
 	}
 	priv := &PrivateKey{}
-	copy(priv.d[:], k.Bytes(n()))
+	priv.d = k.Bytes()
 	copy(priv.pub.q[:], Q.Bytes())
 	return priv, nil
 }
@@ -37,7 +37,7 @@ func NewPrivateKey(d []byte) (*PrivateKey, error) {
 	if len(d) != ScalarSize {
 		return nil, errInvalidKey
 	}
-	k, err := bigmod.NewNat().SetBytes(d, n())
+	k, err := new(fiat.P256Scalar).SetBytes(d)
 	if err != nil || k.IsZero() == 1 {
 		return nil, errInvalidKey
 	}

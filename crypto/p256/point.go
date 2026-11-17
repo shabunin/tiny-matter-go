@@ -5,6 +5,7 @@ import (
 
 	"github.com/shabunin/tiny-matter-go/crypto/internal/bigmod"
 	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec"
+	"github.com/shabunin/tiny-matter-go/crypto/internal/nistec/fiat"
 )
 
 // Point is a P-256 point, including the point at infinity. The zero value is
@@ -89,9 +90,9 @@ func RandomScalar(rand io.Reader) ([]byte, error) {
 		if err := readFull(rand)(b[:]); err != nil {
 			return nil, err
 		}
-		k, err := bigmod.NewNat().SetBytes(b[:], n())
+		k, err := new(fiat.P256Scalar).SetBytes(b[:])
 		if err == nil && k.IsZero() == 0 {
-			return k.Bytes(n()), nil
+			return b[:], nil
 		}
 	}
 }
