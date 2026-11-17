@@ -161,12 +161,10 @@ type appState struct {
 	state    []byte // the raw element
 }
 
-// persister returns the cluster on an application endpoint whose state is
-// saved, or nil.
+// persister returns the cluster whose state is saved with the application
+// state (User Label, Unit Localization... on endpoint 0, the application
+// clusters elsewhere), or nil.
 func (d *Device) persister(endpoint uint16, cluster uint32) im.Persister {
-	if endpoint == 0 {
-		return nil
-	}
 	e := d.Node.Endpoint(endpoint)
 	if e == nil {
 		return nil
@@ -186,10 +184,7 @@ func (d *Device) encodeAppState(w *tlv.Writer) {
 		}
 	}
 	for _, e := range d.Node.Endpoints() {
-		if e.ID == 0 {
-			continue
-		}
-		var ids [16]uint32
+		var ids [32]uint32
 		for _, id := range e.ClusterIDs(ids[:0]) {
 			if p, ok := e.Cluster(id).(im.Persister); ok {
 				start()
@@ -245,7 +240,7 @@ func (d *Device) decodeAppState(r *tlv.Reader) error {
 // restoreCluster restores the stored state of a cluster as it is added.
 func (d *Device) restoreCluster(endpoint uint16, c im.Cluster) {
 	p, ok := c.(im.Persister)
-	if !ok || endpoint == 0 {
+	if !ok {
 		return
 	}
 	for i, a := range d.appState {

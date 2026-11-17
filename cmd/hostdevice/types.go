@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
+	"github.com/shabunin/tiny-matter-go/clusters/unittesting"
 	"github.com/shabunin/tiny-matter-go/device"
 	"github.com/shabunin/tiny-matter-go/im"
 )
@@ -434,4 +435,44 @@ func bridgedEP(args []string, infos map[uint16]*clusters.BridgedDeviceBasicInfor
 		return 0, fmt.Errorf("%q is not a bridged endpoint", args[0])
 	}
 	return uint16(v), nil
+}
+
+// utilities adds the small utility clusters: localization, labels and a
+// mains power source on the root endpoint, and labels on endpoint 1.
+func (a *app) utilities() {
+	n, root := a.d.Node, a.d.Root
+	root.DeviceTypes = append(root.DeviceTypes, clusters.DeviceTypePowerSource)
+	n.AddCluster(root,
+		&clusters.LocalizationConfiguration{ActiveLocale: "en-US",
+			SupportedLocales: []string{"en-US", "de-DE", "fr-FR", "en-GB", "es-ES", "zh-CN", "it-IT", "ja-JP"}},
+		&clusters.TimeFormatLocalization{HourFormat: clusters.Hour24,
+			CalendarTypes: []uint8{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, ActiveCalendar: 4},
+		&clusters.UnitLocalization{TemperatureUnit: clusters.Celsius},
+		&clusters.PowerSource{Description: "Mains", Wired: true},
+		&clusters.FixedLabel{Labels: fixedLabels},
+		&clusters.UserLabel{},
+	)
+	if e := n.Endpoint(1); e != nil {
+		n.AddCluster(e,
+			&clusters.FixedLabel{Labels: fixedLabels},
+			&clusters.UserLabel{})
+	}
+}
+
+var fixedLabels = []clusters.Label{{Label: "room", Value: "bedroom 2"}, {Label: "orientation", Value: "North"},
+	{Label: "floor", Value: "2"}, {Label: "direction", Value: "up"}}
+
+// unitTesting adds the Unit Testing cluster to endpoint 1.
+func (a *app) unitTesting() {
+	e := a.d.Node.Endpoint(1)
+	if e == nil {
+		log.Fatal("-unit-testing needs a device type with endpoint 1")
+	}
+	ut := unittesting.New()
+	a.d.Node.AddCluster(e, ut)
+	removed := a.d.OpCreds.OnFabricRemoved
+	a.d.OpCreds.OnFabricRemoved = func(now time.Time, index uint8) {
+		removed(now, index)
+		ut.RemoveFabric(index)
+	}
 }

@@ -72,6 +72,7 @@ func main() {
 	testKey := flag.String("test-key", "", "hex enable key (16 bytes) for TestEventTrigger")
 	updates := flag.String("updates", "", "accept OTA software updates, keeping downloaded binaries in `dir`")
 	typ := flag.String("type", "light", "device `type`: "+kindNames())
+	unitTesting := flag.Bool("unit-testing", false, "add the Unit Testing cluster (for the SDK's YAML tests) to endpoint 1")
 	flag.Parse()
 	k, ok := kinds[*typ]
 	if !ok {
@@ -145,6 +146,10 @@ func main() {
 	cmds := make(chan string, 4)
 	a := &app{d: d, cmds: cmds}
 	k.build(a)
+	a.utilities()
+	if *unitTesting {
+		a.unitTesting()
+	}
 	groups := &groupMemberships{c: conn, joined: map[netip.Addr]bool{}}
 	d.OnMulticast = groups.set
 	groups.set(d.MulticastAddrs())
