@@ -156,6 +156,24 @@ func (n *Node) Attach(d *device.Device, offScan func() []espradio.AccessPoint) {
 		}
 		return []clusters.NetworkInterface{ni}
 	}
+	if d.WiFiDiagnostics != nil {
+		// espradio reports the RSSI only; BSSID, channel and version read
+		// as null, and the security type as unspecified unless the network
+		// is open.
+		d.WiFiDiagnostics.Status = func() clusters.WiFiStatus {
+			st := clusters.WiFiStatus{Connected: n.linkUp.Load()}
+			if !st.Connected {
+				return st
+			}
+			if len(n.nw.Credentials) == 0 {
+				st.Security = clusters.WiFiSecurityNone
+			}
+			if v, err := espradio.RSSI(); err == nil && v >= -128 && v <= 127 {
+				st.RSSI, st.HasRSSI = int8(v), true
+			}
+			return st
+		}
+	}
 	d.Net.Scan = func(ctx *im.Context, want []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
 		var aps []espradio.AccessPoint
 		if n.wifiOn {

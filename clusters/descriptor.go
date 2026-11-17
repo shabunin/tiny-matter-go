@@ -19,6 +19,8 @@ const (
 	IDGeneralCommissioning   = 0x0030
 	IDNetworkCommissioning   = 0x0031
 	IDGeneralDiagnostics     = 0x0033
+	IDSoftwareDiagnostics    = 0x0034
+	IDWiFiDiagnostics        = 0x0036
 	IDSwitch                 = 0x003B
 	IDAdminCommissioning     = 0x003C
 	IDOperationalCredentials = 0x003E

@@ -96,6 +96,12 @@ type Device struct {
 	// Diagnostics is the General Diagnostics cluster. Set its BootReason
 	// and Interfaces before the first Poll, which records the boot events.
 	Diagnostics *clusters.GeneralDiagnostics
+	// Software is the Software Diagnostics cluster, reporting the runtime's
+	// heap.
+	Software *clusters.SoftwareDiagnostics
+	// WiFiDiagnostics is the Wi-Fi Network Diagnostics cluster (nil unless
+	// Config.WiFi). Set its Status to report the association.
+	WiFiDiagnostics *clusters.WiFiNetworkDiagnostics
 	// Groups holds the group keys and memberships. Add a Groups cluster
 	// (NewGroups) to each application endpoint that groups may address.
 	Groups *clusters.GroupData
@@ -270,9 +276,10 @@ func New(cfg Config) (*Device, error) {
 
 	d.Admin = &clusters.AdminCommissioning{Open: d.adminOpen, Revoke: d.adminRevoke}
 	d.Diagnostics = &clusters.GeneralDiagnostics{}
+	d.Software = &clusters.SoftwareDiagnostics{Heap: clusters.RuntimeHeap}
 
 	d.Root = d.Node.AddEndpoint(0, clusters.DeviceTypeRootNode)
-	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Admin, d.OpCreds,
+	d.Node.AddCluster(d.Root, clusters.Descriptor{}, d.ACL, cfg.Basic, d.General, d.Diagnostics, d.Software, d.Admin, d.OpCreds,
 		&clusters.GroupKeyManagement{Data: d.Groups})
 	if cfg.WiFi || cfg.Thread {
 		d.Net = clusters.NewNetworkCommissioning(d.FailSafe, nil)
@@ -285,6 +292,10 @@ func New(cfg Config) (*Device, error) {
 			}
 		})
 		d.Node.AddCluster(d.Root, d.Net)
+		if cfg.WiFi {
+			d.WiFiDiagnostics = &clusters.WiFiNetworkDiagnostics{}
+			d.Node.AddCluster(d.Root, d.WiFiDiagnostics)
+		}
 	}
 	if cfg.Updates != nil {
 		d.enableOTA(cfg.Updates)
