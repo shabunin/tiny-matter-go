@@ -228,3 +228,42 @@ func TestYield(t *testing.T) {
 		t.Fatalf("sign+verify yielded %d times", n)
 	}
 }
+
+// TestScalarBaseMultTable checks the flash-resident base table (through
+// whichever field backend is built) against crypto/elliptic: random
+// scalars reach nearly every table entry; the edge cases cover the
+// smallest and largest scalars.
+func TestScalarBaseMultTable(t *testing.T) {
+	c := elliptic.P256()
+	N := c.Params().N
+	var scalars []*big.Int
+	for _, v := range []int64{1, 2, 3, 15, 16, 17, 31, 32, 33, 0x7F, 0xFF} {
+		scalars = append(scalars, big.NewInt(v), new(big.Int).Sub(N, big.NewInt(v)))
+	}
+	n := 300
+	if testing.Short() {
+		n = 30
+	}
+	for i := 0; i < n; i++ {
+		k, err := RandomScalar(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scalars = append(scalars, new(big.Int).SetBytes(k))
+	}
+	for _, k := range scalars {
+		kb := k.FillBytes(make([]byte, 32))
+		P, err := NewPoint().ScalarBaseMult(kb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		x, y := c.ScalarBaseMult(kb)
+		if !bytes.Equal(P.Bytes(), elliptic.Marshal(c, x, y)) {
+			t.Fatalf("ScalarBaseMult(%x) mismatch", kb)
+		}
+		Q, err := NewPoint().ScalarMult(Generator(), kb)
+		if err != nil || !bytes.Equal(Q.Bytes(), P.Bytes()) {
+			t.Fatalf("ScalarMult(G, %x) differs from ScalarBaseMult", kb)
+		}
+	}
+}
