@@ -155,15 +155,20 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 		return 0, errRange
 	}
 	configure()
-	// Words in DRAM, padded with 0xFF (which leaves flash bits alone).
-	buf := make([]uint32, (len(p)+3)/4)
+	// Through a small word buffer in DRAM, a chunk at a time (padded with
+	// 0xFF, which leaves flash bits alone): a copy of the whole blob is a
+	// large block the heap may not have.
+	var buf [chunkWords]uint32
 	b := unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), len(buf)*4)
-	for i := range b {
-		b[i] = 0xFF
-	}
-	copy(b, p)
-	if C.tmgflash_op(0, C.uint32_t(d.Offset+off), (*C.uint32_t)(unsafe.Pointer(&buf[0])), C.uint32_t(len(b))) != 0 {
-		return 0, errFlash
+	for done := 0; done < len(p); {
+		n := copy(b, p[done:])
+		for i := n; i < (n+3)&^3; i++ {
+			b[i] = 0xFF
+		}
+		if C.tmgflash_op(0, C.uint32_t(d.Offset+off+int64(done)), (*C.uint32_t)(unsafe.Pointer(&buf[0])), C.uint32_t((n+3)&^3)) != 0 {
+			return done, errFlash
+		}
+		done += n
 	}
 	return len(p), nil
 }
@@ -186,19 +191,22 @@ func (d *Device) EraseBlocks(start, n int64) error {
 	return nil
 }
 
-// readROM reads flash at addr into p, through an aligned word buffer. It
-// reports whether the ROM read it.
+// readROM reads flash at addr into p, through an aligned word buffer, a
+// chunk at a time. It reports whether the ROM read it.
 func readROM(addr uint32, p []byte) bool {
-	if len(p) == 0 {
-		return true
+	var buf [chunkWords]uint32
+	b := unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), len(buf)*4)
+	for len(p) > 0 {
+		start := addr &^ 3
+		n := min(uint32(len(b)), (addr-start+uint32(len(p))+3)&^3)
+		if C.tmgflash_op(2, C.uint32_t(start), (*C.uint32_t)(unsafe.Pointer(&buf[0])), C.uint32_t(n)) != 0 {
+			return false
+		}
+		k := copy(p, b[addr-start:n])
+		p, addr = p[k:], addr+uint32(k)
 	}
-	start := addr &^ 3
-	n := (addr - start + uint32(len(p)) + 3) &^ 3
-	buf := make([]uint32, n/4)
-	if C.tmgflash_op(2, C.uint32_t(start), (*C.uint32_t)(unsafe.Pointer(&buf[0])), C.uint32_t(n)) != 0 {
-		return false
-	}
-	b := unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), n)
-	copy(p, b[addr-start:])
 	return true
 }
+
+// chunkWords is the size of the word buffer flash data goes through.
+const chunkWords = 64

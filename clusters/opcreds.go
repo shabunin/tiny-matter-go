@@ -1,6 +1,7 @@
 package clusters
 
 import (
+	"bytes"
 	"io"
 	"time"
 
@@ -377,7 +378,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if err != nil {
 			return nocResponse(resp, NOCInvalidNOC, 0)
 		}
-		if string(id.PublicKey) != string(o.pendingKey.PublicKey().Bytes()) {
+		if !bytes.Equal(id.PublicKey, o.pendingKey.PublicKey().Bytes()) {
 			return nocResponse(resp, NOCInvalidPublicKey, 0)
 		}
 		fb, err := o.Fabrics.Add(o.pendingRoot, icac, noc, o.pendingKey, f.bytes[2], uint16(f.uints[4]))
@@ -440,7 +441,7 @@ func (o *OperationalCredentials) Invoke(ctx *im.Context, cmd uint32, r *tlv.Read
 		if id.FabricID != fb.FabricID {
 			return nocResponse(resp, NOCInvalidFabricIndex, 0)
 		}
-		if string(id.PublicKey) != string(o.pendingKey.PublicKey().Bytes()) {
+		if !bytes.Equal(id.PublicKey, o.pendingKey.PublicKey().Bytes()) {
 			return nocResponse(resp, NOCInvalidPublicKey, 0)
 		}
 		if _, err := o.Fabrics.Update(idx, icac, noc, o.pendingKey); err != nil {

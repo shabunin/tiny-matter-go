@@ -6,6 +6,7 @@
 package device
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -123,10 +124,11 @@ type Device struct {
 	windowDisc     uint16
 	windowMode     int
 	windowDeadline time.Time
-	dirty          bool   // persistent state changed since the last save
-	saved          []byte // last saved state
-	started        bool   // the boot events were recorded
-	eventLimit     uint64 // event numbers reserved in the store
+	dirty          bool     // persistent state changed since the last save
+	stateBuf       []byte   // encoding buffer, reused (see encodeState)
+	savedSum       [32]byte // SHA-256 of the last saved state
+	started        bool     // the boot events were recorded
+	eventLimit     uint64   // event numbers reserved in the store
 	// Application cluster state (im.Persister): stored entries not yet
 	// restored into a cluster, and when changed state is next saved.
 	appState   []appState
@@ -328,7 +330,7 @@ func New(cfg Config) (*Device, error) {
 		} else if n := d.Fabrics.Committed(); n > 0 {
 			d.log("restored " + strconv.Itoa(n) + " fabric(s)")
 		}
-		d.saved = d.encodeState()
+		d.savedSum = sha256.Sum256(d.encodeState())
 		// Event numbers continue past those reserved before the restart,
 		// and the reboot is counted; both are saved now.
 		d.eventLimit = d.Node.Events.Start(d.eventLimit)

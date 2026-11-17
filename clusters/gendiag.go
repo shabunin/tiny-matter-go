@@ -1,6 +1,7 @@
 package clusters
 
 import (
+	"bytes"
 	"net/netip"
 	"time"
 
@@ -185,7 +186,7 @@ func (g *GeneralDiagnostics) Invoke(ctx *im.Context, cmd uint32, r *tlv.Reader, 
 		}
 		// A key that does not enable triggers is a constraint error,
 		// as in the SDK.
-		if !g.enabled() || string(key) != string(g.EnableKey[:]) {
+		if !g.enabled() || !bytes.Equal(key, g.EnableKey[:]) {
 			return im.ConstraintError
 		}
 		if g.Trigger == nil {

@@ -4,6 +4,7 @@
 package fabric
 
 import (
+	"bytes"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
@@ -138,7 +139,7 @@ func (t *Table) Add(rcac, icac, noc []byte, key *p256.PrivateKey, ipk []byte, ve
 		return nil, err
 	}
 	for _, f := range t.fabrics {
-		if f.FabricID == id.FabricID && string(f.RootPublicKey) == string(id.RootPublic) {
+		if f.FabricID == id.FabricID && bytes.Equal(f.RootPublicKey, id.RootPublic) {
 			return nil, ErrConflict
 		}
 	}

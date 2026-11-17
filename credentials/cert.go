@@ -4,6 +4,7 @@
 package credentials
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"strconv"
@@ -717,7 +718,7 @@ func checkIssued(c, issuer *Cert) error {
 	if !dnEqual(c.Issuer, issuer.Subject) {
 		return ErrCertChain
 	}
-	if c.AuthorityKeyID != nil && issuer.SubjectKeyID != nil && string(c.AuthorityKeyID) != string(issuer.SubjectKeyID) {
+	if c.AuthorityKeyID != nil && issuer.SubjectKeyID != nil && !bytes.Equal(c.AuthorityKeyID, issuer.SubjectKeyID) {
 		return ErrCertChain
 	}
 	return c.VerifySignature(issuer.PublicKey)

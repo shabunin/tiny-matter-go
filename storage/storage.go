@@ -18,7 +18,8 @@ type Store interface {
 	// Load returns the last saved blob, or nil if there is none.
 	Load() ([]byte, error)
 	// Save replaces the blob. After a crash, Load returns either the old or
-	// the new blob, never a mix.
+	// the new blob, never a mix. It must not keep b, which the caller
+	// reuses.
 	Save(b []byte) error
 }
 

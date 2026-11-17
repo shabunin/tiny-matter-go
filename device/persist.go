@@ -2,6 +2,7 @@ package device
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"time"
 
@@ -34,9 +35,13 @@ const stateVersion = 1
 
 var errState = errors.New("device: malformed stored state")
 
-// encodeState serializes committed fabrics and their ACL entries.
+// encodeState serializes committed fabrics and their ACL entries, into a
+// buffer that is kept and reused: the result is valid until the next call.
+// A state of a few KB is the largest block the device needs, and a small,
+// fragmented heap may not have one later, so it is allocated once, early,
+// with room to grow.
 func (d *Device) encodeState() []byte {
-	w := tlv.NewWriter(make([]byte, 0, 1024))
+	w := tlv.NewWriter(d.stateBuf[:0])
 	w.StartStruct(tlv.Anonymous)
 	w.PutUint(tlv.ContextTag(1), stateVersion)
 	w.PutUint(tlv.ContextTag(2), uint64(d.Fabrics.LastIndex()))
@@ -107,8 +112,17 @@ func (d *Device) encodeState() []byte {
 		})
 	}
 	w.EndContainer()
-	return w.Bytes()
+	b := w.Bytes()
+	if cap(b) < len(b)+stateSlack/2 {
+		b = append(make([]byte, 0, len(b)+stateSlack), b...)
+	}
+	d.stateBuf = b
+	return b
 }
+
+// stateSlack is the room left in the state buffer for it to grow (more
+// fabrics, ACL entries, resumption records) without a new allocation.
+const stateSlack = 1024
 
 // decodeBasic restores Basic Information's NodeLabel and Location.
 func (d *Device) decodeBasic(r *tlv.Reader) error {
@@ -415,14 +429,15 @@ func (d *Device) save() {
 		return
 	}
 	b := d.encodeState()
-	if string(b) == string(d.saved) {
+	sum := sha256.Sum256(b)
+	if sum == d.savedSum {
 		return
 	}
 	if err := d.cfg.Store.Save(b); err != nil {
 		d.log("saving state failed: " + err.Error())
 		return
 	}
-	d.saved = b
+	d.savedSum = sum
 	d.log("state saved")
 }
 
