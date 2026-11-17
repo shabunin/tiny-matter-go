@@ -87,6 +87,32 @@ func TestSDKVectors(t *testing.T) {
 	if _, err := ValidateNOCChain(bad, vec["ICA01"]["Chip"], vec["Root01"]["Chip"]); err == nil {
 		t.Fatal("bad signature accepted")
 	}
+
+	// The CASE peer variant gives the same identity, remembering the NOC's
+	// and ICAC's signatures; what it remembers lets no other certificate
+	// through.
+	var cache SignatureCache
+	for i := 0; i < 2; i++ {
+		got, err := ValidatePeerNOCChain(vec["Node01_01"]["Chip"], vec["ICA01"]["Chip"], vec["Root01"]["Chip"], &cache)
+		if err != nil || got.NodeID != id.NodeID || got.FabricID != id.FabricID || !bytes.Equal(got.PublicKey, id.PublicKey) {
+			t.Fatalf("peer chain, pass %d: %+v %v", i, got, err)
+		}
+	}
+	if cache.n != 2 {
+		t.Fatalf("%d signatures cached, want the ICAC's and the NOC's", cache.n)
+	}
+	if _, err := ValidatePeerNOCChain(bad, vec["ICA01"]["Chip"], vec["Root01"]["Chip"], &cache); err == nil {
+		t.Fatal("bad signature accepted with the good one cached")
+	}
+	if _, err := ValidatePeerNOCChain(vec["Node01_01"]["Chip"], vec["ICA01"]["Chip"], vec["Root02"]["Chip"], &cache); err == nil {
+		t.Fatal("cached chain accepted under another root")
+	}
+	if _, err := ValidatePeerNOCChain(vec["Node01_02"]["Chip"], nil, vec["Root01"]["Chip"], &cache); err != nil {
+		t.Fatalf("a NOC issued by the root itself: %v", err)
+	}
+	if cache.n != 3 {
+		t.Fatalf("%d signatures cached after a second NOC", cache.n)
+	}
 }
 
 func TestSignatureDER(t *testing.T) {

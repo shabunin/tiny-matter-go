@@ -46,6 +46,10 @@ type Fabric struct {
 	// yet committed by CommissioningComplete.
 	Pending bool
 
+	// PeerCerts remembers the signatures of CASE peers' certificates that
+	// verified under this fabric's root (credentials.ValidatePeerNOCChain).
+	PeerCerts credentials.SignatureCache
+
 	// prev holds the committed credentials while an UpdateNOC is pending.
 	prev *creds
 }

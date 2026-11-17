@@ -221,7 +221,7 @@ func (h *responderHandshake) onSigma3(now time.Time, ex *exchange.Exchange, payl
 	if t.resumptionID != nil {
 		return ErrPeerCert
 	}
-	id, err := credentials.ValidateNOCChain(t.noc, t.icac, f.RCAC)
+	id, err := credentials.ValidatePeerNOCChain(t.noc, t.icac, f.RCAC, &f.PeerCerts)
 	if err != nil || id.FabricID != f.FabricID {
 		return ErrPeerCert
 	}

@@ -659,6 +659,60 @@ func validNOCEKU(eku []uint8) bool {
 // against the trusted root certificate, all in Matter TLV form. Validity
 // periods are not checked: devices commonly lack a trusted clock.
 func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
+	return validateNOCChain(noc, icac, root, nil)
+}
+
+// ValidatePeerNOCChain validates the NOC chain a CASE peer presents, as
+// ValidateNOCChain does, except that root is taken as trusted (it is the
+// fabric's own root, checked when it was installed) and that signatures
+// cache holds are not verified again; those that verify are added. A
+// controller's NOC and ICAC are the same at every handshake, so repeated
+// handshakes check one signature (the peer's Sigma) instead of four.
+func ValidatePeerNOCChain(noc, icac, root []byte, cache *SignatureCache) (*OperationalIdentity, error) {
+	if cache == nil {
+		cache = &SignatureCache{}
+	}
+	return validateNOCChain(noc, icac, root, cache)
+}
+
+// SignatureCache remembers certificates whose signature verified, as a
+// hash of the issuer's public key and the certificate. The zero value is
+// ready to use; it is not safe for concurrent use.
+type SignatureCache struct {
+	sums [signatureCacheSize][sha256.Size]byte
+	n    int // entries in use
+	next int // the entry replaced next
+}
+
+const signatureCacheSize = 6
+
+func signatureKey(issuerKey, cert []byte) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write(issuerKey)
+	h.Write(cert)
+	var k [sha256.Size]byte
+	h.Sum(k[:0])
+	return k
+}
+
+func (c *SignatureCache) has(k [sha256.Size]byte) bool {
+	for i := 0; i < c.n; i++ {
+		if c.sums[i] == k {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *SignatureCache) add(k [sha256.Size]byte) {
+	c.sums[c.next] = k
+	c.next = (c.next + 1) % signatureCacheSize
+	c.n = min(c.n+1, signatureCacheSize)
+}
+
+// validateNOCChain checks the chain; with a cache, the root is trusted and
+// cached signatures are not verified again.
+func validateNOCChain(noc, icac, root []byte, cache *SignatureCache) (*OperationalIdentity, error) {
 	rc, err := DecodeCert(root)
 	if err != nil {
 		return nil, err
@@ -666,8 +720,10 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	if _, ok := rc.Subject.Get(DNMatterRCACID); !ok || !rc.IsCA || rc.KeyUsage&KeyUsageKeyCertSign == 0 || !dnEqual(rc.Issuer, rc.Subject) {
 		return nil, ErrCertChain
 	}
-	if err := rc.VerifySignature(rc.PublicKey); err != nil {
-		return nil, err
+	if cache == nil {
+		if err := rc.VerifySignature(rc.PublicKey); err != nil {
+			return nil, err
+		}
 	}
 	issuer := rc
 	if icac != nil {
@@ -681,7 +737,7 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 		if _, ok := ic.Subject.Get(DNMatterICACID); !ok || !ic.IsCA || ic.KeyUsage&KeyUsageKeyCertSign == 0 {
 			return nil, ErrCertChain
 		}
-		if err := checkIssued(ic, rc); err != nil {
+		if err := checkIssued(ic, icac, rc, cache); err != nil {
 			return nil, err
 		}
 		issuer = ic
@@ -693,7 +749,7 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	if nc.IsCA || nc.KeyUsage&KeyUsageDigitalSignature == 0 || !validNOCEKU(nc.ExtKeyUsage) {
 		return nil, ErrCertChain
 	}
-	if err := checkIssued(nc, issuer); err != nil {
+	if err := checkIssued(nc, noc, issuer, cache); err != nil {
 		return nil, err
 	}
 	id := &OperationalIdentity{PublicKey: nc.PublicKey, RootPublic: rc.PublicKey, CATs: nc.Subject.CATs()}
@@ -713,15 +769,27 @@ func ValidateNOCChain(noc, icac, root []byte) (*OperationalIdentity, error) {
 	return id, nil
 }
 
-// checkIssued checks that c was issued and signed by issuer.
-func checkIssued(c, issuer *Cert) error {
+// checkIssued checks that c (encoded as raw) was issued and signed by
+// issuer, skipping a signature cache holds (if cache is not nil).
+func checkIssued(c *Cert, raw []byte, issuer *Cert, cache *SignatureCache) error {
 	if !dnEqual(c.Issuer, issuer.Subject) {
 		return ErrCertChain
 	}
 	if c.AuthorityKeyID != nil && issuer.SubjectKeyID != nil && !bytes.Equal(c.AuthorityKeyID, issuer.SubjectKeyID) {
 		return ErrCertChain
 	}
-	return c.VerifySignature(issuer.PublicKey)
+	if cache == nil {
+		return c.VerifySignature(issuer.PublicKey)
+	}
+	k := signatureKey(issuer.PublicKey, raw)
+	if cache.has(k) {
+		return nil
+	}
+	if err := c.VerifySignature(issuer.PublicKey); err != nil {
+		return err
+	}
+	cache.add(k)
+	return nil
 }
 
 func dnEqual(a, b DN) bool {

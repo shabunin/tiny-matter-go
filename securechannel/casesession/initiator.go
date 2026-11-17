@@ -178,7 +178,7 @@ func (in *initiator) onSigma2(now time.Time, ex *exchange.Exchange, payload []by
 		return errMessage
 	}
 	in.resumptionID = append([]byte{}, t.resumptionID...)
-	id, err := credentials.ValidateNOCChain(t.noc, t.icac, f.RCAC)
+	id, err := credentials.ValidatePeerNOCChain(t.noc, t.icac, f.RCAC, &f.PeerCerts)
 	if err != nil || id.FabricID != f.FabricID || id.NodeID != in.cfg.PeerNodeID {
 		return ErrPeerCert
 	}
