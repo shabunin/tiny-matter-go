@@ -3,15 +3,17 @@
 package main
 
 import (
+	tinydev "device"
 	"device/esp"
-	"image/color"
 	"machine"
+	"runtime/interrupt"
+	"runtime/volatile"
 	"time"
+	"unsafe"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/shabunin/tiny-matter-go/device"
 	"github.com/shabunin/tiny-matter-go/tlv"
-	"tinygo.org/x/drivers/ws2812"
 )
 
 // M5Stack Core with the M5GO base: an Extended Color Light on the base's
@@ -55,7 +57,6 @@ type light struct {
 	level *clusters.LevelControl
 	color *clusters.ColorControl
 
-	strip   ws2812.Device
 	changed bool
 	rgb     [3]uint8
 	shown   [3]uint8
@@ -123,7 +124,8 @@ func newApp(d *device.Device) func(now time.Time) {
 		&clusters.Identify{Type: clusters.IdentifyNone}, d.NewBinding())
 
 	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	l.strip = ws2812.NewWS2812(ledPin)
+	ledPin.Low()
+	busyWait(tReset)
 	l.show([3]uint8{0, 0, 8}) // dim blue: starting
 	machine.InitADC()
 	l.knob = machine.ADC{Pin: knobPin}
@@ -278,12 +280,59 @@ func (l *light) render(now time.Time) {
 	}
 }
 
-func (l *light) show(c [3]uint8) {
-	var px [numLEDs]color.RGBA
-	for i := range px {
-		px[i] = color.RGBA{R: c[0], G: c[1], B: c[2]}
+func ccount() uint32 { return uint32(tinydev.AsmFull("rsr {}, CCOUNT", nil)) }
+
+// SK6812 timing in CPU cycles at 160 MHz (6.25 ns per cycle).
+const (
+	t0High = 52        // 0.325 us (SK6812: 0.30 ± 0.15 us)
+	t1High = 112       // 0.70 us  (SK6812: 0.60 ± 0.15 us)
+	tBit   = 200       // 1.25 us
+	tReset = 300 * 240 // >= 300 us latch (450 us at 160 MHz)
+)
+
+func busyWait(cycles uint32) {
+	start := ccount()
+	for ccount()-start < cycles {
 	}
-	l.strip.WriteColors(px[:])
+}
+
+// writeStrip sends the same GRB colour to all numLEDs SK6812 pixels, timing
+// bits with the CPU cycle counter. Marked noinline so show's two passes run
+// the exact same flash addresses and the second pass hits warm ICache.
+//
+//go:noinline
+func writeStrip(c [3]uint8) {
+	set, setMask := ledPin.PortMaskSet()
+	clr, clrMask := ledPin.PortMaskClear()
+	setReg := (*volatile.Register32)(unsafe.Pointer(set))
+	clrReg := (*volatile.Register32)(unsafe.Pointer(clr))
+	data := uint32(c[1])<<16 | uint32(c[0])<<8 | uint32(c[2]) // GRB
+	state := interrupt.Disable()
+	for p := 0; p < numLEDs; p++ {
+		for i := 23; i >= 0; i-- {
+			high := uint32(t0High)
+			if data>>uint(i)&1 != 0 {
+				high = t1High
+			}
+			start := ccount()
+			setReg.Set(setMask)
+			for ccount()-start < high {
+			}
+			clrReg.Set(clrMask)
+			for ccount()-start < tBit {
+			}
+		}
+	}
+	interrupt.Restore(state)
+}
+
+func (l *light) show(c [3]uint8) {
+	// Code runs from flash XIP: the first pass may stall on ICache misses
+	// and stretch a pulse (lighting LED 0 green); the second runs hot from
+	// ICache after a > 300 us latch pause and overwrites any glitch.
+	writeStrip(c)
+	busyWait(tReset)
+	writeStrip(c)
 	l.shown, l.drawn = c, true
 }
 
