@@ -67,7 +67,8 @@ func main() {
 	addr := flag.String("listen", "[::]:5540", "UDP listen address")
 	passcode := flag.Uint("passcode", 20202021, "setup passcode")
 	discriminator := flag.Uint("discriminator", 3840, "discriminator")
-	mdns := flag.Bool("mdns", true, "advertise with avahi-publish")
+	mdnsEnabled := flag.Bool("mdns", true, "advertise and resolve via mDNS")
+	mdnsBackend := flag.String("mdns-backend", "auto", "mDNS backend: auto, builtin or avahi")
 	state := flag.String("state", "", "file keeping fabrics and the ACL across restarts")
 	testKey := flag.String("test-key", "", "hex enable key (16 bytes) for TestEventTrigger")
 	updates := flag.String("updates", "", "accept OTA software updates, keeping downloaded binaries in `dir`")
@@ -122,17 +123,19 @@ func main() {
 		Log:        func(msg string) { log.Print(msg) },
 		Clock:      time.Now,
 	}
-	var avahi *avahiAdvertiser
-	if *mdns {
-		avahi = newAvahiAdvertiser()
-		cfg.Advertiser = avahi
-		// Bound nodes (and OTA providers) are found with avahi-browse.
-		cfg.Resolve = (&avahiResolver{}).Resolve
+	var hmdns *hostMDNS
+	if *mdnsEnabled {
+		hmdns, err = startHostMDNS(*mdnsBackend)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg.Advertiser = hmdns.advertiser
+		cfg.Resolve = hmdns.resolve
 	}
 	if *updates != "" {
 		cfg.Updates = &binaryUpdates{dir: *updates, beforeExec: func() {
-			if avahi != nil {
-				avahi.Advertise(nil)
+			if hmdns != nil {
+				hmdns.close()
 			}
 		}}
 	}
@@ -205,9 +208,15 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	for {
 		var timer <-chan time.Time
-		deadline := d.Poll(time.Now())
-		if t := a.poll(time.Now()); !t.IsZero() {
+		now := time.Now()
+		deadline := d.Poll(now)
+		if t := a.poll(now); !t.IsZero() {
 			deadline = earliest(deadline, t)
+		}
+		if hmdns != nil {
+			if t := hmdns.poll(now); !t.IsZero() {
+				deadline = earliest(deadline, t)
+			}
 		}
 		if !deadline.IsZero() {
 			timer = time.After(time.Until(deadline))
@@ -223,6 +232,9 @@ func main() {
 			}
 		case <-timer:
 		case sig := <-stop:
+			if hmdns != nil {
+				hmdns.close()
+			}
 			d.Flush()
 			log.Printf("%v: stopping", sig)
 			return

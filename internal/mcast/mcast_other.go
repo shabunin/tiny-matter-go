@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !unix
 
 // Package mcast sends UDP datagrams to IPv6 multicast addresses on hosts.
 package mcast

@@ -13,6 +13,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/crypto/p256"
 	"github.com/shabunin/tiny-matter-go/crypto/spake2p"
 	"github.com/shabunin/tiny-matter-go/device"
+	"github.com/shabunin/tiny-matter-go/dnssd"
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/ota"
 )
@@ -182,4 +183,59 @@ func TestCommands(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSanitizeHostLabel(t *testing.T) {
+	cases := map[string]string{
+		"my-host.local":      "my-host",
+		"macbook_pro.lan":    "macbookpro",
+		"192.168.1.50":       "hostdevice",
+		"---":                "hostdevice",
+		"":                   "hostdevice",
+		"Host123":            "Host123",
+		"-leading-trailing-": "leading-trailing",
+	}
+	for in, want := range cases {
+		if got := sanitizeHostLabel(in); got != want {
+			t.Errorf("sanitizeHostLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSelectMDNSBackend(t *testing.T) {
+	if got, err := selectMDNSBackend("builtin"); err != nil || got != "builtin" {
+		t.Fatalf("builtin: (%q, %v)", got, err)
+	}
+	if got, err := selectMDNSBackend("avahi"); err != nil || got != "avahi" {
+		t.Fatalf("avahi: (%q, %v)", got, err)
+	}
+	if got, err := selectMDNSBackend("auto"); err != nil || (got != "avahi" && got != "builtin") {
+		t.Fatalf("auto: (%q, %v)", got, err)
+	}
+	if _, err := selectMDNSBackend("bogus"); err == nil {
+		t.Fatal("expected error for unknown backend")
+	}
+}
+
+func TestBuiltinMDNSLifecycle(t *testing.T) {
+	h, err := startHostMDNS("builtin")
+	if err != nil {
+		t.Fatalf("startHostMDNS(builtin): %v", err)
+	}
+	defer h.close()
+
+	h.advertiser.Advertise([]dnssd.Service{{
+		Instance: "TEST1234",
+		Type:     "_matterc._udp",
+		Subtypes: []string{"_L3840", "_S15"},
+		Port:     5540,
+		TXT:      []string{"D=3840", "CM=1"},
+	}})
+	now := time.Now()
+	if next := h.poll(now); next.IsZero() {
+		t.Fatal("expected follow-up announcement schedule")
+	}
+	// Idempotent close (sends goodbyes and stops reader goroutines).
+	h.close()
+	h.close()
 }

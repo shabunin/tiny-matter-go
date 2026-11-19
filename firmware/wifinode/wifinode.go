@@ -1,9 +1,9 @@
 // Package wifinode runs a Matter device over Wi-Fi on an ESP32 (classic
-// or S3) with espradio: it joins the network, runs IPv6 (link-local) and
-// IPv4 (DHCP) stacks, advertises the node with mDNS on both, finds other
-// nodes for the device, joins its group addresses and feeds it Matter
-// messages. The firmware creates the device with the node's Transport,
-// Advertiser and Resolve, then calls Join and Run.
+// or S3) with espradio: it joins the network, runs IPv6 (link-local and
+// SLAAC) and IPv4 (DHCP) stacks, advertises the node with mDNS on both,
+// finds other nodes for the device, joins its group addresses and feeds it
+// Matter messages. The firmware creates the device with the node's
+// Transport, Advertiser and Resolve, then calls Join and Run.
 package wifinode
 
 import (
@@ -149,7 +149,7 @@ func (n *Node) Attach(d *device.Device, offScan func() []espradio.AccessPoint) {
 		ni := clusters.NetworkInterface{Name: "wlan0", Operational: n.linkUp.Load(),
 			HardwareAddress: n.MAC[:], Type: clusters.InterfaceWiFi}
 		if n.s6 != nil {
-			ni.IPv6 = []netip.Addr{n.s6.Addr()}
+			ni.IPv6 = n.s6.Addrs()
 		}
 		if n.ipv4.IsValid() {
 			ni.IPv4 = []netip.Addr{n.ipv4}
@@ -293,17 +293,28 @@ func (n *Node) Run(poll func(now time.Time)) {
 	}
 	setGroups(d.MulticastAddrs())
 	d.OnMulticast = setGroups
+	updateAddrs := func() {
+		addrs := s6.Addrs()
+		if n.ipv4.IsValid() {
+			addrs = append(addrs, n.ipv4)
+		}
+		resp.SetAddrs(addrs)
+	}
+	s6.StartSLAAC(func() {
+		for _, a := range s6.Addrs()[1:] {
+			n.log("ipv6 address " + a.String())
+		}
+		updateAddrs()
+	})
 	s4.StartDHCP(HexMAC(n.MAC), func(p netip.Prefix, gw netip.Addr) {
-		addrs := []netip.Addr{s6.Addr()}
 		n.ipv4 = netip.Addr{}
 		if p.IsValid() {
 			n.log("ipv4 address " + p.String() + " gateway " + gw.String())
-			addrs = append(addrs, p.Addr())
 			n.ipv4 = p.Addr()
 		} else {
 			n.log("ipv4 address lost")
 		}
-		resp.SetAddrs(addrs)
+		updateAddrs()
 	})
 	n.Transport.ip = net
 	n.Advertiser.r = resp
@@ -317,8 +328,9 @@ func (n *Node) Run(poll func(now time.Time)) {
 	n.nodes = mdns.NewNodeResolver(func(dst netip.AddrPort, b []byte) error {
 		return net.sendUDP(mdns.Port, dst, b)
 	}, func(netip.AddrPort) string { return "wlan0" })
-	// The IPv6 stack has only its link-local address.
-	n.nodes.Usable = func(a netip.Addr) bool { return a.Is4() || a.IsLinkLocalUnicast() }
+	n.nodes.Usable = func(a netip.Addr) bool {
+		return a.Is4() || a.IsLinkLocalUnicast() || s6.HasGlobal()
+	}
 	onMDNS := func(src netip.AddrPort, dst netip.Addr, b []byte) {
 		n.nMDNS++
 		now := time.Now()
@@ -360,12 +372,14 @@ func (n *Node) Run(poll func(now time.Time)) {
 		}
 		if n.rejoin.Swap(false) {
 			s6.ReportGroups()
+			s6.SolicitRouter()
 			s4.ReportGroups()
 			s4.RenewDHCP()
 			resp.Reannounce()
 		}
 		d.Poll(now)
 		resp.Poll(now)
+		s6.Poll(now)
 		s4.Poll(now)
 		if poll != nil {
 			poll(now)

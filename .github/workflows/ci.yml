@@ -46,10 +46,13 @@ jobs:
       - name: Test host-runnable firmware packages (including ESP32-S3 OTA sim)
         run: make test-firmware
 
-      - name: Build host binaries
+      - name: Build host binaries (Linux, macOS, Windows)
         run: |
-          go build -o /dev/null ./cmd/hostdevice
-          go build -o /dev/null ./cmd/tmctl
+          for pair in "linux amd64" "darwin arm64" "darwin amd64" "windows amd64"; do
+            set -- $pair
+            GOOS=$1 GOARCH=$2 go build -o /dev/null ./cmd/hostdevice
+            GOOS=$1 GOARCH=$2 go build -o /dev/null ./cmd/tmctl
+          done
 
       - name: Vet probe module
         run: cd probe && go vet ./crypto ./devicesize ./hello ./onchip ./p256time ./stackcheck ./tlvcheck

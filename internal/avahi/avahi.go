@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/shabunin/tiny-matter-go/dnssd"
 )
@@ -57,7 +56,7 @@ func (a *Advertiser) Advertise(svcs []dnssd.Service) {
 		args = append(args, s.Instance, s.Type, strconv.Itoa(int(s.Port)))
 		args = append(args, s.TXT...)
 		cmd := exec.Command("avahi-publish", args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
+		setPdeathsig(cmd)
 		if err := cmd.Start(); err != nil {
 			a.log("avahi-publish: " + err.Error())
 			continue

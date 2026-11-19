@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 
 	"github.com/shabunin/tiny-matter-go/ota"
 )
@@ -82,5 +81,5 @@ func (b *binaryUpdates) Apply() error {
 	if b.beforeExec != nil {
 		b.beforeExec()
 	}
-	return syscall.Exec(b.ready, append([]string{b.ready}, os.Args[1:]...), os.Environ())
+	return execSelf(b.ready, os.Args[1:])
 }
