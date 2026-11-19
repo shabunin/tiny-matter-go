@@ -2,9 +2,9 @@ PKGS := ./...  # this module only; firmware/ and probe/ are separate modules
 QEMU_TARGET := probe/qemu-m3-big.json
 FUZZTIME ?= 60s
 
-.PHONY: test test-race test32 test-firmware tinygo-test fuzz fuzz-smoke cross build-firmware verify-esp32s3-ota bench-qemu all
+.PHONY: test test-race test32 test-firmware tinygo-test fuzz fuzz-smoke cross build-firmware verify-esp32s3-ota verify-esp32-ota bench-qemu all
 
-all: test test-race test32 test-firmware tinygo-test cross build-firmware verify-esp32s3-ota
+all: test test-race test32 test-firmware tinygo-test cross build-firmware verify-esp32s3-ota verify-esp32-ota
 
 test:
 	go vet $(PKGS)
@@ -52,6 +52,7 @@ cross:
 build-firmware:
 	cd firmware && tinygo build -target ./esp32s3-loader/target.json -o /dev/null ./esp32s3-loader
 	cd firmware && tinygo build -target esp32s3-generic -stack-size=12KB -o /dev/null ./esp32s3-light
+	cd firmware && tinygo build -target ./esp32-loader/target.json -o /dev/null ./esp32-loader
 	cd firmware && tinygo build -target m5stack -stack-size=10KB -o /dev/null ./esp32-node
 	cd firmware && tinygo build -target m5stick-c -stack-size=10KB -o /dev/null ./esp32-node
 
@@ -72,6 +73,27 @@ verify-esp32s3-ota:
 	go run ./cmd/tmctl ota-info "$$tmp/app-2.ota"; \
 	(cd firmware && TMG_ESP32S3_ELF="$$tmp/app.elf" TMG_ESP32S3_BIN="$$tmp/app.bin" TMG_ESP32S3_LOADER_ELF="$$tmp/loader.elf" \
 		go test -race -v -run 'TestVerifyRealArtifacts|TestRealFirmwareArtifactsOTA' ./espslot ./espota)
+
+# Build the real classic ESP32 loader and both M5Stack targets (m5stack and
+# m5stick-c), verify memory-map/symbol/checksum invariants, package Matter
+# .ota images, and simulate flashing, booting, rollback and slot ping-pong.
+verify-esp32-ota:
+	@set -eu; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	(cd firmware && tinygo build -target ./esp32-loader/target.json -o "$$tmp/loader.elf" ./esp32-loader); \
+	for board in m5stack m5stick-c; do \
+		echo "=== verifying $$board OTA ==="; \
+		(cd firmware && tinygo build -target "$$board" -stack-size=10KB -o "$$tmp/$$board.elf" ./esp32-node); \
+		(cd firmware && tinygo build -target "$$board" -stack-size=10KB -o "$$tmp/$$board.bin" ./esp32-node); \
+		(cd firmware && go run ./espslot verify -elf "$$tmp/$$board.elf" -bin "$$tmp/$$board.bin" -loader-elf "$$tmp/loader.elf"); \
+		(cd firmware && go run ./espslot record -elf "$$tmp/$$board.elf" -bin "$$tmp/$$board.bin" -seq 1 -o "$$tmp/$$board.rec"); \
+		(cd firmware && go run ./espslot payload -elf "$$tmp/$$board.elf" -bin "$$tmp/$$board.bin" -o "$$tmp/$$board.payload"); \
+		go run ./cmd/tmctl ota-image "$$tmp/$$board.payload" "$$tmp/$$board-2.ota" -vendor 0xFFF1 -product 0x8000 -version 2; \
+		go run ./cmd/tmctl ota-info "$$tmp/$$board-2.ota"; \
+		(cd firmware && TMG_ESP32_ELF="$$tmp/$$board.elf" TMG_ESP32_BIN="$$tmp/$$board.bin" TMG_ESP32_LOADER_ELF="$$tmp/loader.elf" \
+			go test -race -v -run 'TestVerifyRealArtifacts|TestRealESP32FirmwareArtifactsOTA' ./espslot ./espota); \
+	done
 
 # Instruction counts on an emulated Cortex-M3 (QEMU mps2-an385, -icount).
 bench-qemu: probe/qemu-m3-big.json

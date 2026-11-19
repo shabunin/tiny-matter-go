@@ -16,6 +16,14 @@ import (
 	"unsafe"
 )
 
+const (
+	// SlotA and SlotB are the two application slot offsets on ESP32-S3.
+	SlotA = 0x10000
+	SlotB = 0x200000
+)
+
+var defaultLayout = layoutESP32S3
+
 //go:linkname flashSafeEnter runtime.esp32s3EnterFlashSafeSection
 func flashSafeEnter() (interrupt.State, bool)
 

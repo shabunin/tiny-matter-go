@@ -135,5 +135,7 @@ jobs:
           key: tinygo-ota-${{ env.TINYGO_VERSION }}-${{ hashFiles('go.mod', 'firmware/go.mod', 'firmware/go.sum') }}
           restore-keys: tinygo-ota-${{ env.TINYGO_VERSION }}-
 
-      - name: Build, verify and simulate ESP32-S3 OTA end-to-end
-        run: make verify-esp32s3-ota
+      - name: Build, verify and simulate ESP32-S3 and classic ESP32 OTA end-to-end
+        run: |
+          make verify-esp32s3-ota
+          make verify-esp32-ota

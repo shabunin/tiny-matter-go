@@ -24,6 +24,11 @@
 // It keeps its fabrics and network in the last 32 KB of the flash and
 // restarts commissioned. Hold the reset button (B on the M5GO, the M5
 // button on the StickC) for 5 s to erase them (factory reset).
+//
+// Started by esp32-loader (two flash slots at 0x11000 and 0x201000), it is
+// an OTA requestor: tmctl ota-update installs a new build into the inactive
+// slot, and the loader rolls back if the new image resets before confirming
+// itself on the network.
 package main
 
 import (
@@ -33,6 +38,7 @@ import (
 	"time"
 
 	"firmware/esp32flash"
+	"firmware/espota"
 	"firmware/watchdog"
 	"firmware/wifinode"
 
@@ -63,6 +69,9 @@ const (
 	iterations    = 1000
 
 	resetHold = 5 * time.Second // holding button A this long erases the state
+	// trialTimeout is how long a new image has to confirm itself (20 s on
+	// the network) before the watchdog resets it and the loader rolls back.
+	trialTimeout = 3 * time.Minute
 	// watchdogTimeout is how long the main loop may go without polling
 	// (the longest blocking call, a Wi-Fi connect, takes about 12 s)
 	// before the watchdog resets the chip.
@@ -90,6 +99,12 @@ func main() {
 	watchdog.Start(watchdogTimeout)
 	time.Sleep(time.Second)
 	println("watchdog:", watchdogTimeout.String(), "on a", watchdog.SlowClockHz(), "Hz RTC clock")
+	slots := &espota.Slots{Restart: restart, Log: func(msg string) { println(msg) }}
+	var trialEnd time.Time
+	if _, _, confirmed, ok := slots.Running(); ok && !confirmed {
+		trialEnd = time.Now().Add(trialTimeout)
+		println("trial image: must confirm itself within", trialTimeout.String())
+	}
 	println("tiny-matter-go", boardName, "starting")
 	p256.SetYield(runtime.Gosched)
 	store := stateStore()
@@ -116,6 +131,15 @@ func main() {
 	if err != nil || version == 0 {
 		version = 1
 	}
+	// Updates go to the other flash slot when esp32-loader started us.
+	var updates device.ImageStore
+	if base, seq, confirmed, ok := slots.Running(); ok {
+		println("running slot", base, "record", seq, "confirmed", confirmed, "version", version)
+		updates = slots
+	} else {
+		println("not started by the loader: OTA updates disabled")
+		slots = nil
+	}
 	d, err := device.New(device.Config{
 		Transport: node.Transport, Rand: hwRand{}, Port: wifinode.MatterPort,
 		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: discriminator,
@@ -136,10 +160,15 @@ func main() {
 		Clock:      time.Now,
 		Log:        func(msg string) { println(msg) },
 		WiFi:       true,
+		Updates:    updates,
 		Resolve:    node.Resolve,
 	})
 	if err != nil {
 		fatal("device", err)
+	}
+	if slots != nil {
+		// Save pending state before restarting into an update.
+		slots.Restart = func() { d.Flush(); restart() }
 	}
 	poll := newApp(d)
 	reset := &resetButton{pin: resetPin, store: store}
@@ -167,6 +196,7 @@ func main() {
 	}
 	println("connecting to Wi-Fi", string(nw.SSID))
 	faultAt := time.Now().Add(time.Hour)
+	var confirmAt time.Time
 	all := func(now time.Time) {
 		if testFault != "" && now.After(faultAt) {
 			println("test fault:", testFault)
@@ -176,12 +206,23 @@ func main() {
 			for {
 			}
 		}
-		watchdog.Feed()
+		if trialEnd.IsZero() || now.Before(trialEnd) {
+			watchdog.Feed()
+		}
 		poll(now)
 		reset.poll(now)
+		if slots != nil && !confirmAt.IsZero() && now.After(confirmAt) && node.LinkUp() {
+			confirmAt = time.Time{}
+			if err := slots.Confirm(); err != nil {
+				println("confirming the image:", err.Error())
+			} else {
+				trialEnd = time.Time{}
+			}
+		}
 	}
 	node.Join(nw, all, nil)
 	faultAt = time.Now().Add(30 * time.Second)
+	confirmAt = time.Now().Add(20 * time.Second)
 	node.Run(all)
 }
 

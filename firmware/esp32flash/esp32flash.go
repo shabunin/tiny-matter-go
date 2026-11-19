@@ -191,6 +191,50 @@ func (d *Device) EraseBlocks(start, n int64) error {
 	return nil
 }
 
+// ReadWords reads 4*len(p) bytes from raw flash address addr (4-byte aligned).
+func ReadWords(addr uint32, p []uint32) error {
+	if addr&3 != 0 || len(p) == 0 {
+		return errRange
+	}
+	configure()
+	if r := C.tmgflash_op(2, C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&p[0])), C.uint32_t(4*len(p))); r != 0 {
+		LastErr = int(r)
+		return errFlash
+	}
+	return nil
+}
+
+// WriteWords programs 4*len(p) bytes at raw flash address addr (4-byte aligned).
+// The destination must already be erased, or only clearing bits (1 -> 0).
+func WriteWords(addr uint32, p []uint32) error {
+	if addr&3 != 0 || len(p) == 0 {
+		return errRange
+	}
+	configure()
+	if r := C.tmgflash_op(0, C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&p[0])), C.uint32_t(4*len(p))); r != 0 {
+		LastErr = int(r)
+		return errFlash
+	}
+	return nil
+}
+
+// EraseAndWriteSector erases the 4 KB sector at addr and programs data into it.
+func EraseAndWriteSector(addr uint32, data *[1024]uint32) error {
+	if addr%4096 != 0 {
+		return errRange
+	}
+	configure()
+	if r := C.tmgflash_op(1, C.uint32_t(addr), nil, 0); r != 0 {
+		LastErr = int(r)
+		return errFlash
+	}
+	if r := C.tmgflash_op(0, C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&data[0])), 4096); r != 0 {
+		LastErr = int(r)
+		return errFlash
+	}
+	return nil
+}
+
 // readROM reads flash at addr into p, through an aligned word buffer, a
 // chunk at a time. It reports whether the ROM read it.
 func readROM(addr uint32, p []byte) bool {

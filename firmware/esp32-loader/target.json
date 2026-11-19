@@ -1,0 +1,13 @@
+{
+	"inherits": ["xtensa"],
+	"cpu": "esp32",
+	"features": "+atomctl,+bool,+clamps,+coprocessor,+debug,+density,+dfpaccel,+div32,+exception,+fp,+highpriinterrupts,+interrupt,+loop,+mac16,+memctl,+minmax,+miscsr,+mul32,+mul32high,+nsa,+prid,+regprotect,+rvector,+s32c1i,+sext,+threadptr,+timerint,+windowed",
+	"build-tags": ["esp32", "esp", "m5stack"],
+	"scheduler": "none",
+	"gc": "leaking",
+	"linker": "ld.lld",
+	"ldflags": ["--unresolved-symbols=ignore-all"],
+	"rtlib": "compiler-rt",
+	"libc": "picolibc",
+	"linkerscript": "esp32-loader/loader.ld"
+}

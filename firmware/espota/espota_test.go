@@ -885,3 +885,362 @@ func TestRealFirmwareArtifactsOTA(t *testing.T) {
 	}
 	f.assertStateAreaUntouched(t)
 }
+
+const (
+	esp32AppDRAMLo = 0x3FFB0000
+	esp32AppDRAMHi = 0x3FFE0000
+	esp32AppIRAMLo = 0x40080000
+	esp32AppIRAMHi = 0x4009C000
+	esp32StateBase = 0x3F8000 // last 32 KB of 4 MB flash
+)
+
+// syntheticESP32Image builds a valid classic ESP32 image (chip ID 0) with
+// one DRAM segment holding _drom_flash_addr (set to 0x20000 as TinyGo does
+// for a 0x1000-flashed image) and one IRAM segment.
+func syntheticESP32Image(tag byte, extra int) (img []byte, dromPtr uint32) {
+	dramAddr := uint32(esp32AppDRAMLo + 0x6000)
+	dramLen := uint32(64)
+	dromPtr = dramAddr + 12
+
+	iramAddr := uint32(esp32AppIRAMLo)
+	iramLen := uint32((extra + 3) &^ 3)
+	if iramLen < 32 {
+		iramLen = 32
+	}
+
+	var b bytes.Buffer
+	var hdr [24]byte
+	hdr[0] = espImageMagic
+	hdr[1] = 2
+	binary.LittleEndian.PutUint32(hdr[4:], iramAddr+0x58)
+	binary.LittleEndian.PutUint16(hdr[12:], espChipESP32)
+	b.Write(hdr[:])
+
+	dramData := make([]byte, dramLen)
+	for i := range dramData {
+		dramData[i] = tag ^ byte(i)
+	}
+	binary.LittleEndian.PutUint32(dramData[dromPtr-dramAddr:], 0x20000)
+
+	iramData := make([]byte, iramLen)
+	for i := range iramData {
+		iramData[i] = tag + byte(i*5)
+	}
+
+	writeSeg := func(addr uint32, data []byte) {
+		var sh [8]byte
+		binary.LittleEndian.PutUint32(sh[0:], addr)
+		binary.LittleEndian.PutUint32(sh[4:], uint32(len(data)))
+		b.Write(sh[:])
+		b.Write(data)
+	}
+	writeSeg(dramAddr, dramData)
+	writeSeg(iramAddr, iramData)
+
+	sum := byte(0xEF)
+	for _, x := range dramData {
+		sum ^= x
+	}
+	for _, x := range iramData {
+		sum ^= x
+	}
+	end := b.Len() | 15
+	for b.Len() < end {
+		b.WriteByte(0)
+	}
+	b.WriteByte(sum)
+	return b.Bytes(), dromPtr
+}
+
+// simESP32LoaderBoot faithfully mirrors firmware/esp32-loader/main.go.
+func simESP32LoaderBoot(f *norFlash) (bootResult, error) {
+	cfg := layoutESP32
+	readRec := func(addr uint32) record {
+		s := &Slots{dev: f, cfg: &cfg}
+		return s.readRecord(addr)
+	}
+	inDRAM := func(a, n uint32) bool {
+		return a >= esp32AppDRAMLo && a+n <= esp32AppDRAMHi && a+n >= a
+	}
+	inIRAM := func(a, n uint32) bool {
+		return a >= esp32AppIRAMLo && a+n <= esp32AppIRAMHi && a+n >= a
+	}
+	load := func(r record) (entry, patchedDROM uint32, err error) {
+		var h [6]uint32
+		if err := f.flashRead(r.base, h[:]); err != nil {
+			return 0, 0, err
+		}
+		nseg := (h[0] >> 8) & 0xFF
+		entry = h[1]
+		chip := h[3] & 0xFFFF
+		if h[0]&0xFF != espImageMagic || chip != espChipESP32 || nseg == 0 || nseg > 16 {
+			return 0, 0, errors.New("esp32-loader: bad ESP32 header")
+		}
+		dram := make([]byte, esp32AppDRAMHi-esp32AppDRAMLo)
+		off := r.base + 24
+		sum := byte(0xEF)
+		patched := false
+		for i := uint32(0); i < nseg; i++ {
+			var sh [2]uint32
+			if err := f.flashRead(off, sh[:]); err != nil {
+				return 0, 0, err
+			}
+			addr, segLen := sh[0], sh[1]
+			off += 8
+			if segLen&3 != 0 || addr&3 != 0 {
+				return 0, 0, errors.New("esp32-loader: unaligned segment")
+			}
+			isDRAM := inDRAM(addr, segLen)
+			if !isDRAM && !inIRAM(addr, segLen) {
+				return 0, 0, errors.New("esp32-loader: segment outside application area")
+			}
+			segBytes := f.mem[off : off+segLen]
+			for _, x := range segBytes {
+				sum ^= x
+			}
+			if isDRAM {
+				copy(dram[addr-esp32AppDRAMLo:], segBytes)
+				if r.drom >= addr && r.drom+4 <= addr+segLen {
+					patched = true
+				}
+			}
+			off += segLen
+		}
+		end := ((off - r.base) | 15) + r.base
+		if int(end) >= len(f.mem) || f.mem[end] != sum {
+			return 0, 0, errors.New("esp32-loader: bad checksum")
+		}
+		if !patched {
+			return 0, 0, errors.New("esp32-loader: _drom_flash_addr not in DRAM")
+		}
+		p := dram[r.drom-esp32AppDRAMLo : r.drom-esp32AppDRAMLo+4]
+		patchedDROM = binary.LittleEndian.Uint32(p) + (r.base - cfg.bootBase)
+		binary.LittleEndian.PutUint32(p, patchedDROM)
+		return entry, patchedDROM, nil
+	}
+
+	a, b := readRec(recA), readRec(recB)
+	var cur, prev *record
+	if a.good && (!b.good || a.seq > b.seq) {
+		cur = &a
+		if b.good {
+			prev = &b
+		}
+	} else if b.good {
+		cur = &b
+		if a.good {
+			prev = &a
+		}
+	}
+	if cur == nil {
+		return bootResult{}, errors.New("esp32-loader: no bootable record")
+	}
+	rolledBack := false
+	if prev != nil && !cur.confirmed && cur.tried {
+		cur = prev
+		prev = nil
+		rolledBack = true
+	}
+	if !cur.confirmed && !cur.tried {
+		zero := [1]uint32{0}
+		if err := f.flashWrite(cur.addr+recTried, zero[:]); err != nil {
+			return bootResult{}, err
+		}
+	}
+	entry, pDROM, err := load(*cur)
+	if err != nil && prev != nil {
+		rolledBack = true
+		cur = prev
+		entry, pDROM, err = load(*cur)
+	}
+	if err != nil {
+		return bootResult{}, err
+	}
+	f.curBase = cur.base
+	return bootResult{
+		seq:         cur.seq,
+		base:        cur.base,
+		entry:       entry,
+		trial:       !cur.confirmed,
+		rolledBack:  rolledBack,
+		patchedDROM: pDROM,
+	}, nil
+}
+
+func TestESP32SlotsFullLifecycleAndRollback(t *testing.T) {
+	cfg := layoutESP32
+	f := newNORFlash()
+	img1, drom1 := syntheticESP32Image(0x11, 5000)
+	f.installConfirmed(t, recA, cfg.slotA, 1, img1, 0, drom1)
+
+	// Reject an ESP32-S3 image on a classic ESP32 device.
+	s3Img, s3IROM, s3DROM := syntheticImage(0x99, 2000)
+	if err := streamUpdate(&Slots{dev: f, cfg: &cfg}, makePayload(s3Img, s3IROM, s3DROM), 512); err == nil {
+		t.Fatal("classic ESP32 accepted an ESP32-S3 image")
+	}
+
+	// Update SlotA (0x11000) -> SlotB (0x201000), boot trial, simulate crash -> rollback.
+	img2, drom2 := syntheticESP32Image(0x22, 9000)
+	s := &Slots{dev: f, cfg: &cfg, Restart: func() {}}
+	if err := streamUpdate(s, makePayload(img2, 0, drom2), 1024); err != nil {
+		t.Fatalf("update 1: %v", err)
+	}
+	boot1, err := simESP32LoaderBoot(f)
+	if err != nil || boot1.base != cfg.slotB || !boot1.trial || boot1.patchedDROM != 0x220000 {
+		t.Fatalf("trial boot = %+v, %v; want slotB patchedDROM=0x220000", boot1, err)
+	}
+	// Reset without Confirm -> rolls back to SlotA (0x11000).
+	bootRB, err := simESP32LoaderBoot(f)
+	if err != nil || bootRB.base != cfg.slotA || !bootRB.rolledBack || bootRB.patchedDROM != 0x30000 {
+		t.Fatalf("rollback boot = %+v, %v; want slotA patchedDROM=0x30000", bootRB, err)
+	}
+
+	// Re-apply update -> confirm SlotB -> ping-pong back to SlotA -> confirm.
+	if err := streamUpdate(&Slots{dev: f, cfg: &cfg, Restart: func() {}}, makePayload(img2, 0, drom2), 777); err != nil {
+		t.Fatalf("update 2: %v", err)
+	}
+	if boot, err := simESP32LoaderBoot(f); err != nil || boot.base != cfg.slotB || !boot.trial {
+		t.Fatalf("boot SlotB = %+v, %v", boot, err)
+	}
+	if err := (&Slots{dev: f, cfg: &cfg}).Confirm(); err != nil {
+		t.Fatalf("confirm SlotB: %v", err)
+	}
+	img3, drom3 := syntheticESP32Image(0x33, 6000)
+	if err := streamUpdate(&Slots{dev: f, cfg: &cfg, Restart: func() {}}, makePayload(img3, 0, drom3), 1024); err != nil {
+		t.Fatalf("update 3: %v", err)
+	}
+	if boot, err := simESP32LoaderBoot(f); err != nil || boot.base != cfg.slotA || boot.seq != 3 || boot.patchedDROM != 0x30000 {
+		t.Fatalf("boot SlotA seq 3 = %+v, %v", boot, err)
+	}
+	for off := uint32(esp32StateBase); off < flashSize; off++ {
+		if f.mem[off] != 0xFF {
+			t.Fatalf("classic ESP32 state area modified at %#x", off)
+		}
+	}
+}
+
+func TestConstantsMatchESP32LoaderAndLinker(t *testing.T) {
+	loaderSrc, err := os.ReadFile("../esp32-loader/main.go")
+	if err != nil {
+		t.Fatalf("read esp32-loader/main.go: %v", err)
+	}
+	defineRe := regexp.MustCompile(`(?m)^#define\s+(\w+)\s+(0x[0-9A-Fa-f]+|[0-9]+)u?`)
+	defs := map[string]uint32{}
+	for _, m := range defineRe.FindAllStringSubmatch(string(loaderSrc), -1) {
+		v, err := strconv.ParseUint(m[2], 0, 32)
+		if err != nil {
+			t.Fatalf("parse %s=%s: %v", m[1], m[2], err)
+		}
+		defs[m[1]] = uint32(v)
+	}
+	wantDefs := map[string]uint32{
+		"BOOT_BASE":     layoutESP32.bootBase,
+		"REC_A":         recA,
+		"REC_B":         recB,
+		"REC_MAGIC":     recMagic,
+		"REC_TRIED":     recTried,
+		"REC_CONFIRMED": recConfirmed,
+		"APP_DRAM_LO":   esp32AppDRAMLo,
+		"APP_DRAM_HI":   esp32AppDRAMHi,
+		"APP_IRAM_LO":   esp32AppIRAMLo,
+		"APP_IRAM_HI":   esp32AppIRAMHi,
+	}
+	for k, want := range wantDefs {
+		if got, ok := defs[k]; !ok || got != want {
+			t.Errorf("esp32-loader/main.go %s = %#x (ok=%v), want %#x", k, got, ok, want)
+		}
+	}
+	if layoutESP32.slotB+layoutESP32.slotSize > esp32StateBase {
+		t.Fatalf("ESP32 SlotB %#x+%#x overlaps state area %#x", layoutESP32.slotB, layoutESP32.slotSize, esp32StateBase)
+	}
+}
+
+func TestRealESP32FirmwareArtifactsOTA(t *testing.T) {
+	elfPath := os.Getenv("TMG_ESP32_ELF")
+	binPath := os.Getenv("TMG_ESP32_BIN")
+	if elfPath == "" || binPath == "" {
+		t.Skip("set TMG_ESP32_ELF and TMG_ESP32_BIN to test real classic ESP32 firmware OTA artifacts")
+	}
+	ef, err := elf.Open(elfPath)
+	if err != nil {
+		t.Fatalf("open ELF: %v", err)
+	}
+	defer ef.Close()
+	syms, err := ef.Symbols()
+	if err != nil {
+		t.Fatalf("ELF symbols: %v", err)
+	}
+	var drom uint32
+	for _, sym := range syms {
+		if sym.Name == "_drom_flash_addr" {
+			drom = uint32(sym.Value)
+			break
+		}
+	}
+	if drom == 0 {
+		t.Fatal("missing _drom_flash_addr")
+	}
+	binData, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read BIN: %v", err)
+	}
+	cfg := layoutESP32
+	payload := makePayload(binData, 0, drom)
+	f := newNORFlash()
+	f.installConfirmed(t, recA, cfg.slotA, 1, binData, 0, drom)
+	boot0, err := simESP32LoaderBoot(f)
+	if err != nil || boot0.base != cfg.slotA || boot0.patchedDROM&0xFFFF != 0 {
+		t.Fatalf("initial real ESP32 boot failed: %+v, %v", boot0, err)
+	}
+	t.Logf("real esp32 image: %d bytes (%.1f%% of slot), _drom_flash_addr=%#x, SlotA patched DROM=%#x",
+		len(binData), 100*float64(len(binData))/float64(cfg.slotSize), drom, boot0.patchedDROM)
+
+	runOTA := func(ver uint32, wantSlot uint32) {
+		t.Helper()
+		imgBytes, err := ota.Create(ota.Header{
+			VendorID: 0xFFF1, ProductID: 0x8000, SoftwareVersion: ver,
+			SoftwareVersionString: "0.2." + strconv.Itoa(int(ver)),
+		}, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := &Slots{dev: f, cfg: &cfg, Restart: func() {}}
+		r := &ota.Reader{OnHeader: s.Begin, Payload: s.Write}
+		for off := 0; off < len(imgBytes); off += 1024 {
+			if err := r.Write(imgBytes[off:min(off+1024, len(imgBytes))]); err != nil {
+				t.Fatalf("ota.Reader.Write: %v", err)
+			}
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("ota.Reader.Close: %v", err)
+		}
+		if err := s.Finish(); err != nil {
+			t.Fatalf("Slots.Finish: %v", err)
+		}
+		boot, err := simESP32LoaderBoot(f)
+		if err != nil || boot.base != wantSlot || !boot.trial || boot.patchedDROM&0xFFFF != 0 {
+			t.Fatalf("boot into %#x failed: %+v, %v", wantSlot, boot, err)
+		}
+		t.Logf("booted real ESP32 image in slot %#x (seq %d), entry=%#x, patched DROM=%#x (64KB aligned!)",
+			boot.base, boot.seq, boot.entry, boot.patchedDROM)
+	}
+
+	// Update SlotA -> SlotB, rollback before confirm, re-update -> confirm -> SlotB -> SlotA.
+	runOTA(2, cfg.slotB)
+	if boot, err := simESP32LoaderBoot(f); err != nil || boot.base != cfg.slotA || !boot.rolledBack {
+		t.Fatalf("rollback failed: %+v, %v", boot, err)
+	}
+	runOTA(2, cfg.slotB)
+	if err := (&Slots{dev: f, cfg: &cfg}).Confirm(); err != nil {
+		t.Fatalf("confirm SlotB: %v", err)
+	}
+	runOTA(3, cfg.slotA)
+	if err := (&Slots{dev: f, cfg: &cfg}).Confirm(); err != nil {
+		t.Fatalf("confirm SlotA: %v", err)
+	}
+	for off := uint32(esp32StateBase); off < flashSize; off++ {
+		if f.mem[off] != 0xFF {
+			t.Fatalf("classic ESP32 state area modified at %#x", off)
+		}
+	}
+}

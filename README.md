@@ -72,7 +72,7 @@ Clusters, attributes and commands go by their names in the SDK's data model. `tm
   410 KB of flash and 12 KB of static RAM on the Pico 2 W).
 - [ ] **Thread:** devices on an 802.15.4 radio (nRF52840, ESP32-C6/H2). Thread datasets are already
   parsed and provisioned, by the device and by `tmctl`, though this is untested on Thread hardware.
-- [ ] Global IPv6 addresses (SLAAC)
+- [x] Global IPv6 addresses (SLAAC)
 - [ ] More device types: window coverings, locks, thermostats
 
 ## Documentation

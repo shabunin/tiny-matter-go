@@ -1,7 +1,7 @@
-// Command espslot prepares TinyGo ESP32-S3 firmware for the two-slot
-// layout of esp32s3-loader (see its documentation):
+// Command espslot prepares TinyGo ESP32 and ESP32-S3 firmware for the
+// two-slot layouts of esp32-loader and esp32s3-loader:
 //
-//	espslot record -elf app.elf -bin app.bin -slot 0x10000 -seq 1 -o rec.bin
+//	espslot record -elf app.elf -bin app.bin [-slot 0x10000|0x11000] -seq 1 -o rec.bin
 //
 // writes a boot record sector (4 KB) for the image app.bin, built from
 // app.elf, placed at the slot's flash offset.
@@ -13,9 +13,9 @@
 //
 //	espslot verify -elf app.elf -bin app.bin [-loader-elf loader.elf]
 //
-// checks that a built ESP32-S3 image (and optionally its boot loader) obeys
-// every memory-map, symbol, size and checksum invariant that esp32s3-loader
-// and espota require.
+// checks that a built ESP32 or ESP32-S3 image (and optionally its boot
+// loader) obeys every memory-map, symbol, size and checksum invariant that
+// the loader and espota require.
 package main
 
 import (
@@ -29,26 +29,72 @@ import (
 	"strconv"
 )
 
-// Memory map and flash layout constants shared with esp32s3-loader and espota.
+// Common flash layout constants shared with esp32-loader, esp32s3-loader and espota.
 const (
-	recA      = 0xE000
-	slotSize  = 0x1F0000
-	appDRAMLo = 0x3FC88000
-	appDRAMHi = 0x3FCD8000
-	appIRAMLo = 0x40378000
-	appIRAMHi = 0x403C8000
-	ldrDRAMLo = 0x3FCD8000
-	ldrDRAMHi = 0x3FCE0000
-	ldrIRAMLo = 0x403D0000
-	ldrIRAMHi = 0x403D8000
-	espMagic  = 0xE9
-	espChipS3 = 9
-	recMagic  = 0x42474D54 // "TMGB"
-	payMagic  = 0x49474D54 // "TMGI"
+	recA     = 0xE000
+	slotSize = 0x1F0000
+	espMagic = 0xE9
+	recMagic = 0x42474D54 // "TMGB"
+	payMagic = 0x49474D54 // "TMGI"
+
+	espChipESP32   = 0
+	espChipESP32S3 = 9
 )
 
-// ImageReport summarises the layout and headroom of a verified ESP32-S3 image.
+type chipSpec struct {
+	name        string
+	chipID      uint16
+	bootBase    uint32 // 0x0 on ESP32-S3, 0x1000 on classic ESP32
+	defaultSlot uint32
+	needIROM    bool
+	appDRAMLo   uint32
+	appDRAMHi   uint32
+	appIRAMLo   uint32
+	appIRAMHi   uint32
+	ldrDRAMLo   uint32
+	ldrDRAMHi   uint32
+	ldrIRAMLo   uint32
+	ldrIRAMHi   uint32
+}
+
+var (
+	specESP32S3 = chipSpec{
+		name: "esp32s3", chipID: espChipESP32S3, bootBase: 0, defaultSlot: 0x10000, needIROM: true,
+		appDRAMLo: 0x3FC88000, appDRAMHi: 0x3FCD8000,
+		appIRAMLo: 0x40378000, appIRAMHi: 0x403C8000,
+		ldrDRAMLo: 0x3FCD8000, ldrDRAMHi: 0x3FCE0000,
+		ldrIRAMLo: 0x403D0000, ldrIRAMHi: 0x403D8000,
+	}
+	specESP32 = chipSpec{
+		name: "esp32", chipID: espChipESP32, bootBase: 0x1000, defaultSlot: 0x11000, needIROM: false,
+		appDRAMLo: 0x3FFB0000, appDRAMHi: 0x3FFE0000,
+		appIRAMLo: 0x40080000, appIRAMHi: 0x4009C000,
+		ldrDRAMLo: 0x3FFF0000, ldrDRAMHi: 0x3FFF8000,
+		ldrIRAMLo: 0x4009C000, ldrIRAMHi: 0x400A0000,
+	}
+)
+
+func specForChip(chip uint16) (chipSpec, error) {
+	switch chip {
+	case espChipESP32S3:
+		return specESP32S3, nil
+	case espChipESP32:
+		return specESP32, nil
+	default:
+		return chipSpec{}, fmt.Errorf("espslot: unsupported ESP chip ID %d (want 0=esp32 or 9=esp32s3)", chip)
+	}
+}
+
+func detectChip(img []byte) (chipSpec, error) {
+	if len(img) < 24 || img[0] != espMagic {
+		return chipSpec{}, errors.New("espslot: not a valid ESP image")
+	}
+	return specForChip(binary.LittleEndian.Uint16(img[12:]))
+}
+
+// ImageReport summarises the layout and headroom of a verified ESP image.
 type ImageReport struct {
+	Chip         string
 	Size         uint32
 	Segments     uint32
 	Entry        uint32
@@ -61,17 +107,19 @@ type ImageReport struct {
 	SlotHeadroom uint32
 }
 
-// LoaderReport summarises a verified esp32s3-loader ELF binary.
+// LoaderReport summarises a verified boot loader ELF binary.
 type LoaderReport struct {
+	Chip      string
 	Entry     uint32
 	TotalSize uint32
 	DRAMSize  uint32
 	IRAMSize  uint32
+	MaxBefore uint32 // bytes available before REC_A
 }
 
-// Symbols returns the RAM addresses of the words holding the image's
-// IROM and DROM flash offsets.
-func symbols(path string) (irom, drom uint32, err error) {
+// symbols returns the RAM addresses of the words holding the image's IROM
+// (ESP32-S3 only) and DROM flash offsets.
+func symbols(path string, spec chipSpec) (irom, drom uint32, err error) {
 	f, err := elf.Open(path)
 	if err != nil {
 		return 0, 0, err
@@ -89,8 +137,11 @@ func symbols(path string) (irom, drom uint32, err error) {
 			drom = uint32(s.Value)
 		}
 	}
-	if irom == 0 || drom == 0 {
-		return 0, 0, errors.New("espslot: _irom_flash_addr or _drom_flash_addr not found (not a TinyGo ESP32-S3 image?)")
+	if drom == 0 || (spec.needIROM && irom == 0) {
+		return 0, 0, fmt.Errorf("espslot: flash offset symbols not found in %s (irom=%#x drom=%#x)", path, irom, drom)
+	}
+	if !spec.needIROM {
+		irom = 0
 	}
 	return irom, drom, nil
 }
@@ -112,7 +163,7 @@ func Record(seq, slot, length, irom, drom uint32) []byte {
 	return b
 }
 
-// BuildPayload prefixes an ESP32-S3 image with the 16-byte TMGI header.
+// BuildPayload prefixes an ESP32 or ESP32-S3 image with the 16-byte TMGI header.
 func BuildPayload(img []byte, irom, drom uint32) ([]byte, error) {
 	if _, err := VerifyImage(img, irom, drom); err != nil {
 		return nil, err
@@ -130,8 +181,8 @@ func inRange(addr, length, lo, hi uint32) bool {
 	return addr >= lo && addr+length <= hi && addr+length >= addr
 }
 
-// VerifyImage checks that img and its _irom_flash_addr/_drom_flash_addr
-// symbols satisfy every check performed by esp32s3-loader and espota.
+// VerifyImage checks that img and its flash-offset symbols satisfy every
+// check performed by esp32-loader / esp32s3-loader and espota.
 func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 	if len(img) < 24 {
 		return ImageReport{}, errors.New("espslot: image shorter than 24-byte ESP header")
@@ -139,10 +190,11 @@ func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 	if uint64(len(img)) > slotSize {
 		return ImageReport{}, fmt.Errorf("espslot: image %d bytes exceeds slot limit %d bytes", len(img), slotSize)
 	}
-	le := binary.LittleEndian
-	if img[0] != espMagic || le.Uint16(img[12:]) != espChipS3 {
-		return ImageReport{}, errors.New("espslot: not an ESP32-S3 image")
+	spec, err := detectChip(img)
+	if err != nil {
+		return ImageReport{}, err
 	}
+	le := binary.LittleEndian
 	nseg := uint32(img[1])
 	entry := le.Uint32(img[4:])
 	if nseg == 0 || nseg > 16 {
@@ -151,6 +203,9 @@ func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 	off := uint32(24)
 	sum := byte(0xEF)
 	patched := 0
+	if !spec.needIROM {
+		patched |= 1
+	}
 	var maxDRAM, maxIRAM uint32
 	for i := uint32(0); i < nseg; i++ {
 		if uint64(off)+8 > uint64(len(img)) {
@@ -166,22 +221,22 @@ func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 			return ImageReport{}, fmt.Errorf("espslot: truncated body for segment %d", i)
 		}
 		switch {
-		case inRange(addr, segLen, appDRAMLo, appDRAMHi):
+		case inRange(addr, segLen, spec.appDRAMLo, spec.appDRAMHi):
 			if addr+segLen > maxDRAM {
 				maxDRAM = addr + segLen
 			}
-			if irom >= addr && irom+4 <= addr+segLen {
+			if spec.needIROM && irom >= addr && irom+4 <= addr+segLen {
 				patched |= 1
 			}
 			if drom >= addr && drom+4 <= addr+segLen {
 				patched |= 2
 			}
-		case inRange(addr, segLen, appIRAMLo, appIRAMHi):
+		case inRange(addr, segLen, spec.appIRAMLo, spec.appIRAMHi):
 			if addr+segLen > maxIRAM {
 				maxIRAM = addr + segLen
 			}
 		default:
-			return ImageReport{}, fmt.Errorf("espslot: segment %d (%#x+%#x) outside application SRAM (may overlap esp32s3-loader)", i, addr, segLen)
+			return ImageReport{}, fmt.Errorf("espslot: %s segment %d (%#x+%#x) outside application SRAM (may overlap loader)", spec.name, i, addr, segLen)
 		}
 		for _, x := range img[off : off+segLen] {
 			sum ^= x
@@ -196,12 +251,13 @@ func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 		return ImageReport{}, fmt.Errorf("espslot: bad XOR checksum %#x, want %#x", img[end], sum)
 	}
 	if patched != 3 {
-		return ImageReport{}, fmt.Errorf("espslot: _irom_flash_addr (%#x) or _drom_flash_addr (%#x) not inside any DRAM segment", irom, drom)
+		return ImageReport{}, fmt.Errorf("espslot: flash offset words (irom=%#x drom=%#x) not inside any DRAM segment", irom, drom)
 	}
-	if !inRange(entry, 4, appIRAMLo, appIRAMHi) {
-		return ImageReport{}, fmt.Errorf("espslot: entry point %#x outside application IRAM", entry)
+	if !inRange(entry, 4, spec.appIRAMLo, spec.appIRAMHi) {
+		return ImageReport{}, fmt.Errorf("espslot: entry point %#x outside %s application IRAM", entry, spec.name)
 	}
 	rep := ImageReport{
+		Chip:         spec.name,
 		Size:         uint32(len(img)),
 		Segments:     nseg,
 		Entry:        entry,
@@ -212,17 +268,17 @@ func VerifyImage(img []byte, irom, drom uint32) (ImageReport, error) {
 		SlotHeadroom: slotSize - uint32(len(img)),
 	}
 	if maxDRAM > 0 {
-		rep.DRAMHeadroom = appDRAMHi - maxDRAM
+		rep.DRAMHeadroom = spec.appDRAMHi - maxDRAM
 	}
 	if maxIRAM > 0 {
-		rep.IRAMHeadroom = appIRAMHi - maxIRAM
+		rep.IRAMHeadroom = spec.appIRAMHi - maxIRAM
 	}
 	return rep, nil
 }
 
-// VerifyLoader checks that a built esp32s3-loader ELF uses loader_entry,
-// stays strictly inside its reserved SRAM window above the application, and
-// fits before REC_A (0xE000).
+// VerifyLoader checks that a built esp32-loader or esp32s3-loader ELF uses
+// loader_entry, stays strictly inside its reserved SRAM window, and fits
+// before REC_A (0xE000).
 func VerifyLoader(path string) (LoaderReport, error) {
 	f, err := elf.Open(path)
 	if err != nil {
@@ -246,8 +302,18 @@ func VerifyLoader(path string) (LoaderReport, error) {
 	if f.Entry != entrySym {
 		return LoaderReport{}, fmt.Errorf("espslot: loader ELF entry %#x != loader_entry %#x", f.Entry, entrySym)
 	}
-	var rep LoaderReport
-	rep.Entry = uint32(f.Entry)
+	entry := uint32(f.Entry)
+	var spec chipSpec
+	switch {
+	case inRange(entry, 4, specESP32S3.ldrIRAMLo, specESP32S3.ldrIRAMHi):
+		spec = specESP32S3
+	case inRange(entry, 4, specESP32.ldrIRAMLo, specESP32.ldrIRAMHi):
+		spec = specESP32
+	default:
+		return LoaderReport{}, fmt.Errorf("espslot: loader entry %#x outside reserved ESP32/ESP32-S3 loader IRAM", entry)
+	}
+
+	rep := LoaderReport{Chip: spec.name, Entry: entry, MaxBefore: recA - spec.bootBase}
 	for _, p := range f.Progs {
 		if p.Type != elf.PT_LOAD || (p.Filesz == 0 && p.Memsz == 0) {
 			continue
@@ -255,21 +321,20 @@ func VerifyLoader(path string) (LoaderReport, error) {
 		addr := uint32(p.Vaddr)
 		memsz := uint32(p.Memsz)
 		switch {
-		case inRange(addr, memsz, ldrDRAMLo, ldrDRAMHi):
+		case inRange(addr, memsz, spec.ldrDRAMLo, spec.ldrDRAMHi):
 			rep.DRAMSize += memsz
-		case inRange(addr, memsz, ldrIRAMLo, ldrIRAMHi):
+		case inRange(addr, memsz, spec.ldrIRAMLo, spec.ldrIRAMHi):
 			rep.IRAMSize += memsz
 		default:
-			return LoaderReport{}, fmt.Errorf("espslot: loader segment %#x+%#x outside reserved loader SRAM", addr, memsz)
+			return LoaderReport{}, fmt.Errorf("espslot: %s loader segment %#x+%#x outside reserved loader SRAM", spec.name, addr, memsz)
 		}
 		rep.TotalSize += uint32(p.Filesz)
 	}
 	if rep.TotalSize == 0 {
 		return LoaderReport{}, errors.New("espslot: loader has no loadable segments")
 	}
-	// Reserve room for the ESP image headers alongside loader segments before REC_A.
-	if rep.TotalSize+256 >= recA {
-		return LoaderReport{}, fmt.Errorf("espslot: loader payload %d bytes approaches REC_A (%#x)", rep.TotalSize, recA)
+	if rep.TotalSize+256 >= rep.MaxBefore {
+		return LoaderReport{}, fmt.Errorf("espslot: %s loader payload %d bytes approaches REC_A (%#x)", spec.name, rep.TotalSize, recA)
 	}
 	return rep, nil
 }
@@ -293,7 +358,7 @@ func main() {
 			return
 		}
 	}
-	fmt.Fprintln(os.Stderr, "usage: espslot record -elf app.elf -bin app.bin -slot 0x10000 -seq 1 [-confirmed] -o rec.bin\n"+
+	fmt.Fprintln(os.Stderr, "usage: espslot record -elf app.elf -bin app.bin [-slot 0x10000|0x11000] -seq 1 [-confirmed] -o rec.bin\n"+
 		"       espslot payload -elf app.elf -bin app.bin -o app.payload\n"+
 		"       espslot verify -elf app.elf -bin app.bin [-loader-elf loader.elf]")
 	os.Exit(2)
@@ -303,7 +368,7 @@ func recordCmd(args []string) {
 	fs := flag.NewFlagSet("record", flag.ExitOnError)
 	elfPath := fs.String("elf", "", "the image's ELF file")
 	binPath := fs.String("bin", "", "the image")
-	slot := fs.String("slot", "0x10000", "flash offset of the slot (64 KB aligned)")
+	slot := fs.String("slot", "", "flash offset of the slot (default 0x10000 on ESP32-S3, 0x11000 on ESP32)")
 	seq := fs.Uint("seq", 1, "record sequence number")
 	confirmed := fs.Bool("confirmed", true, "mark the record tried and confirmed")
 	out := fs.String("o", "", "output file")
@@ -312,20 +377,30 @@ func recordCmd(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	irom, drom, err := symbols(*elfPath)
+	img, err := os.ReadFile(*binPath)
 	if err != nil {
 		fail(err)
 	}
-	img, err := os.ReadFile(*binPath)
+	spec, err := detectChip(img)
+	if err != nil {
+		fail(err)
+	}
+	irom, drom, err := symbols(*elfPath, spec)
 	if err != nil {
 		fail(err)
 	}
 	if _, err := VerifyImage(img, irom, drom); err != nil {
 		fail(err)
 	}
-	base, err := parseUint(*slot)
-	if err != nil || base&0xFFFF != 0 || base == 0 {
-		fail(errors.New("espslot: the slot must be a non-zero multiple of 64 KB"))
+	base := spec.defaultSlot
+	if *slot != "" {
+		base, err = parseUint(*slot)
+		if err != nil {
+			fail(err)
+		}
+	}
+	if base&0xFFFF != spec.bootBase || base < spec.defaultSlot {
+		fail(fmt.Errorf("espslot: %s slot %#x must be >= %#x and aligned to 64 KB + %#x", spec.name, base, spec.defaultSlot, spec.bootBase))
 	}
 	rec := Record(uint32(*seq), base, uint32(len(img)), irom, drom)
 	if *confirmed {
@@ -334,7 +409,7 @@ func recordCmd(args []string) {
 	if err := os.WriteFile(*out, rec, 0o644); err != nil {
 		fail(err)
 	}
-	fmt.Printf("record %d: slot %#x, %d bytes, _irom_flash_addr at %#x, _drom_flash_addr at %#x\n", *seq, base, len(img), irom, drom)
+	fmt.Printf("record %d (%s): slot %#x, %d bytes, _irom_flash_addr at %#x, _drom_flash_addr at %#x\n", *seq, spec.name, base, len(img), irom, drom)
 }
 
 // payload writes an OTA payload: "TMGI", the two flash offset word
@@ -349,11 +424,15 @@ func payload(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	irom, drom, err := symbols(*elfPath)
+	img, err := os.ReadFile(*binPath)
 	if err != nil {
 		fail(err)
 	}
-	img, err := os.ReadFile(*binPath)
+	spec, err := detectChip(img)
+	if err != nil {
+		fail(err)
+	}
+	irom, drom, err := symbols(*elfPath, spec)
 	if err != nil {
 		fail(err)
 	}
@@ -364,24 +443,28 @@ func payload(args []string) {
 	if err := os.WriteFile(*out, outBytes, 0o644); err != nil {
 		fail(err)
 	}
-	fmt.Printf("payload: %d byte image, _irom_flash_addr at %#x, _drom_flash_addr at %#x\n", len(img), irom, drom)
+	fmt.Printf("payload (%s): %d byte image, _irom_flash_addr at %#x, _drom_flash_addr at %#x\n", spec.name, len(img), irom, drom)
 }
 
 func verify(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	elfPath := fs.String("elf", "", "the image's ELF file")
 	binPath := fs.String("bin", "", "the image")
-	loaderElf := fs.String("loader-elf", "", "optional esp32s3-loader ELF file")
+	loaderElf := fs.String("loader-elf", "", "optional boot loader ELF file")
 	fs.Parse(args)
 	fail := func(err error) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	irom, drom, err := symbols(*elfPath)
+	img, err := os.ReadFile(*binPath)
 	if err != nil {
 		fail(err)
 	}
-	img, err := os.ReadFile(*binPath)
+	spec, err := detectChip(img)
+	if err != nil {
+		fail(err)
+	}
+	irom, drom, err := symbols(*elfPath, spec)
 	if err != nil {
 		fail(err)
 	}
@@ -389,9 +472,9 @@ func verify(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	fmt.Printf("image ok: %d bytes (%d KB free in slot), %d segments, entry %#x\n",
-		rep.Size, rep.SlotHeadroom/1024, rep.Segments, rep.Entry)
-	fmt.Printf("  DRAM max %#x (%d KB headroom before loader), IRAM max %#x (%d KB headroom)\n",
+	fmt.Printf("image ok (%s): %d bytes (%d KB free in slot), %d segments, entry %#x\n",
+		rep.Chip, rep.Size, rep.SlotHeadroom/1024, rep.Segments, rep.Entry)
+	fmt.Printf("  DRAM max %#x (%d KB headroom), IRAM max %#x (%d KB headroom before loader)\n",
 		rep.MaxDRAM, rep.DRAMHeadroom/1024, rep.MaxIRAM, rep.IRAMHeadroom/1024)
 	fmt.Printf("  _irom_flash_addr=%#x _drom_flash_addr=%#x\n", rep.IROMPtr, rep.DROMPtr)
 	if *loaderElf != "" {
@@ -399,7 +482,10 @@ func verify(args []string) {
 		if err != nil {
 			fail(err)
 		}
-		fmt.Printf("loader ok: entry %#x, %d bytes (%d B DRAM, %d B IRAM, %d KB before REC_A)\n",
-			lrep.Entry, lrep.TotalSize, lrep.DRAMSize, lrep.IRAMSize, (recA-lrep.TotalSize)/1024)
+		if lrep.Chip != rep.Chip {
+			fail(fmt.Errorf("espslot: loader chip %s does not match image chip %s", lrep.Chip, rep.Chip))
+		}
+		fmt.Printf("loader ok (%s): entry %#x, %d bytes (%d B DRAM, %d B IRAM, %d KB before REC_A)\n",
+			lrep.Chip, lrep.Entry, lrep.TotalSize, lrep.DRAMSize, lrep.IRAMSize, (lrep.MaxBefore-lrep.TotalSize)/1024)
 	}
 }

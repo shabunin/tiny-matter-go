@@ -85,9 +85,10 @@ There are three Go modules:
 | `firmware/softi2c/` | Bit-banged I2C (the M5StickC HAT header, which TinyGo's hardware I2C cannot drive). |
 | `firmware/esp32flash/` | Classic ESP32 flash as a `storage.BlockDevice`, through the ROM routines from IRAM with the cache off. |
 | `firmware/watchdog/` | RTC watchdog: resets the chip if `Feed` stops (hangs, fatal errors). Measures the slow clock at `Start`. |
-| `firmware/esp32s3-loader/` | Second-stage boot loader (C, no Go runtime): two application slots, boot records, trial starts and rollback. |
-| `firmware/espota/` | ESP32-S3 `device.ImageStore`: writes an update into the inactive slot, checks it, adds its boot record, confirms a working image. |
-| `firmware/espslot/` | Host tool: boot records and OTA payloads for the two-slot layout. |
+| `firmware/esp32s3-loader/` | Second-stage boot loader (C, no Go runtime) for ESP32-S3: two application slots, boot records, trial starts and rollback. |
+| `firmware/esp32-loader/` | Second-stage boot loader (C, no Go runtime) for classic ESP32 (M5Stack Core / M5StickC Plus): two slots at `0x11000` / `0x201000` with trial starts and rollback. |
+| `firmware/espota/` | ESP32 and ESP32-S3 `device.ImageStore`: writes an update into the inactive slot, checks it, adds its boot record, confirms a working image. |
+| `firmware/espslot/` | Host tool: boot records, OTA payloads and static ELF/BIN verification for the two-slot layouts. |
 | `firmware/flashtest/` | Flash store test program. |
 
 ### The probe module
@@ -398,10 +399,16 @@ tinygo flash -target m5stick-c -stack-size=10KB -ldflags "-X main.ssid=... -X ma
   Cardputer. 0x003B000000000001 clicks G0, 0x003B000000000002 holds it, and 0x002A000000000100 makes
   the node query its default OTA providers.
 
-### OTA on the ESP32-S3 (two slots)
+### OTA on the ESP32 and ESP32-S3 (two slots)
 
-**Layout:** the loader at 0, boot records at 0xE000 and 0xF000, slots at 0x10000 and 0x200000. The
-device state is at the top of the first 4 MB.
+**Layouts:**
+
+- **ESP32-S3 (`esp32s3-loader`):** loader at `0x0`, boot records at `0xE000` and `0xF000`, slots at
+  `0x10000` and `0x200000`. Device state is at the top of the first 4 MB.
+- **Classic ESP32 (`esp32-loader`, M5Stack Core and M5StickC Plus):** loader at `0x1000`, boot
+  records at `0xE000` and `0xF000`, slots at `0x11000` and `0x201000` (each 64 KB * N + `0x1000` so
+  TinyGo's `.rodata` stays 64 KB-aligned for the MMU). Device state is in the last 32 KB of 4 MB
+  (`0x3F8000`–`0x400000`).
 
 **How an update runs:**
 
@@ -412,7 +419,7 @@ device state is at the top of the first 4 MB.
 - A trial image arms the RTC watchdog first thing (TinyGo's start-up disables the watchdogs), so an
   image that hangs or never reaches the network resets after 3 minutes and is rolled back.
 
-One-time setup over USB:
+One-time setup over USB (ESP32-S3):
 
 ```sh
 cd firmware
@@ -424,18 +431,30 @@ go run ./espslot record -elf app.elf -bin app.bin -slot 0x10000 -seq 1 -o rec.bi
 esptool --port /dev/ttyACM0 write-flash 0 loader.bin 0xE000 rec.bin 0x10000 app.bin
 ```
 
-Each update after that:
+One-time setup over USB (classic ESP32: `m5stack` or `m5stick-c`):
 
 ```sh
-tinygo build ... -ldflags "-X main.softwareVersion=N ..." -o app.elf ./esp32s3-light
-tinygo build ... -ldflags "-X main.softwareVersion=N ..." -o app.bin ./esp32s3-light
-go run ./espslot payload -elf app.elf -bin app.bin -o app.payload
-tmctl ota-image app.payload app-N.ota -vendor 0xFFF1 -product 0x8000 -version N
-tmctl ota-update lamp app-N.ota
+cd firmware
+tinygo build -target ./esp32-loader/target.json -o loader.elf ./esp32-loader
+esptool --chip esp32 elf2image --flash-mode dio --flash-freq 40m --flash-size 4MB -o loader.bin loader.elf
+tinygo build -target m5stack -stack-size=10KB -ldflags "-X main.ssid=... -X main.password=..." -o app.elf ./esp32-node
+tinygo build -target m5stack -stack-size=10KB -ldflags "-X main.ssid=... -X main.password=..." -o app.bin ./esp32-node
+go run ./espslot record -elf app.elf -bin app.bin -seq 1 -o rec.bin
+esptool --chip esp32 --port /dev/ttyUSB0 write-flash --flash-size 4MB 0x1000 loader.bin 0xE000 rec.bin 0x11000 app.bin
 ```
 
-A 1.1 MB image downloads in about 30 s, and the whole update takes about a minute. Firmware flashed
-at offset 0 with `tinygo flash` (no loader) runs with updates disabled.
+Each update after that (same flow for ESP32-S3 and classic ESP32):
+
+```sh
+tinygo build ... -ldflags "-X main.softwareVersion=N ..." -o app.elf ./esp32-node
+tinygo build ... -ldflags "-X main.softwareVersion=N ..." -o app.bin ./esp32-node
+go run ./espslot payload -elf app.elf -bin app.bin -o app.payload
+tmctl ota-image app.payload app-N.ota -vendor 0xFFF1 -product 0x8000 -version N
+tmctl ota-update <node> app-N.ota
+```
+
+A 1.1–1.2 MB image downloads in about 30 s, and the whole update takes about a minute. Firmware
+flashed directly with `tinygo flash` (no loader) runs with updates disabled.
 
 ## 9. `tmctl` (`cmd/tmctl`)
 
@@ -660,8 +679,6 @@ To do:
 
 ### Smaller items
 
-- SLAAC global IPv6 addresses in `ip6`. Today it is link-local only, which needs controllers on the
-  same link.
 - More device types and clusters: Window Covering, Door Lock, Thermostat, Fan Control, Mode Select.
   Mode Select would also clear the remaining TestScenesFabricSceneInfo step.
 - P-256 speed: hot fiat routines in IRAM, the ESP RSA/MPI accelerator, 240 MHz on the ESP32 (§14).

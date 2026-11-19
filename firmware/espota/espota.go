@@ -1,12 +1,12 @@
-// Package espota stores OTA software updates for TinyGo ESP32-S3 firmware
-// started by esp32s3-loader: it writes a new image into the slot the
-// firmware is not running from, adds a boot record for it, and confirms
-// the image once it works (see esp32s3-loader for the flash layout).
+// Package espota stores OTA software updates for TinyGo ESP32 and ESP32-S3
+// firmware started by esp32-loader or esp32s3-loader: it writes a new
+// image into the slot the firmware is not running from, adds a boot record
+// for it, and confirms the image once it works.
 //
 // An OTA image's payload is the image prefixed with what its boot record
 // needs (espslot payload writes it):
 //
-//	0x00 magic "TMGI"   0x04 _irom_flash_addr RAM address
+//	0x00 magic "TMGI"   0x04 _irom_flash_addr RAM address (0 on classic ESP32)
 //	0x08 _drom_flash_addr RAM address   0x0C image length
 //	0x10 the ESP image (app.bin)
 package espota
@@ -20,13 +20,11 @@ import (
 	"github.com/shabunin/tiny-matter-go/ota"
 )
 
-// Flash layout (esp32s3-loader).
+// Common flash layout constants shared by esp32-loader and esp32s3-loader.
 const (
 	recA     = 0xE000
 	recB     = 0xF000
-	SlotA    = 0x10000
-	SlotB    = 0x200000
-	slotSize = 0x1F0000 // up to the state area at 0x3F0000
+	slotSize = 0x1F0000 // leaves the state area at the top of 4 MB untouched
 	sector   = 4096
 
 	recMagic       = 0x42474D54 // "TMGB"
@@ -35,18 +33,27 @@ const (
 	payloadMagic   = 0x49474D54 // "TMGI"
 	payloadHeader  = 16
 	espImageMagic  = 0xE9
+	espChipESP32   = 0
 	espChipESP32S3 = 9
+)
+
+type chipLayout struct {
+	slotA    uint32
+	slotB    uint32
+	slotSize uint32
+	bootBase uint32 // 0 on ESP32-S3, 0x1000 on classic ESP32
+	chipID   uint16
+}
+
+var (
+	layoutESP32S3 = chipLayout{slotA: 0x10000, slotB: 0x200000, slotSize: slotSize, bootBase: 0, chipID: espChipESP32S3}
+	layoutESP32   = chipLayout{slotA: 0x11000, slotB: 0x201000, slotSize: slotSize, bootBase: 0x1000, chipID: espChipESP32}
 )
 
 var errFlash = errors.New("espota: flash operation failed")
 
-// buf is the sector being written, word aligned for the ROM routines.
-var buf [sector / 4]uint32
-
-func bufBytes() []byte { return unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), sector) }
-
 // flashBackend lets host tests inject a simulated NOR flash and boot state
-// without changing the zero-allocation hardware path on ESP32-S3.
+// without changing the zero-allocation hardware path on ESP32 / ESP32-S3.
 type flashBackend interface {
 	flashRead(addr uint32, p []uint32) error
 	flashWrite(addr uint32, p []uint32) error
@@ -70,7 +77,9 @@ type Slots struct {
 	// Log, if set, receives progress messages.
 	Log func(msg string)
 
-	dev       flashBackend // nil uses the ESP32-S3 ROM flash routines
+	dev       flashBackend // nil uses the hardware ROM flash routines
+	cfg       *chipLayout  // nil uses defaultLayout for the build target
+	buf       []uint32     // 4 KB word-aligned sector buffer on the heap (keeps .bss small on classic ESP32)
 	running   record       // the record of the running image
 	other     uint32       // the record sector to write
 	target    uint32       // slot offset
@@ -80,6 +89,25 @@ type Slots struct {
 	written   uint32 // image bytes in buf or flash
 	crc       uint32
 	ready     bool
+}
+
+func (s *Slots) sectorWords() *[sector / 4]uint32 {
+	if len(s.buf) != sector/4 {
+		s.buf = make([]uint32, sector/4)
+	}
+	return (*[sector / 4]uint32)(s.buf)
+}
+
+func (s *Slots) bufBytes() []byte {
+	w := s.sectorWords()
+	return unsafe.Slice((*byte)(unsafe.Pointer(&w[0])), sector)
+}
+
+func (s *Slots) layout() chipLayout {
+	if s.cfg != nil {
+		return *s.cfg
+	}
+	return defaultLayout
 }
 
 func (s *Slots) flashRead(addr uint32, p []uint32) error {
@@ -97,10 +125,11 @@ func (s *Slots) flashWrite(addr uint32, p []uint32) error {
 }
 
 func (s *Slots) writeSector(addr uint32) error {
+	w := s.sectorWords()
 	if s.dev != nil {
-		return s.dev.writeSector(addr, &buf)
+		return s.dev.writeSector(addr, w)
 	}
-	return hwWriteSector(addr, &buf)
+	return hwWriteSector(addr, w)
 }
 
 func (s *Slots) runningBase() uint32 {
@@ -111,6 +140,7 @@ func (s *Slots) runningBase() uint32 {
 }
 
 func (s *Slots) readRecord(addr uint32) record {
+	cfg := s.layout()
 	r := record{addr: addr}
 	var w [7]uint32
 	var flags [2]uint32
@@ -120,7 +150,7 @@ func (s *Slots) readRecord(addr uint32) record {
 	b := unsafe.Slice((*byte)(unsafe.Pointer(&w[0])), 24)
 	r.seq, r.base, r.length, r.irom, r.drom = w[1], w[2], w[3], w[4], w[5]
 	r.tried, r.confirmed = flags[0] == 0, flags[1] == 0
-	r.good = w[0] == recMagic && w[6] == crc32.ChecksumIEEE(b) && r.base&0xFFFF == 0 && r.base >= SlotA
+	r.good = w[0] == recMagic && w[6] == crc32.ChecksumIEEE(b) && r.base&0xFFFF == cfg.bootBase && r.base >= cfg.slotA
 	return r
 }
 
@@ -149,6 +179,9 @@ func (s *Slots) Running() (base, seq uint32, confirmed, ok bool) {
 	if cur.addr == recA {
 		s.other = recB
 	}
+	// Allocate the 4 KB sector buffer once at boot so a fragmented heap
+	// never fails an OTA write later.
+	s.sectorWords()
 	return base, cur.seq, cur.confirmed, true
 }
 
@@ -170,20 +203,21 @@ func (s *Slots) Confirm() error {
 
 // Begin implements device.ImageStore.
 func (s *Slots) Begin(h *ota.Header) error {
+	cfg := s.layout()
 	base, _, confirmed, ok := s.Running()
 	if !ok {
-		return errors.New("espota: not started by esp32s3-loader")
+		return errors.New("espota: not started by boot loader")
 	}
 	if !confirmed {
 		// Its rollback image is in the other slot.
 		return errors.New("espota: the running image is not confirmed yet")
 	}
-	if h.PayloadSize < payloadHeader+24 || h.PayloadSize-payloadHeader > slotSize {
+	if h.PayloadSize < payloadHeader+24 || h.PayloadSize-payloadHeader > uint64(cfg.slotSize) {
 		return errors.New("espota: image does not fit a slot")
 	}
-	s.target = SlotB
-	if base == SlotB {
-		s.target = SlotA
+	s.target = cfg.slotB
+	if base == cfg.slotB {
+		s.target = cfg.slotA
 	}
 	s.headerLen, s.written, s.crc, s.length, s.ready = 0, 0, 0, 0, false
 	// No record may point at the slot while it is overwritten.
@@ -196,6 +230,7 @@ func (s *Slots) Begin(h *ota.Header) error {
 
 // Write implements device.ImageStore.
 func (s *Slots) Write(p []byte) error {
+	cfg := s.layout()
 	if s.target == 0 {
 		return errors.New("espota: no update")
 	}
@@ -208,14 +243,14 @@ func (s *Slots) Write(p []byte) error {
 		}
 		le := binary.LittleEndian
 		s.length = le.Uint32(s.header[12:])
-		if le.Uint32(s.header[0:]) != payloadMagic || s.length == 0 || s.length > slotSize {
-			return errors.New("espota: not an ESP32-S3 slot payload")
+		if le.Uint32(s.header[0:]) != payloadMagic || s.length == 0 || s.length > cfg.slotSize {
+			return errors.New("espota: not an ESP slot payload")
 		}
 	}
 	if s.written+uint32(len(p)) > s.length {
 		return errors.New("espota: payload longer than its image")
 	}
-	b := bufBytes()
+	b := s.bufBytes()
 	for len(p) > 0 {
 		at := s.written % sector
 		n := copy(b[at:], p)
@@ -234,11 +269,12 @@ func (s *Slots) Write(p []byte) error {
 // Finish implements device.ImageStore: it writes the last sector, checks
 // what flash holds, and writes the boot record.
 func (s *Slots) Finish() error {
+	cfg := s.layout()
 	if s.target == 0 || s.headerLen < payloadHeader || s.written != s.length {
 		return errors.New("espota: image incomplete")
 	}
 	if rest := s.written % sector; rest != 0 {
-		b := bufBytes()
+		b := s.bufBytes()
 		for i := rest; i < sector; i++ {
 			b[i] = 0xFF
 		}
@@ -248,13 +284,14 @@ func (s *Slots) Finish() error {
 	}
 	// Read the image back.
 	crc := uint32(0)
+	w := s.sectorWords()
 	for off := uint32(0); off < s.length; off += sector {
-		if err := s.flashRead(s.target+off, buf[:]); err != nil {
+		if err := s.flashRead(s.target+off, w[:]); err != nil {
 			return err
 		}
-		b := bufBytes()
-		if off == 0 && (b[0] != espImageMagic || binary.LittleEndian.Uint16(b[12:]) != espChipESP32S3) {
-			return errors.New("espota: not an ESP32-S3 image")
+		b := s.bufBytes()
+		if off == 0 && (b[0] != espImageMagic || binary.LittleEndian.Uint16(b[12:]) != cfg.chipID) {
+			return errors.New("espota: image chip ID mismatch")
 		}
 		crc = crc32.Update(crc, crc32.IEEETable, b[:min(sector, s.length-off)])
 	}
@@ -263,7 +300,7 @@ func (s *Slots) Finish() error {
 	}
 	// The boot record, newer than the running one, in the other sector.
 	le := binary.LittleEndian
-	b := bufBytes()
+	b := s.bufBytes()
 	for i := range b {
 		b[i] = 0xFF
 	}
@@ -296,7 +333,7 @@ func (s *Slots) Abort() {
 
 // eraseOther erases the record sector the running image does not use.
 func (s *Slots) eraseOther() error {
-	b := bufBytes()
+	b := s.bufBytes()
 	for i := range b {
 		b[i] = 0xFF
 	}
