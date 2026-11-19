@@ -81,7 +81,9 @@ func (c *LocalizationConfiguration) WriteAttribute(ctx *im.Context, attr uint32,
 }
 
 // EncodeState saves ActiveLocale (im.Persister).
-func (c *LocalizationConfiguration) EncodeState(w *tlv.Writer, tag tlv.Tag) { w.PutString(tag, c.ActiveLocale) }
+func (c *LocalizationConfiguration) EncodeState(w *tlv.Writer, tag tlv.Tag) {
+	w.PutString(tag, c.ActiveLocale)
+}
 
 // DecodeState restores ActiveLocale if it is still supported
 // (im.Persister).

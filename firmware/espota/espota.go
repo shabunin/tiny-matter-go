@@ -1,5 +1,3 @@
-//go:build esp32s3
-
 // Package espota stores OTA software updates for TinyGo ESP32-S3 firmware
 // started by esp32s3-loader: it writes a new image into the slot the
 // firmware is not running from, adds a boot record for it, and confirms
@@ -13,20 +11,10 @@
 //	0x10 the ESP image (app.bin)
 package espota
 
-/*
-#include <stdint.h>
-extern int esp_rom_spiflash_read(uint32_t src, uint32_t *dst, uint32_t len);
-extern int esp_rom_spiflash_write(uint32_t dst, const uint32_t *src, uint32_t len);
-extern int esp_rom_spiflash_erase_sector(uint32_t sector);
-extern int esp_rom_spiflash_unlock(void);
-*/
-import "C"
-
 import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
-	"runtime/interrupt"
 	"unsafe"
 
 	"github.com/shabunin/tiny-matter-go/ota"
@@ -50,19 +38,6 @@ const (
 	espChipESP32S3 = 9
 )
 
-//go:linkname flashSafeEnter runtime.esp32s3EnterFlashSafeSection
-func flashSafeEnter() (interrupt.State, bool)
-
-//go:linkname flashSafeExit runtime.esp32s3ExitFlashSafeSection
-func flashSafeExit(state interrupt.State, multicore bool)
-
-type romFlashChip struct {
-	deviceID, chipSize, blockSize, sectorSize, pageSize, statusMask uint32
-}
-
-//go:extern rom_spiflash_legacy_data
-var romFlashLegacy *romFlashChip
-
 var errFlash = errors.New("espota: flash operation failed")
 
 // buf is the sector being written, word aligned for the ROM routines.
@@ -70,52 +45,13 @@ var buf [sector / 4]uint32
 
 func bufBytes() []byte { return unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), sector) }
 
-// setChipSize tells the ROM routines the flash size from the image header
-// at offset 0 (they assume 2 MB).
-func setChipSize() {
-	var h uint32
-	if C.esp_rom_spiflash_read(0, (*C.uint32_t)(unsafe.Pointer(&h)), 4) == 0 && byte(h) == espImageMagic && h>>28 <= 7 {
-		romFlashLegacy.chipSize = 1 << 20 << (h >> 28)
-	}
-}
-
-func flashRead(addr uint32, p []uint32) error {
-	st, mc := flashSafeEnter()
-	res := C.esp_rom_spiflash_read(C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&p[0])), C.uint32_t(4*len(p)))
-	flashSafeExit(st, mc)
-	if res != 0 {
-		return errFlash
-	}
-	return nil
-}
-
-// flashWrite programs words (already erased, or only clearing bits).
-func flashWrite(addr uint32, p []uint32) error {
-	st, mc := flashSafeEnter()
-	setChipSize()
-	C.esp_rom_spiflash_unlock()
-	res := C.esp_rom_spiflash_write(C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&p[0])), C.uint32_t(4*len(p)))
-	flashSafeExit(st, mc)
-	if res != 0 {
-		return errFlash
-	}
-	return nil
-}
-
-// writeSector erases a sector and writes buf to it.
-func writeSector(addr uint32) error {
-	st, mc := flashSafeEnter()
-	setChipSize()
-	C.esp_rom_spiflash_unlock()
-	res := C.esp_rom_spiflash_erase_sector(C.uint32_t(addr / sector))
-	if res == 0 {
-		res = C.esp_rom_spiflash_write(C.uint32_t(addr), (*C.uint32_t)(unsafe.Pointer(&buf[0])), sector)
-	}
-	flashSafeExit(st, mc)
-	if res != 0 {
-		return errFlash
-	}
-	return nil
+// flashBackend lets host tests inject a simulated NOR flash and boot state
+// without changing the zero-allocation hardware path on ESP32-S3.
+type flashBackend interface {
+	flashRead(addr uint32, p []uint32) error
+	flashWrite(addr uint32, p []uint32) error
+	writeSector(addr uint32, data *[sector / 4]uint32) error
+	runningBase() uint32
 }
 
 // record is a boot record.
@@ -126,42 +62,6 @@ type record struct {
 	tried, confirmed, good bool
 }
 
-func readRecord(addr uint32) record {
-	r := record{addr: addr}
-	var w [7]uint32
-	var flags [2]uint32
-	if flashRead(addr, w[:]) != nil || flashRead(addr+recTried, flags[:]) != nil {
-		return r
-	}
-	b := unsafe.Slice((*byte)(unsafe.Pointer(&w[0])), 24)
-	r.seq, r.base, r.length, r.irom, r.drom = w[1], w[2], w[3], w[4], w[5]
-	r.tried, r.confirmed = flags[0] == 0, flags[1] == 0
-	r.good = w[0] == recMagic && w[6] == crc32.ChecksumIEEE(b) && r.base&0xFFFF == 0 && r.base >= SlotA
-	return r
-}
-
-// runningBase returns the flash offset of the running image, from the
-// MMU entry that maps its read-only data.
-func runningBase() uint32 {
-	s := "espota running image"
-	v := uintptr(unsafe.Pointer(unsafe.StringData(s)))
-	if v < 0x3C000000 || v >= 0x3E000000 {
-		return 0
-	}
-	entry := *(*uint32)(unsafe.Pointer(uintptr(0x600C5000) + 4*((v-0x3C000000)>>16)))
-	if entry&(1<<14) != 0 { // invalid
-		return 0
-	}
-	phys := entry & 0x3FFF << 16
-	switch {
-	case phys >= SlotB && phys < SlotB+slotSize:
-		return SlotB
-	case phys >= SlotA && phys < SlotB:
-		return SlotA
-	}
-	return 0
-}
-
 // Slots stores updates in the inactive slot. Its methods implement
 // device.ImageStore.
 type Slots struct {
@@ -170,15 +70,58 @@ type Slots struct {
 	// Log, if set, receives progress messages.
 	Log func(msg string)
 
-	running   record // the record of the running image
-	other     uint32 // the record sector to write
-	target    uint32 // slot offset
+	dev       flashBackend // nil uses the ESP32-S3 ROM flash routines
+	running   record       // the record of the running image
+	other     uint32       // the record sector to write
+	target    uint32       // slot offset
 	header    [payloadHeader]byte
 	headerLen int
 	length    uint32 // image length from the payload header
 	written   uint32 // image bytes in buf or flash
 	crc       uint32
 	ready     bool
+}
+
+func (s *Slots) flashRead(addr uint32, p []uint32) error {
+	if s.dev != nil {
+		return s.dev.flashRead(addr, p)
+	}
+	return hwFlashRead(addr, p)
+}
+
+func (s *Slots) flashWrite(addr uint32, p []uint32) error {
+	if s.dev != nil {
+		return s.dev.flashWrite(addr, p)
+	}
+	return hwFlashWrite(addr, p)
+}
+
+func (s *Slots) writeSector(addr uint32) error {
+	if s.dev != nil {
+		return s.dev.writeSector(addr, &buf)
+	}
+	return hwWriteSector(addr, &buf)
+}
+
+func (s *Slots) runningBase() uint32 {
+	if s.dev != nil {
+		return s.dev.runningBase()
+	}
+	return hwRunningBase()
+}
+
+func (s *Slots) readRecord(addr uint32) record {
+	r := record{addr: addr}
+	var w [7]uint32
+	var flags [2]uint32
+	if s.flashRead(addr, w[:]) != nil || s.flashRead(addr+recTried, flags[:]) != nil {
+		return r
+	}
+	b := unsafe.Slice((*byte)(unsafe.Pointer(&w[0])), 24)
+	r.seq, r.base, r.length, r.irom, r.drom = w[1], w[2], w[3], w[4], w[5]
+	r.tried, r.confirmed = flags[0] == 0, flags[1] == 0
+	r.good = w[0] == recMagic && w[6] == crc32.ChecksumIEEE(b) && r.base&0xFFFF == 0 && r.base >= SlotA
+	return r
 }
 
 func (s *Slots) log(msg string) {
@@ -190,8 +133,8 @@ func (s *Slots) log(msg string) {
 // Running reports the running image's slot and record, and whether the
 // loader started it (records exist).
 func (s *Slots) Running() (base, seq uint32, confirmed, ok bool) {
-	base = runningBase()
-	a, b := readRecord(recA), readRecord(recB)
+	base = s.runningBase()
+	a, b := s.readRecord(recA), s.readRecord(recB)
 	var cur *record
 	for _, r := range []*record{&a, &b} {
 		if r.good && r.base == base && (cur == nil || r.seq > cur.seq) {
@@ -218,7 +161,7 @@ func (s *Slots) Confirm() error {
 		return nil
 	}
 	zero := [1]uint32{0}
-	if err := flashWrite(s.running.addr+recConfirmed, zero[:]); err != nil {
+	if err := s.flashWrite(s.running.addr+recConfirmed, zero[:]); err != nil {
 		return err
 	}
 	s.log("image confirmed")
@@ -280,7 +223,7 @@ func (s *Slots) Write(p []byte) error {
 		s.written += uint32(n)
 		p = p[n:]
 		if s.written%sector == 0 {
-			if err := writeSector(s.target + s.written - sector); err != nil {
+			if err := s.writeSector(s.target + s.written - sector); err != nil {
 				return err
 			}
 		}
@@ -299,14 +242,14 @@ func (s *Slots) Finish() error {
 		for i := rest; i < sector; i++ {
 			b[i] = 0xFF
 		}
-		if err := writeSector(s.target + s.written - rest); err != nil {
+		if err := s.writeSector(s.target + s.written - rest); err != nil {
 			return err
 		}
 	}
 	// Read the image back.
 	crc := uint32(0)
 	for off := uint32(0); off < s.length; off += sector {
-		if err := flashRead(s.target+off, buf[:]); err != nil {
+		if err := s.flashRead(s.target+off, buf[:]); err != nil {
 			return err
 		}
 		b := bufBytes()
@@ -331,10 +274,10 @@ func (s *Slots) Finish() error {
 	le.PutUint32(b[16:], le.Uint32(s.header[4:]))
 	le.PutUint32(b[20:], le.Uint32(s.header[8:]))
 	le.PutUint32(b[24:], crc32.ChecksumIEEE(b[:24]))
-	if err := writeSector(s.other); err != nil {
+	if err := s.writeSector(s.other); err != nil {
 		return err
 	}
-	if r := readRecord(s.other); !r.good || r.base != s.target || r.seq != s.running.seq+1 {
+	if r := s.readRecord(s.other); !r.good || r.base != s.target || r.seq != s.running.seq+1 {
 		return errors.New("espota: boot record not written")
 	}
 	s.ready = true
@@ -357,7 +300,7 @@ func (s *Slots) eraseOther() error {
 	for i := range b {
 		b[i] = 0xFF
 	}
-	return writeSector(s.other)
+	return s.writeSector(s.other)
 }
 
 // Apply implements device.ImageStore: it restarts into the new image.

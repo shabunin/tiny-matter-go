@@ -14,6 +14,7 @@ import (
 	"github.com/shabunin/tiny-matter-go/exchange"
 	"github.com/shabunin/tiny-matter-go/fabric"
 	"github.com/shabunin/tiny-matter-go/im"
+	"github.com/shabunin/tiny-matter-go/internal/simnet"
 	"github.com/shabunin/tiny-matter-go/message"
 	"github.com/shabunin/tiny-matter-go/ota"
 	"github.com/shabunin/tiny-matter-go/securechannel"
@@ -26,31 +27,59 @@ const providerNode = 0x1B669 // the test controller
 
 // memImages is an ImageStore in memory.
 type memImages struct {
-	header  *ota.Header
-	data    []byte
-	done    bool
-	aborted bool
-	applied bool
+	header    *ota.Header
+	data      []byte
+	done      bool
+	aborted   bool
+	applied   bool
+	beginErr  error
+	writeErr  error
+	finishErr error
+	applyErr  error
 }
 
 func (m *memImages) Begin(h *ota.Header) error {
+	if m.beginErr != nil {
+		return m.beginErr
+	}
 	m.header, m.data, m.done, m.aborted = h, nil, false, false
 	return nil
 }
-func (m *memImages) Write(p []byte) error { m.data = append(m.data, p...); return nil }
-func (m *memImages) Finish() error        { m.done = true; return nil }
-func (m *memImages) Abort()               { m.aborted = true }
-func (m *memImages) Apply() error         { m.applied = true; return nil }
+func (m *memImages) Write(p []byte) error {
+	if m.writeErr != nil {
+		return m.writeErr
+	}
+	m.data = append(m.data, p...)
+	return nil
+}
+func (m *memImages) Finish() error {
+	if m.finishErr != nil {
+		return m.finishErr
+	}
+	m.done = true
+	return nil
+}
+func (m *memImages) Abort() { m.aborted = true }
+func (m *memImages) Apply() error {
+	if m.applyErr != nil {
+		return m.applyErr
+	}
+	m.applied = true
+	return nil
+}
 
 // provider serves one image from the test controller.
 type provider struct {
-	image    []byte
-	version  uint32
-	token    []byte
-	queries  int
-	applies  int
-	notified []uint32
-	served   []error
+	image       []byte
+	version     uint32
+	token       []byte
+	busyLeft    int // QueryImage responses to answer Busy before UpdateAvailable
+	awaitLeft   int // ApplyUpdate responses to answer AwaitNextAction before Proceed
+	discontinue bool
+	queries     int
+	applies     int
+	notified    []uint32
+	served      []error
 }
 
 // attach makes the harness controller an OTA provider.
@@ -60,6 +89,10 @@ func (p *provider) attach(h *harness) {
 	n.AddCluster(ep, &clusters.OTAProvider{
 		QueryImage: func(ctx *im.Context, q *clusters.QueryImage) clusters.QueryImageResponse {
 			p.queries++
+			if p.busyLeft > 0 {
+				p.busyLeft--
+				return clusters.QueryImageResponse{Status: clusters.OTABusy, DelayedActionTime: 10}
+			}
 			if q.SoftwareVersion >= p.version {
 				return clusters.QueryImageResponse{Status: clusters.OTANotAvailable}
 			}
@@ -71,6 +104,13 @@ func (p *provider) attach(h *harness) {
 			p.applies++
 			if !bytes.Equal(token, p.token) || version != p.version {
 				return clusters.OTAApplyDiscontinue, 0
+			}
+			if p.discontinue {
+				return clusters.OTAApplyDiscontinue, 0
+			}
+			if p.awaitLeft > 0 {
+				p.awaitLeft--
+				return clusters.OTAApplyAwaitNextAction, 10
 			}
 			return clusters.OTAApplyProceed, 0
 		},
@@ -306,5 +346,139 @@ func TestOTADefaultProviders(t *testing.T) {
 	h.w.Advance(10 * time.Second)
 	if p.queries != 1 || h.dev.OTA.State() != clusters.OTAStateIdle || images.header != nil {
 		t.Fatalf("%d queries, state %d", p.queries, h.dev.OTA.State())
+	}
+}
+
+func TestOTACorruptDigest(t *testing.T) {
+	images := &memImages{}
+	h := otaHarness(t, nil, images, 1)
+	_, s := h.commission()
+	payload := make([]byte, 3000)
+	rand.Read(payload)
+	img := testImage(t, 0x8000, payload)
+	// Flip a byte inside the payload after the header so SHA-256 verification fails.
+	img[len(img)-10] ^= 0x55
+	p := &provider{image: img, version: 2, token: bytes.Repeat([]byte{9}, 32)}
+	p.attach(h)
+
+	announce(h, s)
+	h.w.Advance(30 * time.Second)
+	if !images.aborted || images.applied || images.done {
+		t.Fatalf("corrupt digest store state: %+v", images)
+	}
+	if p.applies != 0 || h.dev.OTA.State() != clusters.OTAStateIdle {
+		t.Fatalf("applies=%d state=%d, want 0 and Idle", p.applies, h.dev.OTA.State())
+	}
+}
+
+func TestOTAPacketLoss(t *testing.T) {
+	images := &memImages{}
+	h := otaHarness(t, nil, images, 1)
+	_, s := h.commission()
+	payload := make([]byte, 8192)
+	rand.Read(payload)
+	p := &provider{image: testImage(t, 0x8000, payload), version: 2, token: bytes.Repeat([]byte{3}, 32)}
+	p.attach(h)
+
+	// Drop 1 out of every 5 packets during the BDX download; MRP must recover.
+	seen := 0
+	h.w.Drop = func(pk simnet.Packet) bool {
+		seen++
+		return seen%5 == 0
+	}
+	announce(h, s)
+	h.w.Advance(90 * time.Second)
+	h.w.Drop = nil
+	if !images.done || !images.applied || !bytes.Equal(images.data, payload) {
+		t.Fatalf("packet-loss OTA failed: done=%v applied=%v got=%d bytes", images.done, images.applied, len(images.data))
+	}
+}
+
+func TestOTAApplyDiscontinue(t *testing.T) {
+	store := &storage.Memory{}
+	images := &memImages{}
+	h := otaHarness(t, store, images, 1)
+	_, s := h.commission()
+	p := &provider{image: testImage(t, 0x8000, []byte("candidate")), version: 2, token: bytes.Repeat([]byte{4}, 32), discontinue: true}
+	p.attach(h)
+
+	announce(h, s)
+	h.w.Advance(30 * time.Second)
+	if !images.done || !images.aborted || images.applied {
+		t.Fatalf("discontinue store state: done=%v aborted=%v applied=%v", images.done, images.aborted, images.applied)
+	}
+	if h.dev.OTA.State() != clusters.OTAStateIdle {
+		t.Fatalf("state=%d, want Idle", h.dev.OTA.State())
+	}
+}
+
+func TestOTAApplyAwaitNextAction(t *testing.T) {
+	images := &memImages{}
+	h := otaHarness(t, nil, images, 1)
+	_, s := h.commission()
+	p := &provider{image: testImage(t, 0x8000, []byte("delayed apply")), version: 2, token: bytes.Repeat([]byte{5}, 32), awaitLeft: 1}
+	p.attach(h)
+
+	announce(h, s)
+	h.w.Advance(30 * time.Second)
+	if images.applied || h.dev.OTA.State() != clusters.OTAStateDelayedOnApply {
+		t.Fatalf("expected DelayedOnApply, got state=%d applied=%v", h.dev.OTA.State(), images.applied)
+	}
+	// Advance past otaBusyRetry (2 minutes).
+	h.w.Advance(3 * time.Minute)
+	if !images.applied || p.applies != 2 {
+		t.Fatalf("after delay: applied=%v applies=%d, want true and 2", images.applied, p.applies)
+	}
+}
+
+func TestOTAProviderBusyRetries(t *testing.T) {
+	images := &memImages{}
+	h := otaHarness(t, nil, images, 1)
+	_, s := h.commission()
+	p := &provider{image: testImage(t, 0x8000, []byte("after busy")), version: 2, token: bytes.Repeat([]byte{6}, 32), busyLeft: 2}
+	p.attach(h)
+
+	announce(h, s)
+	h.w.Advance(30 * time.Second)
+	if h.dev.OTA.State() != clusters.OTAStateDelayedOnQuery || p.queries != 1 {
+		t.Fatalf("after first Busy: state=%d queries=%d", h.dev.OTA.State(), p.queries)
+	}
+	h.w.Advance(6 * time.Minute)
+	if p.queries != 3 || !images.applied {
+		t.Fatalf("after retries: queries=%d applied=%v, want 3 and true", p.queries, images.applied)
+	}
+}
+
+func TestOTAImageStoreErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*memImages)
+	}{
+		{"begin", func(m *memImages) { m.beginErr = errors.New("flash busy") }},
+		{"write", func(m *memImages) { m.writeErr = errors.New("flash write failed") }},
+		{"finish", func(m *memImages) { m.finishErr = errors.New("flash crc mismatch") }},
+		{"apply", func(m *memImages) { m.applyErr = errors.New("restart failed") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			images := &memImages{}
+			tc.setup(images)
+			h := otaHarness(t, nil, images, 1)
+			_, s := h.commission()
+			p := &provider{image: testImage(t, 0x8000, bytes.Repeat([]byte{0xAB}, 2500)), version: 2, token: bytes.Repeat([]byte{8}, 32)}
+			p.attach(h)
+
+			announce(h, s)
+			h.w.Advance(30 * time.Second)
+			if h.dev.OTA.State() != clusters.OTAStateIdle {
+				t.Fatalf("state=%d after %s error, want Idle", h.dev.OTA.State(), tc.name)
+			}
+			if images.applied {
+				t.Fatalf("image applied despite %s error", tc.name)
+			}
+			if tc.name != "begin" && !images.aborted {
+				t.Fatalf("store.Abort not called after %s error", tc.name)
+			}
+		})
 	}
 }

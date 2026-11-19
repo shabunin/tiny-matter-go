@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26"
+  TINYGO_VERSION: "0.44.0"
+
+jobs:
+  go-test:
+    name: Go (vet, race, 32-bit, firmware host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet and test root module (race)
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Test 32-bit (GOARCH=386)
+        run: GOARCH=386 go test -count=1 ./...
+
+      - name: Test host-runnable firmware packages (including ESP32-S3 OTA sim)
+        run: make test-firmware
+
+      - name: Build host binaries
+        run: |
+          go build -o /dev/null ./cmd/hostdevice
+          go build -o /dev/null ./cmd/tmctl
+
+      - name: Vet probe module
+        run: cd probe && go vet ./crypto ./devicesize ./hello ./onchip ./p256time ./stackcheck ./tlvcheck
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run fuzz targets (10s each)
+        run: make fuzz FUZZTIME=10s
+
+  tinygo:
+    name: TinyGo tests & MCU cross-builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install TinyGo ${{ env.TINYGO_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz" -o /tmp/tinygo.tar.gz
+          tar -C /usr/local -xzf /tmp/tinygo.tar.gz
+          rm /tmp/tinygo.tar.gz
+          echo "/usr/local/tinygo/bin" >> "$GITHUB_PATH"
+          /usr/local/tinygo/bin/tinygo version
+
+      - name: Cache TinyGo build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinygo
+          key: tinygo-${{ env.TINYGO_VERSION }}-${{ hashFiles('go.mod', 'firmware/go.mod', 'firmware/go.sum') }}
+          restore-keys: tinygo-${{ env.TINYGO_VERSION }}-
+
+      - name: Run TinyGo unit tests
+        run: make tinygo-test
+
+      - name: Cross-compile board probes and sizes
+        run: make cross
+
+      - name: Build classic ESP32 firmware targets
+        run: |
+          cd firmware
+          tinygo build -target m5stack -stack-size=10KB -o /dev/null ./esp32-node
+          tinygo build -target m5stick-c -stack-size=10KB -o /dev/null ./esp32-node
+
+  esp32s3-ota:
+    name: ESP32-S3 OTA gate (real TinyGo build + NOR flash sim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install TinyGo ${{ env.TINYGO_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz" -o /tmp/tinygo.tar.gz
+          tar -C /usr/local -xzf /tmp/tinygo.tar.gz
+          rm /tmp/tinygo.tar.gz
+          echo "/usr/local/tinygo/bin" >> "$GITHUB_PATH"
+          /usr/local/tinygo/bin/tinygo version
+
+      - name: Cache TinyGo build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinygo
+          key: tinygo-ota-${{ env.TINYGO_VERSION }}-${{ hashFiles('go.mod', 'firmware/go.mod', 'firmware/go.sum') }}
+          restore-keys: tinygo-ota-${{ env.TINYGO_VERSION }}-
+
+      - name: Build, verify and simulate ESP32-S3 OTA end-to-end
+        run: make verify-esp32s3-ota
