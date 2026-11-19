@@ -3,10 +3,8 @@
 package main
 
 import (
-	tinydev "device"
 	"device/esp"
 	"machine"
-	"runtime/interrupt"
 	"runtime/volatile"
 	"time"
 	"unsafe"
@@ -123,9 +121,7 @@ func newApp(d *device.Device) func(now time.Time) {
 	d.Node.AddCluster(sw, clusters.Descriptor{},
 		&clusters.Identify{Type: clusters.IdentifyNone}, d.NewBinding())
 
-	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	ledPin.Low()
-	busyWait(tReset)
+	initLEDs()
 	l.show([3]uint8{0, 0, 8}) // dim blue: starting
 	machine.InitADC()
 	l.knob = machine.ADC{Pin: knobPin}
@@ -280,59 +276,73 @@ func (l *light) render(now time.Time) {
 	}
 }
 
-func ccount() uint32 { return uint32(tinydev.AsmFull("rsr {}, CCOUNT", nil)) }
-
-// SK6812 timing in CPU cycles at 160 MHz (6.25 ns per cycle).
+// ESP32 RMT channel 0 drives the 10 SK6812 LEDs on GPIO15 in hardware (no
+// interrupt masking, no flash XIP / ICache timing sensitivity).
 const (
-	t0High = 52        // 0.325 us (SK6812: 0.30 ± 0.15 us)
-	t1High = 112       // 0.70 us  (SK6812: 0.60 ± 0.15 us)
-	tBit   = 200       // 1.25 us
-	tReset = 300 * 240 // >= 300 us latch (450 us at 160 MHz)
+	rmtSigOut0 = 87         // ESP32 GPIO matrix: RMT_SIG_OUT0_IDX
+	rmtMemBase = 0x3FF56800 // RMT channel 0 RAM (4 blocks * 64 words = 256 words)
+
+	// RMT clock = 80 MHz APB / 2 = 40 MHz (25 ns per tick).
+	// Item format: [14:0] dur0, [15] lvl0, [30:16] dur1, [31] lvl1.
+	rmtBit0 = (1 << 15) | 12 | (36 << 16) // 300 ns high, 900 ns low
+	rmtBit1 = (1 << 15) | 26 | (24 << 16) // 650 ns high, 600 ns low
 )
 
-func busyWait(cycles uint32) {
-	start := ccount()
-	for ccount()-start < cycles {
-	}
-}
+func initLEDs() {
+	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	ledPin.Low()
 
-// writeStrip sends the same GRB colour to all numLEDs SK6812 pixels, timing
-// bits with the CPU cycle counter. Marked noinline so show's two passes run
-// the exact same flash addresses and the second pass hits warm ICache.
-//
-//go:noinline
-func writeStrip(c [3]uint8) {
-	set, setMask := ledPin.PortMaskSet()
-	clr, clrMask := ledPin.PortMaskClear()
-	setReg := (*volatile.Register32)(unsafe.Pointer(set))
-	clrReg := (*volatile.Register32)(unsafe.Pointer(clr))
-	data := uint32(c[1])<<16 | uint32(c[0])<<8 | uint32(c[2]) // GRB
-	state := interrupt.Disable()
-	for p := 0; p < numLEDs; p++ {
-		for i := 23; i >= 0; i-- {
-			high := uint32(t0High)
-			if data>>uint(i)&1 != 0 {
-				high = t1High
-			}
-			start := ccount()
-			setReg.Set(setMask)
-			for ccount()-start < high {
-			}
-			clrReg.Set(clrMask)
-			for ccount()-start < tBit {
-			}
-		}
-	}
-	interrupt.Restore(state)
+	esp.DPORT.SetPERIP_CLK_EN_RMT_CLK_EN(1)
+	esp.DPORT.SetPERIP_RST_EN_RMT_RST(1)
+	esp.DPORT.SetPERIP_RST_EN_RMT_RST(0)
+
+	esp.RMT.SetAPB_CONF_APB_FIFO_MASK(1)
+	esp.RMT.SetAPB_CONF_MEM_TX_WRAP_EN(0)
+
+	esp.RMT.SetCH0CONF0_MEM_PD(0)
+	esp.RMT.SetCH0CONF0_CLK_EN(1)
+	esp.RMT.SetCH0CONF0_DIV_CNT(2)
+	esp.RMT.SetCH0CONF0_MEM_SIZE(4) // 256 items: 240 bits + end marker
+	esp.RMT.SetCH0CONF0_CARRIER_EN(0)
+
+	esp.RMT.SetCH0CONF1_TX_START(0)
+	esp.RMT.SetCH0CONF1_RX_EN(0)
+	esp.RMT.SetCH0CONF1_MEM_OWNER(0)
+	esp.RMT.SetCH0CONF1_TX_CONTI_MODE(0)
+	esp.RMT.SetCH0CONF1_REF_ALWAYS_ON(1)
+	esp.RMT.SetCH0CONF1_IDLE_OUT_LV(0)
+	esp.RMT.SetCH0CONF1_IDLE_OUT_EN(1)
+	esp.RMT.SetCH0CONF1_REF_CNT_RST(1)
+	esp.RMT.SetCH0CONF1_REF_CNT_RST(0)
+
+	// Route RMT channel 0 output to GPIO15, keeping GPIO_ENABLE as OEN.
+	esp.GPIO.FUNC15_OUT_SEL_CFG.Set(rmtSigOut0)
+	esp.GPIO.SetFUNC15_OUT_SEL_CFG_OEN_SEL(1)
 }
 
 func (l *light) show(c [3]uint8) {
-	// Code runs from flash XIP: the first pass may stall on ICache misses
-	// and stretch a pulse (lighting LED 0 green); the second runs hot from
-	// ICache after a > 300 us latch pause and overwrites any glitch.
-	writeStrip(c)
-	busyWait(tReset)
-	writeStrip(c)
+	if l.drawn {
+		for i := 0; i < 20000 && esp.RMT.INT_RAW.Get()&esp.RMT_INT_RAW_CH0_TX_END == 0; i++ {
+		}
+	}
+	mem := (*[numLEDs*24 + 1]volatile.Register32)(unsafe.Pointer(uintptr(rmtMemBase)))
+	data := uint32(c[1])<<16 | uint32(c[0])<<8 | uint32(c[2]) // GRB
+	idx := 0
+	for p := 0; p < numLEDs; p++ {
+		for i := 23; i >= 0; i-- {
+			if data>>uint(i)&1 != 0 {
+				mem[idx].Set(rmtBit1)
+			} else {
+				mem[idx].Set(rmtBit0)
+			}
+			idx++
+		}
+	}
+	mem[idx].Set(0) // end-of-transmission marker
+	esp.RMT.INT_CLR.Set(esp.RMT_INT_CLR_CH0_TX_END)
+	esp.RMT.SetCH0CONF1_MEM_RD_RST(1)
+	esp.RMT.SetCH0CONF1_MEM_RD_RST(0)
+	esp.RMT.SetCH0CONF1_TX_START(1)
 	l.shown, l.drawn = c, true
 }
 
