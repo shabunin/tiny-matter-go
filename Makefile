@@ -17,10 +17,10 @@ test-race:
 test32:
 	GOARCH=386 go test $(PKGS)
 
-# Host-runnable tests in the firmware module (sensors, BLE HCI, ESP32-S3 OTA slot/loader simulation).
+# Host-runnable tests in the firmware module (sensors, BLE HCI, ESP32 and RP2350 OTA layouts).
 test-firmware:
-	cd firmware && go vet ./envsensor ./matterble ./espslot ./espota
-	cd firmware && go test -race -count=1 ./envsensor ./matterble ./espslot ./espota
+	cd firmware && go vet ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot
+	cd firmware && go test -race -count=1 ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot
 
 tinygo-test:
 	tinygo test ./tlv ./ota ./bdx ./crypto/internal/nistec/fiat ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip4 ./ip6 ./mdns ./storage ./onboarding ./thread
@@ -55,7 +55,8 @@ build-firmware:
 	cd firmware && tinygo build -target ./esp32-loader/target.json -o /dev/null ./esp32-loader
 	cd firmware && tinygo build -target m5stack -stack-size=10KB -o /dev/null ./esp32-node
 	cd firmware && tinygo build -target m5stick-c -stack-size=10KB -o /dev/null ./esp32-node
-	cd firmware && tinygo build -target pico2-w -stack-size=16KB -o /dev/null ./pico2w-light
+	cd firmware && tinygo build -target pico2-w -stack-size=16KB -o /tmp/tmg-pico2w.elf ./pico2w-light
+	cd firmware && go run ./rpslot payload -elf /tmp/tmg-pico2w.elf -o /dev/null
 
 # Build the real ESP32-S3 loader and firmware, statically verify all memory-map,
 # symbol, checksum and headroom invariants, package a real Matter .ota file, and

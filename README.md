@@ -26,7 +26,7 @@ and no vendor SDK. A host controller, `tmctl`, comes with it.
 | M5Stack Cardputer | ESP32-S3 | Colour light and button; BLE commissioning, OTA updates |
 | M5Stack Core + M5GO base | ESP32 | Colour light on the LED bar, colour dimmer switch |
 | M5StickC Plus + ENV unit | ESP32 | Temperature, humidity and pressure sensor |
-| Raspberry Pi Pico 2 W | RP2350 + CYW43439 | On/off light on the LED; BLE commissioning |
+| Raspberry Pi Pico 2 W | RP2350 + CYW43439 | On/off light on the LED; BLE commissioning, OTA updates |
 | Your computer | Linux | `cmd/hostdevice`: any of the device types above, over UDP (mDNS via avahi) |
 
 It works with chip-tool, [matter.js](https://github.com/matter-js/matter.js),
@@ -69,8 +69,9 @@ Clusters, attributes and commands go by their names in the SDK's data model. `tm
 ## Roadmap
 
 - [x] **Raspberry Pi Pico 2 W:** an on/off light over Wi-Fi (the CYW43439), on the same IPv6,
-  IPv4 and mDNS stacks, commissioned over BLE (`firmware/pico2w-light`)
-- [ ] **Pico W / Pico 2 W:** OTA; the Pico W (RP2040)
+  IPv4 and mDNS stacks, commissioned over BLE, updated over the air on the boot ROM's A/B
+  partitions (`firmware/pico2w-light`)
+- [ ] **Pico W (RP2040)**
 - [ ] **Thread:** devices on an 802.15.4 radio (nRF52840, ESP32-C6/H2). Thread datasets are already
   parsed and provisioned, by the device and by `tmctl`, though this is untested on Thread hardware.
 - [x] Global IPv6 addresses (SLAAC)

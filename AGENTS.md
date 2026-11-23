@@ -79,13 +79,15 @@ There are three Go modules:
 |---|---|
 | `firmware/esp32s3-light/` | ESP32-S3 (M5Stack Cardputer) firmware. Endpoint 1: Extended Color Light on the RGB LED, with scenes and groups. Endpoint 2: the G0 button as a Generic Switch. Optional Grove units: an ENV sensor on endpoints 3-5, a PIR on endpoint 6. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. OTA requestor when started by the loader. |
 | `firmware/esp32-node/` | Classic ESP32 boards; the TinyGo target picks the board. `m5stack` is an M5Stack Core with the M5GO base: a colour light on the LED bar plus a Color Dimmer Switch (endpoint 2) worked by an angle unit and buttons. `m5stick-c` is an M5StickC Plus with an ENV unit: temperature, humidity and pressure (endpoints 1-3). Commissioned over IP only. |
-| `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. Test builds can reboot into the UF2 bootloader by a test event trigger. |
+| `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. OTA requestor when running from a partition. Test builds can reboot into the UF2 bootloader by a test event trigger. |
 | `firmware/wifinode/` | Shared Wi-Fi runner over a `Radio` interface: joins the network (rejoining for radios that don't), runs `ip6` and `ip4`, advertises with `mdns`, resolves nodes, joins group addresses (and programs the radio's multicast filter), feeds the device. |
 | `firmware/espwifi/` | The ESP32 and ESP32-S3 radio (`espradio`) as a `wifinode.Radio`. |
 | `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, no scan. Optionally starts the Bluetooth controller for HCI. |
 | `firmware/rptrng/` | RP2350 TRNG reader with the health tests on and SHA-256 conditioning. |
 | `firmware/rpwatchdog/` | RP2350 watchdog, reboot (a full chip reset, USB included) and last reset reason. |
-| `firmware/rpflash/` | RP2350 flash as a `storage.BlockDevice` at absolute offsets, with aligned sector erases and whole-page writes. |
+| `firmware/rpflash/` | A range of the RP2350 flash as a `storage.BlockDevice` at physical offsets (read through the untranslated XIP window), with aligned sector erases and whole-page writes. |
+| `firmware/rpota/` | RP2350 OTA on the boot ROM's A/B partitions: the layout, the partition table and UF2 encoding (host-testable), and a `device.ImageStore` that writes the other partition, confirms a trial image (`explicit_buy`) and reboots into an update (FLASH_UPDATE). |
+| `firmware/rpslot/` | Host tool: the one-time partition-table UF2, firmware UF2s with the RP2350-E10 workaround, and OTA payloads (the image flagged TBYB). |
 | `firmware/matterble/` | Matter BLE peripheral over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp`. `Options` caps the MTU for controllers with short HCI writes and runs vendor setup (an address) after the reset. |
 | `firmware/climate/`, `firmware/envsensor/` | ENV unit endpoints; SHT3x and BMP280 drivers. |
 | `firmware/pir/` | PIR as an Occupancy Sensor endpoint. |
@@ -389,15 +391,16 @@ tinygo flash -target m5stack   -stack-size=10KB -ldflags "-X main.ssid=... -X ma
 tinygo flash -target m5stick-c -stack-size=10KB -ldflags "-X main.ssid=... -X main.password=..." ./esp32-node
 ```
 
-**Raspberry Pi Pico 2 W:**
+**Raspberry Pi Pico 2 W:** the flash is partitioned for OTA. Once, with the board in BOOTSEL mode,
+copy the partition table to its drive, then the firmware:
 
 ```sh
-tinygo flash -target pico2-w -stack-size=16KB ./pico2w-light                    # BLE commissioning
-tinygo flash -target pico2-w -stack-size=16KB \
-    -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light               # on-network
+go run ./rpslot install -o install.uf2                                  # copy to the RP2350 drive
+tinygo build -target pico2-w -stack-size=16KB -o app.elf ./pico2w-light  # BLE commissioning
+tinygo build -target pico2-w -stack-size=16KB \
+    -ldflags "-X main.ssid=... -X main.password=..." -o app.elf ./pico2w-light  # on-network
+go run ./rpslot uf2 -elf app.elf -o app.uf2                              # copy to the drive
 ```
-
-Or copy a UF2 (`tinygo build ... -o app.uf2`) to the RP2350 drive the board shows with BOOTSEL held.
 
 - **Stack sizes are required:** 12 KB on the S3, 10 KB on the ESP32 and 16 KB on the Pico 2 W
   (520 KB of RAM). Commissioning takes the main goroutine past the 8 KB default: on the Pico 2 W
@@ -419,7 +422,28 @@ Or copy a UF2 (`tinygo build ... -o app.uf2`) to the RP2350 drive the board show
 
 **Pico 2 W notes:**
 
-- State lives in the last 32 KB of the 4 MB flash (`rpflash`). Fabrics survive reflashing.
+- **Flash layout (`rpota`):** the partition table in sector 0, partition A at `0x2000`,
+  partition B at `0x1FD000` (about 2 MB each), and the state in the last 32 KB (`0x3F8000`), outside
+  both. The boot ROM maps the partition it boots at `0x10000000`, so one image runs from either.
+  Fabrics survive reflashing and updates.
+- **OTA updates:**
+  - The image is written to the partition that isn't running, with its IMAGE_DEF flagged "try
+    before you buy" (TBYB), and started by a FLASH_UPDATE reboot. The ROM boots a TBYB image only
+    then.
+  - The image confirms itself (`explicit_buy`) 20 s after reaching the network; the ROM then erases
+    the other partition's first sector. A reset before that, or 3 minutes without confirming,
+    starts the previous image, and the device reports the failed update.
+  - An 800 KB image downloads in about 22 s.
+
+  ```sh
+  go run ./rpslot payload -elf app.elf -o app.payload   # built with -X main.softwareVersion=N
+  tmctl ota-image app.payload app-N.ota -vendor 0xFFF1 -product 0x8000 -version N
+  tmctl ota-update <node> app-N.ota
+  ```
+
+- **Reflashing over USB:** a UF2 dropped on the drive also goes to the partition that isn't running
+  and takes over, without a trial. Images without a partition table (`tinygo flash`) run with
+  updates disabled.
 - BLE commissioning (`tmctl commission <code> -ssid <network>`) takes about 25 s, mostly the Wi-Fi
   join. The controller's firmware starts with the same public address on every board; the
   firmware sets the Wi-Fi address plus one, as the Pico SDK does. The driver writes HCI packets
@@ -558,7 +582,7 @@ cd firmware
 tinygo build -target esp32s3-generic -stack-size=12KB -o /tmp/s3.elf ./esp32s3-light
 tinygo build -target m5stack -stack-size=10KB -o /tmp/m5.bin ./esp32-node
 tinygo build -target m5stick-c -stack-size=10KB -o /tmp/stick.bin ./esp32-node
-tinygo build -target pico2-w -stack-size=16KB -o /tmp/pico.uf2 ./pico2w-light
+tinygo build -target pico2-w -stack-size=16KB -o /tmp/pico.elf ./pico2w-light
 ```
 
 `make build-firmware` builds them all.
@@ -662,6 +686,15 @@ say so.
   RP2040-shaped too (reset selection, tick); use `rpwatchdog`.
 - **TinyGo's RP2 `crypto/rand` and `machine.GetRNG` sample the ring oscillator:** not for keys.
   Use `rptrng`.
+- **The RP2350 A2 boot ROM ignores UF2s for a partition** (erratum RP2350-E10) unless an
+  absolute-family block comes first. `rpslot uf2` adds one, aimed at the unused slot-1 sector;
+  picotool's default target, the end of 16 MB, is the end of the 4 MB flash, where the state lives.
+  So once the partition table is in, `tinygo flash` and TinyGo's UF2s are silently ignored (the
+  drive accepts the copy and nothing happens).
+- **TinyGo's `-o app.bin` for the RP2350 writes a UF2,** not a raw image. `rpslot` reads the ELF.
+- **Once the boot ROM runs an image from a partition, `0x10000000` is that partition,** and flash
+  beyond its size faults. Read physical flash through `0x1C000000` (no translation, no cache), as
+  `rpflash` does. The ROM's flash program and erase functions take physical offsets.
 
 ## 14. Performance (classic ESP32 at 160 MHz, TinyGo)
 
@@ -692,18 +725,16 @@ starting it.
 ### Raspberry Pi Pico W / Pico 2 W (RP2040 / RP2350 with a CYW43439)
 
 Already in place (Pico 2 W, `firmware/pico2w-light`): Wi-Fi through `cyw43wifi` with the hardware
-multicast filter, BLE commissioning through the CYW43439's HCI and `matterble`, the RP2350 TRNG,
-flash persistence, the watchdog. Commissioned with `tmctl` in
+multicast filter, BLE commissioning through the CYW43439's HCI and `matterble`, OTA updates on the
+boot ROM's A/B partitions (`rpota`), the RP2350 TRNG, flash persistence, the watchdog. Commissioned with `tmctl` in
 about 2 s; the firmware is about 780 KB of flash.
 
 To do:
 
 - **USB enumeration:** find why the RP2350's USB often fails to enumerate under TinyGo (see §8).
 - **Scan:** the driver cannot scan, so ScanNetworks reports no networks.
-- **OTA:** the RP2350 has partition and boot-slot support in its boot ROM. Map `device.ImageStore`
-  onto it.
 - **Pico W (RP2040):** entropy from the ring oscillator with conditioning, a flash device and a
-  second-stage loader for OTA.
+  second-stage loader for OTA (the RP2040 boot ROM has no partitions).
 
 ### Thread
 

@@ -8,13 +8,29 @@
 // product 0x8000), test passcode 20202021 and discriminator 3840. Built
 // without a network, it is commissioned over BLE, which provisions one:
 //
-//	tinygo flash -target pico2-w -stack-size=16KB ./pico2w-light
 //	tmctl commission 34970112332 -ssid <network>
 //
-// Built with a network, it joins it at once and is commissioned over IP:
+// Built with a network (-ldflags "-X main.ssid=... -X main.password=..."),
+// it joins it at once and is commissioned over IP.
 //
-//	tinygo flash -target pico2-w -stack-size=16KB -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light
-//	tmctl commission 34970112332
+// The flash is partitioned for OTA updates (see rpota). Once, with the
+// board in BOOTSEL mode, copy the partition table to its drive, then the
+// firmware (TinyGo's own UF2 does not load into a partition: rpslot adds
+// the RP2350-E10 workaround):
+//
+//	go run ./rpslot install -o install.uf2
+//	tinygo build -target pico2-w -stack-size=16KB -o app.elf ./pico2w-light
+//	go run ./rpslot uf2 -elf app.elf -o app.uf2
+//
+// Updates are OTA images of rpslot payloads, with a higher softwareVersion:
+//
+//	tinygo build -target pico2-w -stack-size=16KB -ldflags "-X main.softwareVersion=2" -o app.elf ./pico2w-light
+//	go run ./rpslot payload -elf app.elf -o app.payload
+//	tmctl ota-image app.payload app-2.ota -vendor 0xFFF1 -product 0x8000 -version 2
+//	tmctl ota-update <node> app-2.ota
+//
+// An update runs on trial and confirms itself 20 s after reaching the
+// network; a reset before that starts the previous image again.
 //
 // The LED blinks briefly every second until the light is commissioned,
 // then shows the light; it blinks quickly while a controller identifies it.
@@ -31,6 +47,7 @@ import (
 	"firmware/cyw43wifi"
 	"firmware/matterble"
 	"firmware/rpflash"
+	"firmware/rpota"
 	"firmware/rptrng"
 	"firmware/rpwatchdog"
 	"firmware/wifinode"
@@ -67,6 +84,11 @@ const (
 	// joinTimeout is how long to try a network provisioned over BLE
 	// before rebooting to be commissioned again.
 	joinTimeout = 60 * time.Second
+
+	// trialTimeout is how long an update has to confirm itself (20 s on
+	// the network) before the board reboots into the previous image.
+	trialTimeout = 3 * time.Minute
+	confirmDelay = 20 * time.Second
 )
 
 func fatal(msg string, err error) {
@@ -77,11 +99,12 @@ func fatal(msg string, err error) {
 }
 
 // stateStore keeps fabrics, the ACL, the network and the application
-// state in the last 32 KB of the flash, in two 16 KB slots.
+// state in the last 32 KB of the flash, in two 16 KB slots, after the
+// firmware partitions (see rpota).
 func stateStore() *storage.Flash {
 	const slot = 16 << 10
-	dev := &rpflash.Device{}
-	return &storage.Flash{Dev: dev, Offset: dev.Size() - 2*slot, SlotSize: slot}
+	dev := &rpflash.Device{Start: rpota.StateStart, End: rpota.FlashSize}
+	return &storage.Flash{Dev: dev, Offset: rpota.StateStart, SlotSize: slot}
 }
 
 // radio is the Wi-Fi chip (and the LED's).
@@ -128,6 +151,14 @@ func main() {
 	println("tiny-matter-go pico2w-light starting; USB enumerated on attempt", usbTries)
 	p256.SetYield(runtime.Gosched)
 	store := stateStore()
+	slots := rpota.NewStore()
+	slots.Log = func(msg string) { println(msg) }
+	println("boot:", slots.Boot().String())
+	var trialEnd time.Time
+	if _, trial, _ := slots.Running(); trial {
+		trialEnd = time.Now().Add(trialTimeout)
+		println("trial image: must confirm itself within", trialTimeout.String())
+	}
 
 	var err error
 	// Bluetooth is only for commissioning, which needs it when no network
@@ -157,6 +188,15 @@ func main() {
 	if err != nil || version == 0 {
 		version = 1
 	}
+	// Updates go to the other partition, when the boot ROM started us from
+	// one (see rpota for the one-time setup).
+	var updates device.ImageStore
+	if p, trial, ok := slots.Running(); ok {
+		println("running partition", "AB"[p:p+1], "trial", trial, "version", version)
+		updates = slots
+	} else {
+		println("not running from a partition: OTA updates disabled")
+	}
 	d, err := device.New(device.Config{
 		Transport: node.Transport, Rand: rng, Port: wifinode.MatterPort,
 		Verifier: v, Salt: salt, Iterations: iterations, Discriminator: discriminator,
@@ -178,6 +218,7 @@ func main() {
 		Log:        func(msg string) { println(msg) },
 		WiFi:       true,
 		Resolve:    node.Resolve,
+		Updates:    updates,
 	})
 	if err != nil {
 		fatal("device", err)
@@ -187,6 +228,11 @@ func main() {
 	reboot := func() {
 		radio.Dev.Leave()
 		rpwatchdog.Reboot()
+	}
+	// Before rebooting into an update: save the state, leave the network.
+	slots.Restart = func() {
+		d.Flush()
+		radio.Dev.Leave()
 	}
 	l := newLight(d, radio)
 	d.Diagnostics.BootReason = bootReason(reason)
@@ -201,12 +247,27 @@ func main() {
 	trig := triggers{d: d, reboot: reboot}
 	trig.enable()
 	usb := usbKeeper{done: usbTries > 0}
+	var confirmAt time.Time
 	all := func(now time.Time) {
 		heartbeat = now.UnixMilli()
 		l.poll(now)
 		con.poll()
 		trig.poll(now)
 		usb.poll(now)
+		if !confirmAt.IsZero() && now.After(confirmAt) && node.LinkUp() {
+			confirmAt = time.Time{}
+			if err := slots.Confirm(); err != nil {
+				println("confirming the image:", err.Error())
+			} else {
+				trialEnd = time.Time{}
+			}
+		}
+		if !trialEnd.IsZero() && now.After(trialEnd) {
+			// A normal boot starts the previous image: this one is still
+			// on trial.
+			println("trial image did not confirm itself: rebooting")
+			reboot()
+		}
 	}
 
 	// The network: stored, compiled in, or provisioned over BLE.
@@ -235,6 +296,9 @@ func main() {
 	if !node.Join(nw, all, giveUp) {
 		println("cannot join the network: rebooting")
 		reboot()
+	}
+	if !trialEnd.IsZero() {
+		confirmAt = time.Now().Add(confirmDelay)
 	}
 	node.Run(all)
 }

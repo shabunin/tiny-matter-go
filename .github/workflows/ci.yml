@@ -112,7 +112,10 @@ jobs:
       - name: Build Pico 2 W firmware
         run: |
           cd firmware
-          tinygo build -target pico2-w -stack-size=16KB -o /dev/null ./pico2w-light
+          tinygo build -target pico2-w -stack-size=16KB -o /tmp/pico.elf ./pico2w-light
+          # The OTA payload and UF2 need TinyGo's IMAGE_DEF block as rpota expects it.
+          go run ./rpslot payload -elf /tmp/pico.elf -o /dev/null
+          go run ./rpslot uf2 -elf /tmp/pico.elf -o /dev/null
 
   esp32s3-ota:
     name: ESP32-S3 OTA gate (real TinyGo build + NOR flash sim)
