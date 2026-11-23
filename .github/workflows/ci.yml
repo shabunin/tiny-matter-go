@@ -109,6 +109,11 @@ jobs:
           tinygo build -target m5stack -stack-size=10KB -o /dev/null ./esp32-node
           tinygo build -target m5stick-c -stack-size=10KB -o /dev/null ./esp32-node
 
+      - name: Build Pico 2 W firmware
+        run: |
+          cd firmware
+          tinygo build -target pico2-w -stack-size=16KB -o /dev/null ./pico2w-light
+
   esp32s3-ota:
     name: ESP32-S3 OTA gate (real TinyGo build + NOR flash sim)
     runs-on: ubuntu-latest

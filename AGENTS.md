@@ -15,7 +15,8 @@ tiny-matter-go is a Matter (CSA smart-home standard, spec 1.4) **device** stack 
   groups, OTA, diagnostics).
 - **Commissioning:** BLE (BTP) and on-network commissioning.
 - **Networking:** its own minimal IPv6, IPv4 and mDNS stacks over raw Ethernet frames, so it runs on
-  bare-metal Wi-Fi chips (ESP32 via `tinygo.org/x/espradio`) without an OS network stack.
+  bare-metal Wi-Fi chips (ESP32 via `tinygo.org/x/espradio`, the Pico 2 W's CYW43439 via
+  `soypat/cyw43439`) without an OS network stack.
 - **A host controller:** the `controller` package and the `tmctl` CLI.
 
 Status: v0.x, and APIs change freely. It is not certified. The examples use the Matter SDK's public
@@ -29,7 +30,7 @@ There are three Go modules:
 | Module | Path | Notes |
 |---|---|---|
 | `github.com/shabunin/tiny-matter-go` | `/` | The stack, controller, tmctl, hostdevice. `make test` covers this module only. |
-| `firmware` | `firmware/` | TinyGo firmware for ESP32/ESP32-S3; `replace` points at `../`. Builds only with TinyGo. |
+| `firmware` | `firmware/` | TinyGo firmware for ESP32/ESP32-S3 and the Pico 2 W; `replace` points at `../`. Builds only with TinyGo. |
 | `probe` | `probe/` | Feasibility probes, benchmarks, size checks; `replace` points at `../`. |
 
 ### Packages of the root module
@@ -78,7 +79,13 @@ There are three Go modules:
 |---|---|
 | `firmware/esp32s3-light/` | ESP32-S3 (M5Stack Cardputer) firmware. Endpoint 1: Extended Color Light on the RGB LED, with scenes and groups. Endpoint 2: the G0 button as a Generic Switch. Optional Grove units: an ENV sensor on endpoints 3-5, a PIR on endpoint 6. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. OTA requestor when started by the loader. |
 | `firmware/esp32-node/` | Classic ESP32 boards; the TinyGo target picks the board. `m5stack` is an M5Stack Core with the M5GO base: a colour light on the LED bar plus a Color Dimmer Switch (endpoint 2) worked by an angle unit and buttons. `m5stick-c` is an M5StickC Plus with an ENV unit: temperature, humidity and pressure (endpoints 1-3). Commissioned over IP only. |
-| `firmware/wifinode/` | Shared Wi-Fi runner for ESP32 and S3: joins the network, runs `ip6` and `ip4`, advertises with `mdns`, resolves nodes, joins group addresses, feeds the device. |
+| `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioned over IP (Wi-Fi credentials compiled in). Test builds can reboot into the UF2 bootloader by a test event trigger. |
+| `firmware/wifinode/` | Shared Wi-Fi runner over a `Radio` interface: joins the network (rejoining for radios that don't), runs `ip6` and `ip4`, advertises with `mdns`, resolves nodes, joins group addresses (and programs the radio's multicast filter), feeds the device. |
+| `firmware/espwifi/` | The ESP32 and ESP32-S3 radio (`espradio`) as a `wifinode.Radio`. |
+| `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, no scan. |
+| `firmware/rptrng/` | RP2350 TRNG reader with the health tests on and SHA-256 conditioning. |
+| `firmware/rpwatchdog/` | RP2350 watchdog, reboot (a full chip reset, USB included) and last reset reason. |
+| `firmware/rpflash/` | RP2350 flash as a `storage.BlockDevice` at absolute offsets, with aligned sector erases and whole-page writes. |
 | `firmware/matterble/` | Matter BLE peripheral over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp`. |
 | `firmware/climate/`, `firmware/envsensor/` | ENV unit endpoints; SHT3x and BMP280 drivers. |
 | `firmware/pir/` | PIR as an Occupancy Sensor endpoint. |
@@ -382,8 +389,17 @@ tinygo flash -target m5stack   -stack-size=10KB -ldflags "-X main.ssid=... -X ma
 tinygo flash -target m5stick-c -stack-size=10KB -ldflags "-X main.ssid=... -X main.password=..." ./esp32-node
 ```
 
-- **Stack sizes are required:** 12 KB on the S3 and 10 KB on the ESP32. Commissioning takes the main
-  goroutine past the 8 KB default. Do not go higher on the ESP32: goroutine stacks come out of the
+**Raspberry Pi Pico 2 W:**
+
+```sh
+tinygo flash -target pico2-w -stack-size=16KB -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light
+```
+
+Or copy a UF2 (`tinygo build ... -o app.uf2`) to the RP2350 drive the board shows with BOOTSEL held.
+
+- **Stack sizes are required:** 12 KB on the S3, 10 KB on the ESP32 and 16 KB on the Pico 2 W
+  (520 KB of RAM). Commissioning takes the main goroutine past the 8 KB default: on the Pico 2 W
+  that overflowed with a HardFault at AddTrustedRootCertificate. Do not go higher on the ESP32: goroutine stacks come out of the
   ~150 KB heap.
 - **Wi-Fi credentials go only through `-ldflags -X`.** Never commit them, and never print them in
   logs.
@@ -398,6 +414,24 @@ tinygo flash -target m5stick-c -stack-size=10KB -ldflags "-X main.ssid=... -X ma
 - **Test event triggers:** a test build with `-X main.testEventKey=<32 hex>` enables them on the
   Cardputer. 0x003B000000000001 clicks G0, 0x003B000000000002 holds it, and 0x002A000000000100 makes
   the node query its default OTA providers.
+
+**Pico 2 W notes:**
+
+- State lives in the last 32 KB of the 4 MB flash (`rpflash`). Fabrics survive reflashing.
+- USB often fails to enumerate (the host logs "device not accepting address, error -71"), after
+  any kind of start. The firmware re-attaches USB (drops the D+ pull-up) until a host enumerates
+  it, which takes up to about 10 s. The Matter side runs regardless. Cause unknown.
+- `machine.CPUReset` leaves USB dead until a replug: reboot with `rpwatchdog.Reboot`.
+- A test build (`-X main.testEventKey=<32 hex>`) reboots into the UF2 bootloader on test event
+  trigger `0xFFF1000000000001`, for flashing without the button, and reboots on
+  `0xFFF1000000000002`:
+
+  ```sh
+  tmctl invoke <node> 0 GeneralDiagnostics TestEventTrigger enableKey=hex:<key> eventTrigger=0xFFF1000000000001
+  ```
+
+- On the USB console, `reboot` and `factory-reset` work the board.
+- The LED blinks briefly every second until commissioned, and quickly while identifying.
 
 ### OTA on the ESP32 and ESP32-S3 (two slots)
 
@@ -515,7 +549,10 @@ cd firmware
 tinygo build -target esp32s3-generic -stack-size=12KB -o /tmp/s3.elf ./esp32s3-light
 tinygo build -target m5stack -stack-size=10KB -o /tmp/m5.bin ./esp32-node
 tinygo build -target m5stick-c -stack-size=10KB -o /tmp/stick.bin ./esp32-node
+tinygo build -target pico2-w -stack-size=16KB -o /tmp/pico.uf2 ./pico2w-light
 ```
+
+`make build-firmware` builds them all.
 
 - **Multi-node tests** use `internal/simnet` (deterministic clock and packet delivery; `Drop` hooks).
   `im` tests have a fixture with a device node and a client session (`im/im_test.go`). `device`
@@ -580,7 +617,8 @@ say so.
   - Built binaries (for example a `hostdevice` binary in the root).
 - **Matter only:** control devices through Matter, not vendor-private APIs.
 - **Dependencies:** keep the root module dependency-light (standard library plus TinyGo-compatible
-  code). The firmware module adds `tinygo.org/x/bluetooth` and `tinygo.org/x/espradio`.
+  code). The firmware module adds `tinygo.org/x/bluetooth`, `tinygo.org/x/espradio` and
+  `github.com/soypat/cyw43439` (replaced by the fork with `Leave` and `RSSI`).
 
 ## 13. Pitfalls (learned the hard way)
 
@@ -602,6 +640,19 @@ say so.
 - **Board timings jitter about ±8% with code layout** (32 KB flash cache). Compare against an
   untouched operation.
 - **The M5GO's chip has 16 MB of flash,** although images report 4 MB from their header.
+- **Wi-Fi access points keep stale associations.** After a station resets without leaving (crash,
+  power cut, reflash), the next join may associate but never finish the WPA handshake, and every
+  retry keeps that state alive. `cyw43wifi` leaves (WLC_DISASSOC) before each retry, and the
+  firmware leaves before deliberate reboots. The driver lacks `Leave` (and `RSSI`) upstream; the
+  firmware module uses a fork (`github.com/shabunin/cyw43439`, branch `leave-rssi`).
+- **cyw43439 calls the receive handler under its lock:** sending a reply from inside it deadlocks.
+  Copy the frame out and handle it after `PollOne`.
+- **TinyGo's RP2 `machine.Flash` is unsafe for a store:** its offsets start at the end of the
+  program image, which is rarely 4 KB-aligned, so erases miss their sectors and the state is
+  corrupted (seen as a lost fabric after reflashing). Use `rpflash`. TinyGo's RP2 watchdog is
+  RP2040-shaped too (reset selection, tick); use `rpwatchdog`.
+- **TinyGo's RP2 `crypto/rand` and `machine.GetRNG` sample the ring oscillator:** not for keys.
+  Use `rptrng`.
 
 ## 14. Performance (classic ESP32 at 160 MHz, TinyGo)
 
@@ -631,29 +682,20 @@ starting it.
 
 ### Raspberry Pi Pico W / Pico 2 W (RP2040 / RP2350 with a CYW43439)
 
-Already in place:
-
-- The whole device stack compiles for `pico-w` and `pico2-w`. `make cross` and
-  `probe/devicesize` report, for an on/off light, about 410 KB of flash and 12 KB of static RAM
-  on the Pico 2 W, and 445 KB on the Pico W (`-opt=z`, as of v0.2.0).
-- The networking is ours (`ip6`, `ip4`, `mdns` over raw Ethernet frames), so the port needs only
-  a frame-level Wi-Fi driver, not a TCP/IP stack.
+Already in place (Pico 2 W, `firmware/pico2w-light`): Wi-Fi through `cyw43wifi` with the hardware
+multicast filter, the RP2350 TRNG, flash persistence, the watchdog. Commissioned with `tmctl` in
+about 2 s; the firmware is about 780 KB of flash.
 
 To do:
 
-- **Wi-Fi:** a frame transport over the CYW43439 driver (soypat/cyw43439): join, send and receive
-  Ethernet frames. Set up the chip's hardware multicast filter for the IPv6 mDNS group, the
-  solicited-node addresses and the Matter group addresses.
-- **A runner like `firmware/wifinode`** for the RP2xxx, plus a `firmware/pico-light` (or similar)
-  command.
-- **Entropy:** use the RP2350 TRNG; on the RP2040, the ring oscillator with conditioning.
-- **Persistence:** a `storage.BlockDevice` on the RP2xxx flash (TinyGo's `machine.Flash`),
-  preferably in the last sectors.
+- **USB enumeration:** find why the RP2350's USB often fails to enumerate under TinyGo (see §8).
+- **Scan:** the driver cannot scan, so ScanNetworks reports no networks.
 - **BLE commissioning:** the CYW43439's HCI through `tinygo.org/x/bluetooth`, driving `btp` via a
   `matterble`-style peripheral. GATT indications must work.
 - **OTA:** the RP2350 has partition and boot-slot support in its boot ROM. Map `device.ImageStore`
-  onto it. On the RP2040, a second-stage loader like `esp32s3-loader` would be needed.
-- **Watchdog:** the RP2xxx hardware watchdog behind the same `Feed` API.
+  onto it.
+- **Pico W (RP2040):** entropy from the ring oscillator with conditioning, a flash device and a
+  second-stage loader for OTA.
 
 ### Thread
 
