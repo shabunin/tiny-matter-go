@@ -56,10 +56,16 @@ type Radio interface {
 	Stats() string
 }
 
-// AccessPoint is a network a scan found.
+// AccessPoint is a network a scan found. Radios that report only names
+// and signal strengths leave the rest zero.
 type AccessPoint struct {
 	SSID string
 	RSSI int // dBm
+	// Security is a Matter WiFiSecurityBitmap (clusters.WiFiWPA2...);
+	// zero means unknown, taken as WPA2.
+	Security uint8
+	BSSID    [6]byte
+	Channel  uint16
 }
 
 // Sender carries messages to one peer over another link (BTP over BLE).
@@ -468,8 +474,8 @@ func (n *Node) count(f []byte) {
 }
 
 // ScanResults lists the networks of aps (only want, if set), strongest
-// first, each once, at most 8. The radio reports only names and signal
-// strengths: WPA2 on 2.4 GHz is assumed.
+// first, each once, at most 8. All the radios are 2.4 GHz; an unknown
+// security is reported as WPA2.
 func ScanResults(aps []AccessPoint, want []byte) []clusters.WiFiScanResult {
 	sorted := append([]AccessPoint(nil), aps...)
 	for i := 1; i < len(sorted); i++ {
@@ -488,7 +494,12 @@ next:
 				continue next
 			}
 		}
-		res = append(res, clusters.WiFiScanResult{Security: clusters.WiFiWPA2, SSID: []byte(ap.SSID),
+		sec := ap.Security
+		if sec == 0 {
+			sec = clusters.WiFiWPA2
+		}
+		res = append(res, clusters.WiFiScanResult{Security: sec, SSID: []byte(ap.SSID),
+			BSSID: ap.BSSID, Channel: ap.Channel,
 			Band: clusters.WiFiBand2G4, RSSI: int8(max(min(ap.RSSI, 0), -128))})
 		if len(res) == 8 {
 			break

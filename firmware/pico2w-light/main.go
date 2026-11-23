@@ -237,7 +237,15 @@ func main() {
 	l := newLight(d, radio)
 	d.Diagnostics.BootReason = bootReason(reason)
 	println("boot reason", d.Diagnostics.BootReason, "reboot count", d.Diagnostics.RebootCount)
-	node.Attach(d, nil)
+	// The chip scans before it joins too: a commissioner provisioning
+	// Wi-Fi over BLE asks for the networks around first.
+	node.Attach(d, func() []wifinode.AccessPoint {
+		aps, err := radio.Scan()
+		if err != nil {
+			println("scan:", err.Error())
+		}
+		return aps
+	})
 	if !d.Commissioned() {
 		d.OpenCommissioningWindow()
 		println("commissionable: passcode", passcode, "discriminator", discriminator)

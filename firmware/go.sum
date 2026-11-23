@@ -1,7 +1,7 @@
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
-github.com/shabunin/cyw43439 v0.0.0-20261123144131-18c8f390635f h1:a4ELyJGEGE0ap56CS8cZ5m4EVW/jNFCTHE5y1jJIZ3Q=
-github.com/shabunin/cyw43439 v0.0.0-20261123144131-18c8f390635f/go.mod h1:PXS9E4wJ2f3BK3Vqf//gw1tE2kipMlNuubNm5au5RGc=
+github.com/shabunin/cyw43439 v0.0.0-20261123193914-7c3305b89fc4 h1:ueqAS4V0GxdOPLhDn91eDOJbgHKnVMGVlsM2BJJyj7E=
+github.com/shabunin/cyw43439 v0.0.0-20261123193914-7c3305b89fc4/go.mod h1:PXS9E4wJ2f3BK3Vqf//gw1tE2kipMlNuubNm5au5RGc=
 github.com/soypat/lneto v0.4.0 h1:oBTcMnhEIBERXmAfwK4uDpItRaF7RiT1K2pljFVxtQc=
 github.com/soypat/lneto v0.4.0/go.mod h1:Be5PjwoYukvHFiUXxpYi8+ppH2F/gw/vjGBvFdv+Ti8=
 github.com/soypat/seqs v0.0.0-20260125140838-2c1c6b1bd69e h1:xF3R+8683ngGNUeIy8PHJZiJZ/XIw+hlGgxg572P0Mw=

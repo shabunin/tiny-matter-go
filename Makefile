@@ -19,8 +19,8 @@ test32:
 
 # Host-runnable tests in the firmware module (sensors, BLE HCI, ESP32 and RP2350 OTA layouts).
 test-firmware:
-	cd firmware && go vet ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot
-	cd firmware && go test -race -count=1 ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot
+	cd firmware && go vet ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot ./wifinode
+	cd firmware && go test -race -count=1 ./envsensor ./matterble ./espslot ./espota ./rpota ./rpslot ./wifinode
 
 tinygo-test:
 	tinygo test ./tlv ./ota ./bdx ./crypto/internal/nistec/fiat ./crypto/p256 ./crypto/ccm ./crypto/spake2p ./message ./exchange ./securechannel ./securechannel/pase ./securechannel/casesession ./im ./credentials ./credentials/devcreds ./fabric ./device ./ip4 ./ip6 ./mdns ./storage ./onboarding ./thread

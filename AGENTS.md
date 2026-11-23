@@ -82,7 +82,7 @@ There are three Go modules:
 | `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. OTA requestor when running from a partition. Test builds can reboot into the UF2 bootloader by a test event trigger. |
 | `firmware/wifinode/` | Shared Wi-Fi runner over a `Radio` interface: joins the network (rejoining for radios that don't), runs `ip6` and `ip4`, advertises with `mdns`, resolves nodes, joins group addresses (and programs the radio's multicast filter), feeds the device. |
 | `firmware/espwifi/` | The ESP32 and ESP32-S3 radio (`espradio`) as a `wifinode.Radio`. |
-| `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, no scan. Optionally starts the Bluetooth controller for HCI. |
+| `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, network scans (also before joining, for BLE commissioning). Optionally starts the Bluetooth controller for HCI. |
 | `firmware/rptrng/` | RP2350 TRNG reader with the health tests on and SHA-256 conditioning. |
 | `firmware/rpwatchdog/` | RP2350 watchdog, reboot (a full chip reset, USB included) and last reset reason. |
 | `firmware/rpflash/` | A range of the RP2350 flash as a `storage.BlockDevice` at physical offsets (read through the untranslated XIP window), with aligned sector erases and whole-page writes. |
@@ -651,7 +651,7 @@ say so.
 - **Matter only:** control devices through Matter, not vendor-private APIs.
 - **Dependencies:** keep the root module dependency-light (standard library plus TinyGo-compatible
   code). The firmware module adds `tinygo.org/x/bluetooth`, `tinygo.org/x/espradio` and
-  `github.com/soypat/cyw43439` (replaced by the fork with `Leave` and `RSSI`).
+  `github.com/soypat/cyw43439` (replaced by the fork with `Leave`, `RSSI` and `Scan`).
 
 ## 13. Pitfalls (learned the hard way)
 
@@ -676,7 +676,7 @@ say so.
 - **Wi-Fi access points keep stale associations.** After a station resets without leaving (crash,
   power cut, reflash), the next join may associate but never finish the WPA handshake, and every
   retry keeps that state alive. `cyw43wifi` leaves (WLC_DISASSOC) before each retry, and the
-  firmware leaves before deliberate reboots. The driver lacks `Leave` (and `RSSI`) upstream; the
+  firmware leaves before deliberate reboots. The driver lacks `Leave` (and `RSSI` and `Scan`) upstream; the
   firmware module uses a fork (`github.com/shabunin/cyw43439`, branch `leave-rssi`).
 - **cyw43439 calls the receive handler under its lock:** sending a reply from inside it deadlocks.
   Copy the frame out and handle it after `PollOne`.
@@ -725,14 +725,13 @@ starting it.
 ### Raspberry Pi Pico W / Pico 2 W (RP2040 / RP2350 with a CYW43439)
 
 Already in place (Pico 2 W, `firmware/pico2w-light`): Wi-Fi through `cyw43wifi` with the hardware
-multicast filter, BLE commissioning through the CYW43439's HCI and `matterble`, OTA updates on the
-boot ROM's A/B partitions (`rpota`), the RP2350 TRNG, flash persistence, the watchdog. Commissioned with `tmctl` in
-about 2 s; the firmware is about 780 KB of flash.
+multicast filter and network scans, BLE commissioning through the CYW43439's HCI and `matterble`,
+OTA updates on the boot ROM's A/B partitions (`rpota`), the RP2350 TRNG, flash persistence, the
+watchdog. Commissioned with `tmctl` in about 2 s; the firmware is about 820 KB of flash.
 
 To do:
 
 - **USB enumeration:** find why the RP2350's USB often fails to enumerate under TinyGo (see §8).
-- **Scan:** the driver cannot scan, so ScanNetworks reports no networks.
 - **Pico W (RP2040):** entropy from the ring oscillator with conditioning, a flash device and a
   second-stage loader for OTA (the RP2040 boot ROM has no partitions).
 

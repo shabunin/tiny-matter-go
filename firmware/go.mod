@@ -23,4 +23,4 @@ require (
 
 replace github.com/shabunin/tiny-matter-go => ../
 
-replace github.com/soypat/cyw43439 => github.com/shabunin/cyw43439 v0.0.0-20261123144131-18c8f390635f
+replace github.com/soypat/cyw43439 => github.com/shabunin/cyw43439 v0.0.0-20261123193914-7c3305b89fc4

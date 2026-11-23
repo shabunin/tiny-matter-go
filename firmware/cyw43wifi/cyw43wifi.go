@@ -8,6 +8,7 @@ import (
 
 	"firmware/wifinode"
 
+	"github.com/shabunin/tiny-matter-go/clusters"
 	"github.com/soypat/cyw43439"
 )
 
@@ -118,8 +119,55 @@ func (r *Radio) SetMulticast(macs [][6]byte) error {
 	return r.Dev.SetMulticastList(macs)
 }
 
-// Scan reports no networks: the driver cannot scan yet.
-func (r *Radio) Scan() ([]wifinode.AccessPoint, error) { return nil, nil }
+// maxScan bounds the networks a scan keeps.
+const maxScan = 24
+
+// Scan scans all 2.4 GHz channels (about 3 s), joined or not. Frames that
+// arrive meanwhile are dropped: the radio is off the channel for most of
+// it, and MRP retransmits.
+func (r *Radio) Scan() ([]wifinode.AccessPoint, error) {
+	var aps []wifinode.AccessPoint
+	err := r.Dev.Scan(func(res cyw43439.ScanResult) {
+		name := res.Name()
+		if len(name) == 0 || name[0] == 0 {
+			return // hidden
+		}
+		for i := range aps {
+			if aps[i].BSSID == res.BSSID {
+				aps[i].RSSI = max(aps[i].RSSI, int(res.RSSI))
+				return
+			}
+		}
+		sec := security(res.Security)
+		if sec != 0 && len(aps) < maxScan {
+			aps = append(aps, wifinode.AccessPoint{SSID: string(name), RSSI: int(res.RSSI),
+				Security: sec, BSSID: res.BSSID, Channel: uint16(res.Channel)})
+		}
+	})
+	return aps, err
+}
+
+// security maps the driver's flags to a Matter WiFiSecurityBitmap, zero
+// for an enterprise-only network, which Matter cannot provision.
+func security(s cyw43439.ScanSecurity) uint8 {
+	if s == 0 {
+		return clusters.WiFiUnencrypted
+	}
+	var m uint8
+	if s&cyw43439.ScanWEP != 0 {
+		m |= clusters.WiFiWEP
+	}
+	if s&cyw43439.ScanWPA != 0 {
+		m |= clusters.WiFiWPAPersonal
+	}
+	if s&cyw43439.ScanWPA2 != 0 {
+		m |= clusters.WiFiWPA2
+	}
+	if s&cyw43439.ScanWPA3 != 0 {
+		m |= clusters.WiFiWPA3
+	}
+	return m
+}
 
 func (r *Radio) RSSI() (int, error) { return r.Dev.RSSI() }
 
