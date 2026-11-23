@@ -6,14 +6,17 @@ import (
 	"time"
 )
 
-// USB often fails to enumerate on this firmware, after any kind of start:
+// USB often fails to enumerate under TinyGo 0.44, after any kind of start:
 // the host reports "device not accepting address, error -71", tries for
-// about two seconds and gives up. The cause is not known yet (the Matter
-// side runs regardless). Detaching (dropping the D+ pull-up) and attaching
-// again makes the host start over, so the firmware waits for an address at
-// start, re-attaching a few times, and then keeps re-attaching from the
-// main loop until a host enumerates it. With no USB host, that does
-// nothing.
+// about two seconds and gives up. TinyGo's RP2 driver answers SET_ADDRESS
+// by waiting in the interrupt handler, at most 570 µs, for the host to
+// fetch the status stage; hosts often take longer (up to a frame, 1 ms),
+// and then the driver stalls the request. The fix is to apply the address
+// once the status stage completes, as the Pico SDK does, in TinyGo itself.
+// Until then, detaching (dropping the D+ pull-up) and attaching again makes
+// the host start over, so the firmware waits for an address at start,
+// re-attaching a few times, and then keeps re-attaching from the main loop
+// until a host enumerates it. With no USB host, that does nothing.
 const (
 	usbWait     = 1500 * time.Millisecond // for an address, per attempt at start
 	usbAttempts = 3

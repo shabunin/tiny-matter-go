@@ -452,8 +452,11 @@ go run ./rpslot uf2 -elf app.elf -o app.uf2                              # copy 
 - Only a network provisioned over BLE is stored. A board commissioned over IP with compiled-in
   credentials and then reflashed without them has a fabric but no network: factory-reset it.
 - USB often fails to enumerate (the host logs "device not accepting address, error -71"), after
-  any kind of start. The firmware re-attaches USB (drops the D+ pull-up) until a host enumerates
-  it, which takes up to about 10 s. The Matter side runs regardless. Cause unknown.
+  any kind of start. TinyGo's RP2 driver (0.44) waits at most 570 µs in its interrupt handler for
+  the status stage of SET_ADDRESS, and stalls it if the host is later; hosts take up to a frame
+  (612 µs was measured; the fix is in §13). Until TinyGo is fixed, the firmware re-attaches USB
+  (drops the D+ pull-up) until a host enumerates it, which takes up to about 10 s. The Matter side
+  runs regardless.
 - `machine.CPUReset` leaves USB dead until a replug: reboot with `rpwatchdog.Reboot`.
 - A test build (`-X main.testEventKey=<32 hex>`) reboots into the UF2 bootloader on test event
   trigger `0xFFF1000000000001`, for flashing without the button, and reboots on
@@ -692,6 +695,23 @@ say so.
   So once the partition table is in, `tinygo flash` and TinyGo's UF2s are silently ignored (the
   drive accepts the copy and nothing happens).
 - **TinyGo's `-o app.bin` for the RP2350 writes a UF2,** not a raw image. `rpslot` reads the ELF.
+- **TinyGo's RP2 USB driver drops SET_ADDRESS when the host is slow** (TinyGo 0.44 and `dev` as of
+  2026-11; RP2040 and RP2350 share the code). `handleUSBSetAddress` in
+  `src/machine/machine_rp2{040,350}_usb.go` sends the status-stage ZLP, then busy-waits in the
+  interrupt handler for `SIE_STATUS.ACK_REC` for at most 570 µs, and stalls EP0 if the ACK has not
+  come. The host fetches that status stage up to a frame later: on a Linux xHCI host the ACK came
+  139-612 µs after the setup interrupt, so some attempts were stalled. The kernel then logs
+  "Device not responding to setup address" and "device not accepting address N, error -71".
+  - **The fix, verified on the Pico 2 W:** 20 of 20 reboots enumerated on the first attempt, with
+    no kernel errors; before it, 1 boot in 8 failed. It follows the Pico SDK:
+    - In `handleUSBSetAddress`:
+      - store the address and set a pending flag;
+      - clear a stale EP0 IN bit (`BUFF_STATUS.Set(1)`);
+      - send the ZLP and return true, with no waiting.
+    - In the `BUFF_STATUS` branch, after reading and clearing `s2`: if `s2&1` (EP0 IN done) and the
+      flag is set, clear the flag and write the address to `ADDR_ENDP`.
+    - On bus reset, clear the flag.
+  - Not reported upstream. It only affects the USB console, and the firmware works around it (§8).
 - **Once the boot ROM runs an image from a partition, `0x10000000` is that partition,** and flash
   beyond its size faults. Read physical flash through `0x1C000000` (no translation, no cache), as
   `rpflash` does. The ROM's flash program and erase functions take physical offsets.
@@ -731,7 +751,8 @@ watchdog. Commissioned with `tmctl` in about 2 s; the firmware is about 820 KB o
 
 To do:
 
-- **USB enumeration:** find why the RP2350's USB often fails to enumerate under TinyGo (see §8).
+- **USB enumeration:** fix SET_ADDRESS in TinyGo's RP2 USB driver (see §8), then drop the
+  re-attach workaround in `pico2w-light/usb.go`.
 - **Pico W (RP2040):** entropy from the ring oscillator with conditioning, a flash device and a
   second-stage loader for OTA (the RP2040 boot ROM has no partitions).
 
