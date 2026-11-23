@@ -163,6 +163,11 @@ func (s *Stack) Join(g netip.Addr) error {
 	return nil
 }
 
+// Groups returns the multicast groups joined. A radio with a hardware
+// multicast filter must pass their MAC addresses. The slice is the
+// stack's own; do not change it.
+func (s *Stack) Groups() []netip.Addr { return s.groups }
+
 // ReportGroups sends an IGMPv2 report for each joined group. SetAddr calls
 // it; call it again after the link (re)connects.
 func (s *Stack) ReportGroups() {

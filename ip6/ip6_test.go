@@ -518,3 +518,34 @@ func FuzzHandleFrame(f *testing.F) {
 		s.HandleFrame(frame)
 	})
 }
+
+func TestGroups(t *testing.T) {
+	p := newPair()
+	ll := p.b.Addr()
+	want := []netip.Addr{allNodes, solicitedNode(ll)}
+	if got := p.b.Groups(); !slicesEqual(got, want) {
+		t.Fatalf("groups %v, want %v", got, want)
+	}
+	mdns := netip.MustParseAddr("ff02::fb")
+	p.b.Join(mdns)
+	if got := p.b.Groups(); !slicesEqual(got, append(want, mdns)) {
+		t.Fatalf("after join: %v", got)
+	}
+	p.b.Leave(mdns)
+	p.b.Leave(allNodes) // the stack's own groups stay
+	if got := p.b.Groups(); !slicesEqual(got, want) {
+		t.Fatalf("after leave: %v", got)
+	}
+}
+
+func slicesEqual(a, b []netip.Addr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

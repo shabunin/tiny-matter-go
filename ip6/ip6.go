@@ -343,6 +343,12 @@ func (s *Stack) Join(g netip.Addr) error {
 	return s.ReportGroups()
 }
 
+// Groups returns the multicast groups the stack listens on: all-nodes,
+// the solicited-node group and those joined. A radio with a hardware
+// multicast filter must pass their MAC addresses. The slice is the
+// stack's own; do not change it.
+func (s *Stack) Groups() []netip.Addr { return s.groups }
+
 // Leave leaves multicast group g, telling MLD snooping switches.
 func (s *Stack) Leave(g netip.Addr) error {
 	for i, x := range s.groups {

@@ -429,3 +429,16 @@ func FuzzHandleFrame(f *testing.F) {
 		s.HandleFrame(frame)
 	})
 }
+
+func TestGroups(t *testing.T) {
+	s, _ := newStack(t)
+	if len(s.Groups()) != 0 {
+		t.Fatalf("groups %v before joining", s.Groups())
+	}
+	g := netip.MustParseAddr("224.0.0.251")
+	s.Join(g)
+	s.Join(g)
+	if got := s.Groups(); len(got) != 1 || got[0] != g {
+		t.Fatalf("groups %v, want [%v]", got, g)
+	}
+}
