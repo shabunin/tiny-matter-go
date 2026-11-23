@@ -16,18 +16,42 @@ import (
 type Radio struct {
 	Config espradio.Config
 
-	link   espradio.Link
-	nd     *espradio.NetDev
-	params espradio.STAConfig
-	linked bool // link set up
-	frame  []byte
-	up     atomic.Bool // set from espradio's link callback
+	link    espradio.Link
+	nd      *espradio.NetDev
+	params  espradio.STAConfig
+	started bool
+	frame   []byte
+	up      atomic.Bool // set from espradio's link callback
 }
 
 var _ wifinode.Radio = (*Radio)(nil)
 
-// Start starts Wi-Fi (espradio.Enable must have been called).
-func (r *Radio) Start() error { return espradio.Start() }
+// Start starts Wi-Fi (espradio.Enable must have been called) and the link
+// watcher, and allocates the receive buffer. It does nothing once it has
+// succeeded, so firmware can call it early, before device.New restores the
+// state. The driver's tasks and the link watcher are goroutines, each with a
+// contiguous stack of -stack-size: started after a node with four fabrics
+// was restored, the classic ESP32's heap (about 150 KB) had 68 KB free but
+// no 10 KB run, and the board ran out of memory on every boot.
+func (r *Radio) Start() error {
+	if r.started {
+		return nil
+	}
+	if err := espradio.Start(); err != nil {
+		return err
+	}
+	r.started = true
+	r.link = espradio.Link{Config: r.Config}
+	r.link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
+		r.up.Store(connected)
+		if !connected {
+			return 3, r.params
+		}
+		return 0, espradio.STAConfig{}
+	})
+	r.frame = make([]byte, espradio.MaxFrameSize)
+	return nil
+}
 
 // MAC returns the station address.
 func (r *Radio) MAC() ([6]byte, bool) {
@@ -35,21 +59,10 @@ func (r *Radio) MAC() ([6]byte, bool) {
 	return m, err == nil
 }
 
-// Connect joins the network. Once it is up, espradio rejoins it every 3 s
-// after the link drops.
+// Connect joins the network (Start must have succeeded). Once it is up,
+// espradio rejoins it every 3 s after the link drops.
 func (r *Radio) Connect(ssid, password []byte) error {
 	r.params = espradio.STAConfig{SSID: string(ssid), Password: string(password)}
-	if !r.linked {
-		r.linked = true
-		r.link = espradio.Link{Config: r.Config}
-		r.link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
-			r.up.Store(connected)
-			if !connected {
-				return 3, r.params
-			}
-			return 0, espradio.STAConfig{}
-		})
-	}
 	if err := r.link.LinkConnect(r.params); err != nil {
 		return err
 	}
@@ -61,16 +74,14 @@ func (r *Radio) Connect(ssid, password []byte) error {
 func (r *Radio) LinkUp() bool     { return r.up.Load() }
 func (r *Radio) Reconnects() bool { return true }
 
-// Recv polls for a frame. The buffer is on the heap, allocated once: not
-// on main's stack, which packet handling (CASE, certificate checks) takes
-// close to its end, and not a package-level var (on the classic ESP32,
-// growing .bss by that much breaks the Wi-Fi handshake, "auth expired").
+// Recv polls for a frame. The buffer is on the heap, allocated once by
+// Start: not on main's stack, which packet handling (CASE, certificate
+// checks) takes close to its end, and not a package-level var (on the
+// classic ESP32, growing .bss by that much breaks the Wi-Fi handshake,
+// "auth expired").
 func (r *Radio) Recv() ([]byte, error) {
 	if r.nd == nil {
 		return nil, nil
-	}
-	if r.frame == nil {
-		r.frame = make([]byte, espradio.MaxFrameSize)
 	}
 	off, size, err := r.nd.EthPoll(r.frame)
 	if err != nil || size == 0 {

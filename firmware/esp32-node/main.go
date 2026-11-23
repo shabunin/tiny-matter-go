@@ -116,7 +116,14 @@ func main() {
 	}
 	mac := factoryMAC()
 	println("mac", wifinode.HexMAC(mac))
-	node := wifinode.New(mac, &espwifi.Radio{Config: radioCfg})
+	// Start Wi-Fi now, while the heap is fresh: its goroutine stacks need
+	// 10 KB runs, which restoring several fabrics in device.New leaves none
+	// of. Join starts it again, which does nothing.
+	radio := &espwifi.Radio{Config: radioCfg}
+	if err := radio.Start(); err != nil {
+		fatal("wifi start", err)
+	}
+	node := wifinode.New(mac, radio)
 	node.Log = func(msg string) { println(msg) }
 
 	salt := []byte("SPAKE2P Key Salt")

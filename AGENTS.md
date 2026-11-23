@@ -661,6 +661,10 @@ say so.
 - **TinyGo out-of-memory is usually fragmentation.** On the classic ESP32 (about 150 KB heap), OOM
   happened with 45 KB free but no free run above 3 KB.
   - Never allocate multi-KB blocks after boot: new goroutines (10 KB stacks), whole-state copies.
+  - Restoring the state in `device.New` (certificates, P-256) fragments the heap. With four
+    fabrics, the M5GO then had 68 KB free but no 10 KB run, and starting Wi-Fi (espradio's
+    task goroutines) ran out of memory on every boot. `esp32-node` therefore starts the radio
+    (`espwifi.Radio.Start`, which also starts the link watcher) before `device.New`.
   - Diagnose with a private TinyGo root whose `runtime/gc_blocks.go` prints the size and caller
     before the fatal error, then map the address with `llvm-nm`.
 - **TinyGo allocates where Go doesn't.**
