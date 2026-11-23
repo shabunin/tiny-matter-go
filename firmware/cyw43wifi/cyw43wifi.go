@@ -28,10 +28,15 @@ type Radio struct {
 
 var _ wifinode.Radio = (*Radio)(nil)
 
-// New powers the chip up and loads its firmware (about 1.5 s).
-func New() (*Radio, error) {
+// New powers the chip up and loads its Wi-Fi firmware (about 1.5 s), and
+// with bluetooth its Bluetooth controller's too, for HCI.
+func New(bluetooth bool) (*Radio, error) {
 	r := &Radio{Dev: cyw43439.NewPicoWDevice(), rx: make([]byte, cyw43439.MaxFrameSize)}
-	if err := r.Dev.Init(cyw43439.DefaultWifiConfig()); err != nil {
+	cfg := cyw43439.DefaultWifiConfig()
+	if bluetooth {
+		cfg = cyw43439.DefaultWifiBluetoothConfig()
+	}
+	if err := r.Dev.Init(cfg); err != nil {
 		return nil, err
 	}
 	// The driver calls the handler while it holds its lock, so a reply
@@ -39,6 +44,24 @@ func New() (*Radio, error) {
 	// returns it after the poll.
 	r.Dev.RecvEthHandle(func(f []byte) { r.rxLen = copy(r.rx, f) })
 	return r, nil
+}
+
+// HCIMaxPacket is the longest HCI packet (type byte included) the driver
+// writes to the Bluetooth controller: its buffer is 256 bytes, with a
+// 4-byte header.
+const HCIMaxPacket = 252
+
+// BDAddr is the Bluetooth address to give the controller, the Wi-Fi
+// address plus one, as the Pico SDK does: the controller's firmware starts
+// with the same address on every board.
+func BDAddr(mac [6]byte) [6]byte {
+	for i := 5; i >= 0; i-- {
+		mac[i]++
+		if mac[i] != 0 {
+			break
+		}
+	}
+	return mac
 }
 
 // Start does nothing: New started the chip.

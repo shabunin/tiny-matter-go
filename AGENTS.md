@@ -79,14 +79,14 @@ There are three Go modules:
 |---|---|
 | `firmware/esp32s3-light/` | ESP32-S3 (M5Stack Cardputer) firmware. Endpoint 1: Extended Color Light on the RGB LED, with scenes and groups. Endpoint 2: the G0 button as a Generic Switch. Optional Grove units: an ENV sensor on endpoints 3-5, a PIR on endpoint 6. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. OTA requestor when started by the loader. |
 | `firmware/esp32-node/` | Classic ESP32 boards; the TinyGo target picks the board. `m5stack` is an M5Stack Core with the M5GO base: a colour light on the LED bar plus a Color Dimmer Switch (endpoint 2) worked by an angle unit and buttons. `m5stick-c` is an M5StickC Plus with an ENV unit: temperature, humidity and pressure (endpoints 1-3). Commissioned over IP only. |
-| `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioned over IP (Wi-Fi credentials compiled in). Test builds can reboot into the UF2 bootloader by a test event trigger. |
+| `firmware/pico2w-light/` | Raspberry Pi Pico 2 W firmware: an On/Off Light on the LED (endpoint 1) with Identify, Groups and Scenes. Commissioning over BLE, or over IP when Wi-Fi credentials are compiled in. Test builds can reboot into the UF2 bootloader by a test event trigger. |
 | `firmware/wifinode/` | Shared Wi-Fi runner over a `Radio` interface: joins the network (rejoining for radios that don't), runs `ip6` and `ip4`, advertises with `mdns`, resolves nodes, joins group addresses (and programs the radio's multicast filter), feeds the device. |
 | `firmware/espwifi/` | The ESP32 and ESP32-S3 radio (`espradio`) as a `wifinode.Radio`. |
-| `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, no scan. |
+| `firmware/cyw43wifi/` | The Pico W / Pico 2 W CYW43439 as a `wifinode.Radio`: leaves before rejoining, 10-entry multicast filter, no scan. Optionally starts the Bluetooth controller for HCI. |
 | `firmware/rptrng/` | RP2350 TRNG reader with the health tests on and SHA-256 conditioning. |
 | `firmware/rpwatchdog/` | RP2350 watchdog, reboot (a full chip reset, USB included) and last reset reason. |
 | `firmware/rpflash/` | RP2350 flash as a `storage.BlockDevice` at absolute offsets, with aligned sector erases and whole-page writes. |
-| `firmware/matterble/` | Matter BLE peripheral over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp`. |
+| `firmware/matterble/` | Matter BLE peripheral over `tinygo.org/x/bluetooth`'s HCI stack, driving `btp`. `Options` caps the MTU for controllers with short HCI writes and runs vendor setup (an address) after the reset. |
 | `firmware/climate/`, `firmware/envsensor/` | ENV unit endpoints; SHT3x and BMP280 drivers. |
 | `firmware/pir/` | PIR as an Occupancy Sensor endpoint. |
 | `firmware/softi2c/` | Bit-banged I2C (the M5StickC HAT header, which TinyGo's hardware I2C cannot drive). |
@@ -392,7 +392,9 @@ tinygo flash -target m5stick-c -stack-size=10KB -ldflags "-X main.ssid=... -X ma
 **Raspberry Pi Pico 2 W:**
 
 ```sh
-tinygo flash -target pico2-w -stack-size=16KB -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light
+tinygo flash -target pico2-w -stack-size=16KB ./pico2w-light                    # BLE commissioning
+tinygo flash -target pico2-w -stack-size=16KB \
+    -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light               # on-network
 ```
 
 Or copy a UF2 (`tinygo build ... -o app.uf2`) to the RP2350 drive the board shows with BOOTSEL held.
@@ -418,6 +420,13 @@ Or copy a UF2 (`tinygo build ... -o app.uf2`) to the RP2350 drive the board show
 **Pico 2 W notes:**
 
 - State lives in the last 32 KB of the 4 MB flash (`rpflash`). Fabrics survive reflashing.
+- BLE commissioning (`tmctl commission <code> -ssid <network>`) takes about 25 s, mostly the Wi-Fi
+  join. The controller's firmware starts with the same public address on every board; the
+  firmware sets the Wi-Fi address plus one, as the Pico SDK does. The driver writes HCI packets
+  of at most 252 bytes, so the ATT MTU is 243. If the provisioned network cannot be joined within
+  60 s, the board reboots and advertises again.
+- Only a network provisioned over BLE is stored. A board commissioned over IP with compiled-in
+  credentials and then reflashed without them has a fabric but no network: factory-reset it.
 - USB often fails to enumerate (the host logs "device not accepting address, error -71"), after
   any kind of start. The firmware re-attaches USB (drops the D+ pull-up) until a host enumerates
   it, which takes up to about 10 s. The Matter side runs regardless. Cause unknown.
@@ -683,15 +692,14 @@ starting it.
 ### Raspberry Pi Pico W / Pico 2 W (RP2040 / RP2350 with a CYW43439)
 
 Already in place (Pico 2 W, `firmware/pico2w-light`): Wi-Fi through `cyw43wifi` with the hardware
-multicast filter, the RP2350 TRNG, flash persistence, the watchdog. Commissioned with `tmctl` in
+multicast filter, BLE commissioning through the CYW43439's HCI and `matterble`, the RP2350 TRNG,
+flash persistence, the watchdog. Commissioned with `tmctl` in
 about 2 s; the firmware is about 780 KB of flash.
 
 To do:
 
 - **USB enumeration:** find why the RP2350's USB often fails to enumerate under TinyGo (see §8).
 - **Scan:** the driver cannot scan, so ScanNetworks reports no networks.
-- **BLE commissioning:** the CYW43439's HCI through `tinygo.org/x/bluetooth`, driving `btp` via a
-  `matterble`-style peripheral. GATT indications must work.
 - **OTA:** the RP2350 has partition and boot-slot support in its boot ROM. Map `device.ImageStore`
   onto it.
 - **Pico W (RP2040):** entropy from the ring oscillator with conditioning, a flash device and a

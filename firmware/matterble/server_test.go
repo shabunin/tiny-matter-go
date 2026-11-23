@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/btp"
+	"tinygo.org/x/bluetooth/hci"
 )
 
 // fakeController is the controller side of an H4 byte stream. It answers
@@ -21,6 +22,8 @@ type fakeController struct {
 	advOn    bool
 	disc     bool
 	fragSize int
+	ops      []uint16 // commands, in order
+	longest  int      // longest packet the host wrote
 }
 
 func (f *fakeController) Buffered() int { return len(f.rx) }
@@ -32,9 +35,11 @@ func (f *fakeController) Read(buf []byte) (int, error) {
 }
 
 func (f *fakeController) Write(buf []byte) (int, error) {
+	f.longest = max(f.longest, len(buf))
 	switch buf[0] {
 	case 0x01: // command
 		op := binary.LittleEndian.Uint16(buf[1:])
+		f.ops = append(f.ops, op)
 		params := buf[4 : 4+int(buf[3])]
 		switch op {
 		case 0x2008: // LE Set Advertising Data
@@ -103,7 +108,7 @@ func writeReq(handle uint16, v []byte) []byte {
 func setup(t *testing.T) (*Server, *fakeController, *[][]byte) {
 	resetDelay = 0
 	f := &fakeController{t: t, fragSize: 27}
-	s, err := New(NewTransport(f), 3840, 0xFFF1, 0x8000)
+	s, err := New(NewTransport(f), 3840, 0xFFF1, 0x8000, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +204,54 @@ func TestServer(t *testing.T) {
 	poll(s, got)
 	if s.Connected() {
 		t.Fatal("still connected")
+	}
+}
+
+// TestOptions checks that Setup runs right after the reset and that a
+// smaller MTU caps the ATT MTU, the BTP segments and so every packet the
+// server writes (the CYW43439 driver takes at most 252 bytes).
+func TestOptions(t *testing.T) {
+	resetDelay = 0
+	f := &fakeController{t: t, fragSize: 27}
+	var setupAfter []uint16
+	s, err := New(NewTransport(f), 3840, 0xFFF1, 0x8000, Options{
+		MTU: 243,
+		Setup: func(h *hci.HCI) error {
+			setupAfter = append([]uint16(nil), f.ops...)
+			return h.SendVendorCommand(0x0001, []byte{1, 2, 3, 4, 5, 6})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(setupAfter); n == 0 || setupAfter[n-1] != 0x0C03 {
+		t.Fatalf("Setup ran after % x, want right after Reset", setupAfter)
+	}
+	if i := len(setupAfter); len(f.ops) <= i || f.ops[i] != 0xFC01 {
+		t.Fatalf("commands % x: the vendor command is not next", f.ops)
+	}
+
+	var got [][]byte
+	f.event(0x3E, 0x01, 0, 0x40, 0, 1, 0, 1, 2, 3, 4, 5, 6, 24, 0, 0, 0, 0x48, 0, 0)
+	poll(s, &got)
+	f.att([]byte{0x02, 247, 0})
+	poll(s, &got)
+	if a := f.takeACL(); len(a) != 1 || !bytes.Equal(a[0], []byte{0x03, 243, 0}) {
+		t.Fatalf("MTU response % x", a)
+	}
+	f.att(writeReq(hC1, []byte{0x65, 0x6C, 0x04, 0, 0, 0, 0, 0, 6}))
+	f.att(writeReq(hCCCD, []byte{1, 0}))
+	poll(s, &got)
+	a := f.takeACL()
+	if len(a) != 3 || !bytes.Equal(a[2][3:], []byte{0x65, 0x6C, 4, 240, 0, 6}) {
+		t.Fatalf("handshake response % x", a)
+	}
+	if err := s.Send(bytes.Repeat([]byte{0xAB}, 600)); err != nil {
+		t.Fatal(err)
+	}
+	poll(s, &got)
+	if len(f.takeACL()) != 3 || f.longest != 252 {
+		t.Fatalf("longest packet %d bytes, want 252", f.longest)
 	}
 }
 

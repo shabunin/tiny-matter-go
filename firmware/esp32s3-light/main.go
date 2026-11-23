@@ -343,7 +343,7 @@ func commissionOverBLE(d *device.Device, tr *wifinode.Transport, u *ui) clusters
 	// when Wi-Fi stops (stopping Wi-Fi first leaves BLE unable to advertise).
 	bootScan = scanOnce()
 	matterble.Log = func(msg string) { println(msg) }
-	b, err := matterble.New(matterble.NewTransport(espradio.VHCITransport{}), discriminator, devcreds.VendorID, devcreds.ProductID)
+	b, err := matterble.New(matterble.NewTransport(espradio.VHCITransport{}), discriminator, devcreds.VendorID, devcreds.ProductID, matterble.Options{})
 	if err != nil {
 		fatal("ble", err)
 	}

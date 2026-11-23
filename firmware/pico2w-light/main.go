@@ -5,10 +5,15 @@
 // network and light state live in the last 32 KB of the flash.
 //
 // It uses the SDK development attestation credentials (vendor 0xFFF1,
-// product 0x8000), test passcode 20202021 and discriminator 3840. Build it
-// with a network, which it joins at once, and commission it over IP:
+// product 0x8000), test passcode 20202021 and discriminator 3840. Built
+// without a network, it is commissioned over BLE, which provisions one:
 //
-//	tinygo flash -target pico2-w -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light
+//	tinygo flash -target pico2-w -stack-size=16KB ./pico2w-light
+//	tmctl commission 34970112332 -ssid <network>
+//
+// Built with a network, it joins it at once and is commissioned over IP:
+//
+//	tinygo flash -target pico2-w -stack-size=16KB -ldflags "-X main.ssid=... -X main.password=..." ./pico2w-light
 //	tmctl commission 34970112332
 //
 // The LED blinks briefly every second until the light is commissioned,
@@ -24,6 +29,7 @@ import (
 	"time"
 
 	"firmware/cyw43wifi"
+	"firmware/matterble"
 	"firmware/rpflash"
 	"firmware/rptrng"
 	"firmware/rpwatchdog"
@@ -57,6 +63,10 @@ const (
 	// about 14 s, and while it waits it lets the feeder run.
 	hardwareTimeout = 8 * time.Second
 	loopTimeout     = 60 * time.Second
+
+	// joinTimeout is how long to try a network provisioned over BLE
+	// before rebooting to be commissioned again.
+	joinTimeout = 60 * time.Second
 )
 
 func fatal(msg string, err error) {
@@ -120,7 +130,9 @@ func main() {
 	store := stateStore()
 
 	var err error
-	radio, err = cyw43wifi.New()
+	// Bluetooth is only for commissioning, which needs it when no network
+	// is compiled in (a stored one may be gone after a factory reset).
+	radio, err = cyw43wifi.New(ssid == "")
 	if err != nil {
 		fatal("wifi chip", err)
 	}
@@ -128,6 +140,8 @@ func main() {
 	println("mac", wifinode.HexMAC(mac))
 	node := wifinode.New(mac, radio)
 	node.Log = func(msg string) { println(msg) }
+	tr := node.Transport
+	tr.Peer, tr.HasPeer = matterble.Peer, true
 
 	rng := &rptrng.Reader{}
 	salt := []byte("SPAKE2P Key Salt")
@@ -183,19 +197,6 @@ func main() {
 		println("commissionable: passcode", passcode, "discriminator", discriminator)
 	}
 
-	var nw clusters.WiFiNetwork
-	switch {
-	case len(d.Net.Networks) > 0:
-		nw = d.Net.Networks[0]
-	case ssid != "":
-		nw = clusters.WiFiNetwork{SSID: []byte(ssid), Credentials: []byte(password)}
-	default:
-		for {
-			println("no Wi-Fi network: build with -X main.ssid=... -X main.password=...")
-			time.Sleep(5 * time.Second)
-		}
-	}
-	println("connecting to Wi-Fi")
 	con := console{d: d, reboot: reboot, store: store}
 	trig := triggers{d: d, reboot: reboot}
 	trig.enable()
@@ -207,7 +208,34 @@ func main() {
 		trig.poll(now)
 		usb.poll(now)
 	}
-	node.Join(nw, all, nil)
+
+	// The network: stored, compiled in, or provisioned over BLE.
+	var nw clusters.WiFiNetwork
+	viaBLE := false
+	switch {
+	case len(d.Net.Networks) > 0:
+		nw = d.Net.Networks[0]
+	case ssid != "":
+		nw = clusters.WiFiNetwork{SSID: []byte(ssid), Credentials: []byte(password)}
+	default:
+		nw = commissionOverBLE(d, tr, mac, all)
+		viaBLE = true
+		// If commissioning does not complete, start over: the fail-safe
+		// rolled the network back, so BLE advertising resumes.
+		d.FailSafe.OnExpire = append(d.FailSafe.OnExpire, func(now time.Time) {
+			if !d.Commissioned() {
+				println("commissioning did not complete: rebooting")
+				reboot()
+			}
+		})
+	}
+	println("connecting to Wi-Fi")
+	joinStart := time.Now()
+	giveUp := func() bool { return viaBLE && time.Since(joinStart) > joinTimeout }
+	if !node.Join(nw, all, giveUp) {
+		println("cannot join the network: rebooting")
+		reboot()
+	}
 	node.Run(all)
 }
 

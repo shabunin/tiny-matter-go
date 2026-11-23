@@ -58,6 +58,18 @@ func logf(args ...any) {
 // buffer: 9 bytes of HCI, L2CAP and 3 of ATT header, plus a 244-byte segment.
 const maxATTMTU = 247
 
+// Options adapts the server to a controller.
+type Options struct {
+	// MTU caps the ATT MTU, for transports that take shorter packets than
+	// the hci package; 0 or above 247 means 247. A notification is an HCI
+	// packet of MTU + 9 bytes.
+	MTU int
+
+	// Setup, if set, runs after the controller is reset, before anything
+	// else is sent, for vendor commands such as setting the address.
+	Setup func(h *hci.HCI) error
+}
+
 // GATT characteristic properties.
 const (
 	propRead     = 0x02
@@ -77,6 +89,7 @@ type Server struct {
 	cccd      uint16
 	adv       []byte
 	advOn     bool
+	mtu       uint16
 	writes    [][]byte // C1 writes not yet processed
 	subscribe bool     // the C2 subscription changed
 	closing   bool     // disconnect once the send queue drains
@@ -108,8 +121,11 @@ func mustUUID(s string) ble.UUID {
 }
 
 // New brings up the controller behind t and the Matter GATT service.
-func New(t hci.Transport, discriminator, vendorID, productID uint16) (*Server, error) {
-	b := &Server{st: hci.NewStack(t)}
+func New(t hci.Transport, discriminator, vendorID, productID uint16, opts Options) (*Server, error) {
+	b := &Server{st: hci.NewStack(t), mtu: maxATTMTU}
+	if opts.MTU > 0 && opts.MTU < maxATTMTU {
+		b.mtu = uint16(opts.MTU)
+	}
 	h := b.st.HCI
 	if err := h.Start(); err != nil {
 		return nil, err
@@ -118,19 +134,24 @@ func New(t hci.Transport, discriminator, vendorID, productID uint16) (*Server, e
 		return nil, err
 	}
 	time.Sleep(resetDelay)
+	if opts.Setup != nil {
+		if err := opts.Setup(h); err != nil {
+			return nil, err
+		}
+	}
 	if err := h.SetEventMask(0x3FFFFFFFFFFFFFFF); err != nil {
 		return nil, err
 	}
 	if err := h.SetLEEventMask(0x3FF); err != nil {
 		return nil, err
 	}
-	b.st.ATT.SetMaxMTU(maxATTMTU)
+	b.st.ATT.SetMaxMTU(b.mtu)
 	if tr, ok := t.(*Transport); ok {
 		tr.Snoop = snoop
 	}
 	b.addService()
 	b.adv = btp.AdvertisingData(discriminator, vendorID, productID)
-	b.conn.Reset(maxATTMTU)
+	b.conn.Reset(int(b.mtu))
 	return b, nil
 }
 
@@ -278,7 +299,7 @@ func (b *Server) pollConnectionEvents(now time.Time) {
 			b.connected, b.handle, b.closing = true, c.Handle, false
 			b.advOn = false // the controller stops advertising on connection
 			b.cccd, b.writes, b.subscribe, b.logged = 0, b.writes[:0], false, false
-			b.conn.Reset(maxATTMTU)
+			b.conn.Reset(int(b.mtu))
 			logf("ble: connected")
 			// Ask for a long supervision timeout: the link must outlive the
 			// CPU stalls of PASE and CASE computations, during which the
@@ -295,7 +316,7 @@ func (b *Server) pollConnectionEvents(now time.Time) {
 		}
 		b.connected, b.closing = false, false
 		b.cccd, b.writes, b.subscribe, b.paramsAt = 0, b.writes[:0], false, time.Time{}
-		b.conn.Reset(maxATTMTU)
+		b.conn.Reset(int(b.mtu))
 	}
 }
 
