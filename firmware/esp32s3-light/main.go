@@ -64,6 +64,7 @@ import (
 	"time"
 
 	"firmware/espota"
+	"firmware/espwifi"
 	"firmware/matterble"
 	"firmware/pir"
 	"firmware/watchdog"
@@ -161,7 +162,8 @@ func main() {
 	mac := factoryMAC()
 	println("mac", wifinode.HexMAC(mac))
 
-	node := wifinode.New(mac, radioCfg)
+	radio := &espwifi.Radio{Config: radioCfg}
+	node := wifinode.New(mac, radio)
 	node.Log = func(msg string) { println(msg) }
 	tr := node.Transport
 	tr.Peer, tr.HasPeer = matterble.Peer, true
@@ -221,7 +223,7 @@ func main() {
 	if len(d.Net.Networks) == 0 && ssid == "" {
 		radioCfg.ArenaPoolSize = 96 << 10
 	}
-	node.Radio = radioCfg
+	radio.Config = radioCfg
 	if err := espradio.Enable(radioCfg); err != nil {
 		fatal("radio", err)
 	}
@@ -254,7 +256,7 @@ func main() {
 	}
 	// During BLE commissioning, BLE has the radio: scans report what a
 	// scan saw as it started.
-	node.Attach(d, func() []espradio.AccessPoint { return bootScan })
+	node.Attach(d, func() []wifinode.AccessPoint { return bootScan })
 	if !d.Commissioned() {
 		d.OpenCommissioningWindow()
 		println("commissionable: passcode", passcode, "discriminator", discriminator)
@@ -310,16 +312,16 @@ func main() {
 }
 
 // bootScan is what a Wi-Fi scan saw as BLE commissioning started.
-var bootScan []espradio.AccessPoint
+var bootScan []wifinode.AccessPoint
 
 // scanOnce starts Wi-Fi just to scan, so that a commissioner can be told
 // which networks are around while BLE has the radio.
-func scanOnce() []espradio.AccessPoint {
+func scanOnce() []wifinode.AccessPoint {
 	if err := espradio.Start(); err != nil {
 		println("wifi scan: start:", err.Error())
 		return nil
 	}
-	aps, err := espradio.Scan()
+	aps, err := espwifi.Scan()
 	if err != nil {
 		println("wifi scan:", err.Error())
 	}

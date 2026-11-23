@@ -1,15 +1,15 @@
-// Package wifinode runs a Matter device over Wi-Fi on an ESP32 (classic
-// or S3) with espradio: it joins the network, runs IPv6 (link-local and
-// SLAAC) and IPv4 (DHCP) stacks, advertises the node with mDNS on both,
-// finds other nodes for the device, joins its group addresses and feeds it
-// Matter messages. The firmware creates the device with the node's
-// Transport, Advertiser and Resolve, then calls Join and Run.
+// Package wifinode runs a Matter device over Wi-Fi: it joins the network,
+// runs IPv6 (link-local and SLAAC) and IPv4 (DHCP) stacks, advertises the
+// node with mDNS on both, finds other nodes for the device, joins its
+// group addresses and feeds it Matter messages. The radio is a Radio:
+// espwifi (ESP32 and ESP32-S3) or cyw43wifi (the Pico W's CYW43439). The
+// firmware creates the device with the node's Transport, Advertiser and
+// Resolve, then calls Join and Run.
 package wifinode
 
 import (
 	"net/netip"
 	"slices"
-	"sync/atomic"
 	"time"
 
 	"github.com/shabunin/tiny-matter-go/clusters"
@@ -20,11 +20,47 @@ import (
 	"github.com/shabunin/tiny-matter-go/ip4"
 	"github.com/shabunin/tiny-matter-go/ip6"
 	"github.com/shabunin/tiny-matter-go/mdns"
-	"tinygo.org/x/espradio"
 )
 
 // MatterPort is the UDP port Matter listens on.
 const MatterPort = 5540
+
+// Radio is a Wi-Fi station that carries Ethernet frames. A Node calls it
+// from one goroutine only.
+type Radio interface {
+	// Start turns the station on, before Connect and scans.
+	Start() error
+	// MAC returns the station address, once known.
+	MAC() ([6]byte, bool)
+	// Connect joins a network, blocking until the link is up or the
+	// attempt fails.
+	Connect(ssid, password []byte) error
+	// LinkUp reports whether the station is associated.
+	LinkUp() bool
+	// Reconnects reports whether the radio rejoins by itself after it
+	// loses the link. If not, the Node calls Connect again.
+	Reconnects() bool
+	// Recv returns the next received frame, or nil when none is waiting.
+	// The frame is valid until the next call.
+	Recv() ([]byte, error)
+	// Send transmits a frame.
+	Send(frame []byte) error
+	// SetMulticast sets the multicast MAC addresses a hardware filter
+	// passes. Radios without one ignore it.
+	SetMulticast(macs [][6]byte) error
+	// Scan lists the access points around.
+	Scan() ([]AccessPoint, error)
+	// RSSI returns the signal strength of the network joined, in dBm.
+	RSSI() (int, error)
+	// Stats returns counters for the periodic report (may be empty).
+	Stats() string
+}
+
+// AccessPoint is a network a scan found.
+type AccessPoint struct {
+	SSID string
+	RSSI int // dBm
+}
 
 // Sender carries messages to one peer over another link (BTP over BLE).
 type Sender interface {
@@ -93,32 +129,30 @@ func (a *Advertiser) Advertise(svcs []dnssd.Service) {
 // Node is the Wi-Fi side of a device.
 type Node struct {
 	MAC        [6]byte
-	Radio      espradio.Config // as passed to espradio.Enable
+	Radio      Radio
 	Transport  *Transport
 	Advertiser *Advertiser
 	// Log, if set, receives progress messages.
 	Log func(msg string)
 
-	d       *device.Device
-	link    espradio.Link
-	nw      clusters.WiFiNetwork
-	params  espradio.STAConfig
-	s6      *ip6.Stack
-	s4      *ip4.Stack
-	ipv4    netip.Addr
-	nodes   *mdns.NodeResolver
-	wifiOn  bool
-	linkUp  atomic.Bool
-	changed atomic.Bool // the link went up or down
-	rejoin  atomic.Bool // the link came back
+	d      *device.Device
+	nw     clusters.WiFiNetwork
+	s6     *ip6.Stack
+	s4     *ip4.Stack
+	ipv4   netip.Addr
+	nodes  *mdns.NodeResolver
+	wifiOn bool
+	wasUp  bool      // the link as last seen by Run
+	retry  time.Time // when Run next tries to rejoin (radios that don't)
+	mcast  [][6]byte // the multicast filter set
 
 	nIP6, nMcast6, nIP4, nTX, nTXErr, nMDNS int
 }
 
-// New returns the node for the radio (enabled with cfg) and station
-// address mac.
-func New(mac [6]byte, cfg espradio.Config) *Node {
-	return &Node{MAC: mac, Radio: cfg, Transport: &Transport{}, Advertiser: &Advertiser{}}
+// New returns the node for radio, with station address mac (the radio's
+// own, once it starts, takes precedence).
+func New(mac [6]byte, radio Radio) *Node {
+	return &Node{MAC: mac, Radio: radio, Transport: &Transport{}, Advertiser: &Advertiser{}}
 }
 
 func (n *Node) log(msg string) {
@@ -138,15 +172,15 @@ func (n *Node) Resolve(now time.Time, cfid [8]byte, node uint64) (netip.AddrPort
 }
 
 // LinkUp reports whether the station is associated.
-func (n *Node) LinkUp() bool { return n.linkUp.Load() }
+func (n *Node) LinkUp() bool { return n.wifiOn && n.Radio.LinkUp() }
 
 // Attach reports the Wi-Fi interface in d's General Diagnostics and
 // scans for its Network Commissioning cluster (with scan, if not nil,
 // while Wi-Fi is off).
-func (n *Node) Attach(d *device.Device, offScan func() []espradio.AccessPoint) {
+func (n *Node) Attach(d *device.Device, offScan func() []AccessPoint) {
 	n.d = d
 	d.Diagnostics.Interfaces = func() []clusters.NetworkInterface {
-		ni := clusters.NetworkInterface{Name: "wlan0", Operational: n.linkUp.Load(),
+		ni := clusters.NetworkInterface{Name: "wlan0", Operational: n.LinkUp(),
 			HardwareAddress: n.MAC[:], Type: clusters.InterfaceWiFi}
 		if n.s6 != nil {
 			ni.IPv6 = n.s6.Addrs()
@@ -157,28 +191,28 @@ func (n *Node) Attach(d *device.Device, offScan func() []espradio.AccessPoint) {
 		return []clusters.NetworkInterface{ni}
 	}
 	if d.WiFiDiagnostics != nil {
-		// espradio reports the RSSI only; BSSID, channel and version read
+		// The radios report the RSSI only; BSSID, channel and version read
 		// as null, and the security type as unspecified unless the network
 		// is open.
 		d.WiFiDiagnostics.Status = func() clusters.WiFiStatus {
-			st := clusters.WiFiStatus{Connected: n.linkUp.Load()}
+			st := clusters.WiFiStatus{Connected: n.LinkUp()}
 			if !st.Connected {
 				return st
 			}
 			if len(n.nw.Credentials) == 0 {
 				st.Security = clusters.WiFiSecurityNone
 			}
-			if v, err := espradio.RSSI(); err == nil && v >= -128 && v <= 127 {
+			if v, err := n.Radio.RSSI(); err == nil && v >= -128 && v <= 127 {
 				st.RSSI, st.HasRSSI = int8(v), true
 			}
 			return st
 		}
 	}
 	d.Net.Scan = func(ctx *im.Context, want []byte) ([]clusters.WiFiScanResult, clusters.NetworkingStatus) {
-		var aps []espradio.AccessPoint
+		var aps []AccessPoint
 		if n.wifiOn {
 			var err error
-			if aps, err = espradio.Scan(); err != nil {
+			if aps, err = n.Radio.Scan(); err != nil {
 				return nil, clusters.NetworkUnknownError
 			}
 		} else if offScan != nil {
@@ -192,37 +226,21 @@ func (n *Node) Attach(d *device.Device, offScan func() []espradio.AccessPoint) {
 // waits. giveUp, if set, is asked after each failure whether to stop
 // trying; Join then returns false.
 func (n *Node) Join(nw clusters.WiFiNetwork, poll func(now time.Time), giveUp func() bool) bool {
-	if err := espradio.Start(); err != nil {
+	if err := n.Radio.Start(); err != nil {
 		n.log("wifi start: " + err.Error())
 		return false
 	}
 	n.wifiOn = true
-	if m, err := espradio.StationMAC(); err == nil && m != n.MAC {
-		n.log("station MAC differs from eFuse: " + HexMAC(m))
+	if m, ok := n.Radio.MAC(); ok && m != n.MAC {
+		n.log("station MAC differs from the factory one: " + HexMAC(m))
 		n.MAC = m
 	}
 	n.nw = nw
-	n.params = espradio.STAConfig{SSID: string(nw.SSID), Password: string(nw.Credentials)}
-	n.link = espradio.Link{Config: n.Radio}
-	n.link.LinkNotify(func(connected bool) (int, espradio.STAConfig) {
-		if connected {
-			n.log("wifi link up")
-		} else {
-			n.log("wifi link down")
-		}
-		n.linkUp.Store(connected)
-		n.changed.Store(true)
-		if !connected {
-			return 3, n.params
-		}
-		n.rejoin.Store(true)
-		return 0, espradio.STAConfig{}
-	})
 	for {
 		if poll != nil {
 			poll(time.Now())
 		}
-		err := n.link.LinkConnect(n.params)
+		err := n.Radio.Connect(nw.SSID, nw.Credentials)
 		if err == nil {
 			break
 		}
@@ -237,22 +255,56 @@ func (n *Node) Join(nw clusters.WiFiNetwork, poll func(now time.Time), giveUp fu
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	n.linkUp.Store(true)
-	n.changed.Store(false)
-	n.rejoin.Store(false)
+	n.log("wifi link up")
+	n.wasUp = true
 	n.d.Net.SetConnected(n.d.Node, nw.SSID)
 	n.d.Net.SetLastConnect(n.d.Node, nw.SSID, clusters.NetworkOK, 0, false)
 	return true
+}
+
+// rejoinDelay is how long Run waits between attempts to rejoin the network
+// on radios that do not reconnect by themselves.
+const rejoinDelay = 3 * time.Second
+
+// multicastMAC returns the Ethernet address of multicast group g
+// (RFC 2464 for IPv6, RFC 1112 for IPv4).
+func multicastMAC(g netip.Addr) [6]byte {
+	if g.Is4() {
+		a := g.As4()
+		return [6]byte{0x01, 0x00, 0x5E, a[1] & 0x7F, a[2], a[3]}
+	}
+	a := g.As16()
+	return [6]byte{0x33, 0x33, a[12], a[13], a[14], a[15]}
+}
+
+// updateMulticast gives the radio the MAC addresses of the groups the
+// stacks listen on, if they changed.
+func (n *Node) updateMulticast() {
+	var macs [][6]byte
+	for _, groups := range [][]netip.Addr{n.s6.Groups(), n.s4.Groups()} {
+		for _, g := range groups {
+			if m := multicastMAC(g); !slices.Contains(macs, m) {
+				macs = append(macs, m)
+			}
+		}
+	}
+	if slices.Equal(macs, n.mcast) {
+		return
+	}
+	if err := n.Radio.SetMulticast(macs); err != nil {
+		n.log("multicast filter: " + err.Error())
+		return
+	}
+	n.mcast = macs
 }
 
 // Run brings up the IP stacks and mDNS and serves the device for good,
 // calling poll every pass.
 func (n *Node) Run(poll func(now time.Time)) {
 	d := n.d
-	nd := n.link.NetDev()
 	sendFrame := func(f []byte) error {
 		n.nTX++
-		err := nd.SendOffsetEthFrame(f)
+		err := n.Radio.Send(f)
 		if err != nil {
 			n.nTXErr++
 			if n.nTXErr < 10 {
@@ -290,6 +342,7 @@ func (n *Node) Run(poll func(now time.Time)) {
 			}
 		}
 		groupAddrs = append(groupAddrs[:0], addrs...)
+		n.updateMulticast()
 	}
 	setGroups(d.MulticastAddrs())
 	d.OnMulticast = setGroups
@@ -305,6 +358,7 @@ func (n *Node) Run(poll func(now time.Time)) {
 			n.log("ipv6 address " + a.String())
 		}
 		updateAddrs()
+		n.updateMulticast()
 	})
 	s4.StartDHCP(HexMAC(n.MAC), func(p netip.Prefix, gw netip.Addr) {
 		n.ipv4 = netip.Addr{}
@@ -341,41 +395,47 @@ func (n *Node) Run(poll func(now time.Time)) {
 	s6.Listen(mdns.Port, onMDNS)
 	s4.Listen(MatterPort, onMatter)
 	s4.Listen(mdns.Port, onMDNS)
+	n.updateMulticast()
 	if d.Commissioned() {
 		n.log("commissioned; reachable over CASE")
 	}
 
-	// The frame buffer is on the heap, not main's stack, which packet
-	// handling (CASE, certificate checks) takes close to its end. (Not a
-	// package-level var: on the classic ESP32, growing .bss by that much
-	// breaks the Wi-Fi handshake, "auth expired".)
-	frame := make([]byte, espradio.MaxFrameSize)
 	lastReport := time.Now()
 	for {
 		for i := 0; i < 8; i++ {
-			off, size, err := nd.EthPoll(frame)
-			if err != nil || size == 0 {
+			f, err := n.Radio.Recv()
+			if err != nil || f == nil {
 				break
 			}
-			f := frame[off : off+size]
 			n.count(f)
 			s6.HandleFrame(f)
 			s4.HandleFrame(f)
 		}
 		now := time.Now()
-		if n.changed.Swap(false) {
-			if n.linkUp.Load() {
+		if up := n.Radio.LinkUp(); up != n.wasUp {
+			n.wasUp = up
+			if up {
+				n.log("wifi link up")
 				d.Net.SetConnected(d.Node, n.nw.SSID)
+				s6.ReportGroups()
+				s6.SolicitRouter()
+				s4.ReportGroups()
+				s4.RenewDHCP()
+				resp.Reannounce()
 			} else {
+				n.log("wifi link down")
 				d.Net.SetConnected(d.Node, nil)
+				n.retry = now
 			}
 		}
-		if n.rejoin.Swap(false) {
-			s6.ReportGroups()
-			s6.SolicitRouter()
-			s4.ReportGroups()
-			s4.RenewDHCP()
-			resp.Reannounce()
+		if !n.wasUp && !n.Radio.Reconnects() && !now.Before(n.retry) {
+			// Connect blocks for seconds; the watchdog allows for it.
+			if err := n.Radio.Connect(n.nw.SSID, n.nw.Credentials); err != nil {
+				n.log("wifi reconnect: " + err.Error())
+				n.retry = time.Now().Add(rejoinDelay)
+			}
+			n.mcast = nil // set the filter again
+			n.updateMulticast()
 		}
 		d.Poll(now)
 		resp.Poll(now)
@@ -386,8 +446,7 @@ func (n *Node) Run(poll func(now time.Time)) {
 		}
 		if now.Sub(lastReport) > 30*time.Second {
 			lastReport = now
-			rx, drops := espradio.NetifRxStats()
-			println("alive: rx frames", rx, "ring drops", drops, "ipv6", n.nIP6, "v6 multicast", n.nMcast6, "ipv4", n.nIP4, "tx", n.nTX, "txerr", n.nTXErr, "mdns rx", n.nMDNS)
+			println("alive:", n.Radio.Stats(), "ipv6", n.nIP6, "v6 multicast", n.nMcast6, "ipv4", n.nIP4, "tx", n.nTX, "txerr", n.nTXErr, "mdns rx", n.nMDNS)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -411,8 +470,8 @@ func (n *Node) count(f []byte) {
 // ScanResults lists the networks of aps (only want, if set), strongest
 // first, each once, at most 8. The radio reports only names and signal
 // strengths: WPA2 on 2.4 GHz is assumed.
-func ScanResults(aps []espradio.AccessPoint, want []byte) []clusters.WiFiScanResult {
-	sorted := append([]espradio.AccessPoint(nil), aps...)
+func ScanResults(aps []AccessPoint, want []byte) []clusters.WiFiScanResult {
+	sorted := append([]AccessPoint(nil), aps...)
 	for i := 1; i < len(sorted); i++ {
 		for j := i; j > 0 && sorted[j].RSSI > sorted[j-1].RSSI; j-- {
 			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]

@@ -39,6 +39,7 @@ import (
 
 	"firmware/esp32flash"
 	"firmware/espota"
+	"firmware/espwifi"
 	"firmware/watchdog"
 	"firmware/wifinode"
 
@@ -115,7 +116,7 @@ func main() {
 	}
 	mac := factoryMAC()
 	println("mac", wifinode.HexMAC(mac))
-	node := wifinode.New(mac, radioCfg)
+	node := wifinode.New(mac, &espwifi.Radio{Config: radioCfg})
 	node.Log = func(msg string) { println(msg) }
 
 	salt := []byte("SPAKE2P Key Salt")
